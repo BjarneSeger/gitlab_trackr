@@ -1,0 +1,4 @@
+# Install: tt hook fish > ~/.config/fish/conf.d/gitlab_trackr.fish
+function __gitlab_trackr_tick --on-event fish_postexec
+    command tt tick
+end

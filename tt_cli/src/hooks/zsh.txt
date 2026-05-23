@@ -1,0 +1,6 @@
+# Install: tt hook zsh >> ~/.zshrc      (or source it from .zshrc)
+__gitlab_trackr_tick() { command tt tick }
+typeset -ga precmd_functions
+if [[ ${precmd_functions[(ie)__gitlab_trackr_tick]} -gt ${#precmd_functions} ]]; then
+    precmd_functions+=(__gitlab_trackr_tick)
+fi

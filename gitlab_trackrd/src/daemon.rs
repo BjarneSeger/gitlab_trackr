@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, instrument, warn};
 
-use super::iface::{Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, Issue, VarlinkInterface};
 use super::{Error, ISSUES_TABLE, Result};
 use crate::gl;
 use crate::utils::{issue_from_value, now_secs};
+use gitlab_trackr_api::{
+    Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, Issue, VarlinkInterface,
+};
 
 /// Shared state injected into every varlink method call.
 pub struct Daemon {

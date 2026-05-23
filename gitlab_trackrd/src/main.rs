@@ -31,12 +31,9 @@ mod daemon;
 mod gl;
 mod service;
 mod utils;
-mod iface {
-    include!(concat!(env!("OUT_DIR"), "/org.thehoster.gitlab.trackrd.rs"));
-}
 
 use daemon::Daemon;
-use iface::Issue;
+use gitlab_trackr_api::Issue;
 use service::ServiceHandler;
 
 /// redb table that stores the serialised [`CachedData`](daemon::CachedData) blob under the key `"assigned"`.

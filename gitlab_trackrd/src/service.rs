@@ -3,10 +3,12 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 use varlink::sansio::ServerEvent;
 
-use crate::{
-    daemon::Daemon,
-    iface::{self, VarlinkInterface as _},
+use gitlab_trackr_api::{
+    self, AsyncCall, Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, PostTime_Args,
+    VarlinkInterface as _,
 };
+
+use crate::daemon::Daemon;
 
 const ORG_VARLINK_SERVICE_DESCRIPTION: &str = r#"interface org.varlink.service
 
@@ -83,20 +85,18 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                             }
                         }
                         "org.thehoster.gitlab.trackrd.ClearCache" => {
-                            let mut call = iface::AsyncCall::default();
+                            let mut call = AsyncCall::default();
                             self.daemon
-                                .clear_cache(&mut call as &mut dyn iface::Call_ClearCache)
+                                .clear_cache(&mut call as &mut dyn Call_ClearCache)
                                 .await?;
                             if let Some(reply) = call.take_reply() {
                                 server.send_reply(reply)?;
                             }
                         }
                         "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {
-                            let mut call = iface::AsyncCall::default();
+                            let mut call = AsyncCall::default();
                             self.daemon
-                                .get_assigned_issues(
-                                    &mut call as &mut dyn iface::Call_GetAssignedIssues,
-                                )
+                                .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues)
                                 .await?;
                             if let Some(reply) = call.take_reply() {
                                 server.send_reply(reply)?;
@@ -104,18 +104,18 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                         }
                         "org.thehoster.gitlab.trackrd.PostTime" => {
                             if let Some(args_val) = request.parameters {
-                                let args: iface::PostTime_Args = serde_json::from_value(args_val)
+                                let args: PostTime_Args = serde_json::from_value(args_val)
                                     .map_err(|e| {
-                                    varlink::Error(
-                                        varlink::ErrorKind::InvalidParameter(e.to_string()),
-                                        None,
-                                        None,
-                                    )
-                                })?;
-                                let mut call = iface::AsyncCall::default();
+                                        varlink::Error(
+                                            varlink::ErrorKind::InvalidParameter(e.to_string()),
+                                            None,
+                                            None,
+                                        )
+                                    })?;
+                                let mut call = AsyncCall::default();
                                 self.daemon
                                     .post_time(
-                                        &mut call as &mut dyn iface::Call_PostTime,
+                                        &mut call as &mut dyn Call_PostTime,
                                         args.project_id,
                                         args.issue_iid,
                                         args.duration,

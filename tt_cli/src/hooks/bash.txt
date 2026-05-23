@@ -1,0 +1,7 @@
+# Install: tt hook bash >> ~/.bashrc    (or source it from .bashrc)
+__gitlab_trackr_tick() { command tt tick; }
+case "${PROMPT_COMMAND:-}" in
+    *__gitlab_trackr_tick*) ;;
+    "")  PROMPT_COMMAND="__gitlab_trackr_tick" ;;
+    *)   PROMPT_COMMAND="__gitlab_trackr_tick;${PROMPT_COMMAND}" ;;
+esac

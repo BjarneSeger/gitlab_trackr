@@ -1,3 +1,3 @@
 [workspace]
 resolver = "3"
-members = ["gitlab_trackrd"]
+members = ["gitlab_trackr_api","gitlab_trackrd", "tt_cli"]
