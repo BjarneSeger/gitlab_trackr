@@ -1,0 +1,50 @@
+# gitlab_trackrd
+
+A small daemon that exposes a [varlink](https://varlink.org) IPC socket for GitLab
+time tracking with caching. Provides the basis for other tools in this workspace.
+
+## Installation
+gitlab_trackrd provides precompiled releases for arm64 and amd64, with packages for
+debian, rpm and arch. See the `releases`-tab.
+
+## Configuration
+
+All configuration is done via environment variables. Only `GITLAB_TOKEN` is
+required; everything else has a sensible default.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `GITLAB_TOKEN` | **yes** | — | Personal access token |
+| `GITLAB_HOST` | no | `gitlab.com` | GitLab instance hostname (e.g. `gitlab.example.com`) |
+| `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket` | Varlink socket address.  Falls back to `unix:/tmp/gitlab_trackrd.socket` when `$XDG_RUNTIME_DIR` is unset. |
+| `GITLAB_TRACKRD_CACHE_TTL` | no | `300` | Seconds before the issue cache is considered stale |
+
+## Checking everything works
+```sh
+varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}
+```
+
+## Building locally
+
+### Requirements
+
+- Rust 1.85+
+- A GitLab personal access token with at least `read_api` + `write_api` scopes
+
+### Build
+
+```sh
+cargo build --release
+```
+
+### Run
+
+```sh
+cargo run --release
+```
+
+## Varlink interface
+
+The interface name is `org.thehoster.gitlab.trackrd`.
+For more information, see [the interface docs](docs/varlink_interface.md) and
+[the interface definition](src/org.thehoster.gitlab_trackrd.varlink).

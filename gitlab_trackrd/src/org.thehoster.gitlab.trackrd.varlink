@@ -1,0 +1,18 @@
+interface org.thehoster.gitlab.trackrd
+
+type Issue (
+  id: int,
+  iid: int,
+  project_id: int,
+  title: string,
+  web_url: string,
+  state: string
+)
+
+error GitlabError (message: string)
+
+method GetAssignedIssues() -> (issues: []Issue)
+
+method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
+
+method ClearCache() -> ()
