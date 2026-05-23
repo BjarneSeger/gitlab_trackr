@@ -1,8 +1,18 @@
 version: 2
 
-project_name: gitlab_trackr_cli
+project_name: gitlab_trackr
 
 builds:
+  - id: gitlab_trackrd
+    binary: gitlab_trackrd
+    builder: rust
+    targets:
+      - "x86_64-unknown-linux-gnu"
+      - "aarch64-unknown-linux-gnu"
+    command: zigbuild
+    flags:
+      - --release
+      - --package=gitlab_trackrd
   - id: gitlab_trackr_cli
     binary: tt
     builder: rust
@@ -15,12 +25,32 @@ builds:
       - --package=tt_cli
 
 archives:
-  - id: gitlab_trackr_cli
+  - id: gitlab_trackrd
+    ids:
+      - gitlab_trackrd
+      - gitlab_trackr_cli
     formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 nfpms:
+  - id: gitlab_trackrd
+    package_name: gitlab-trackrd
+    maintainer: Bjarne Seger <bjarneseger@thehoster.org>
+    description: GitLab time-tracking varlink daemon
+    formats:
+      - deb
+      - rpm
+      - archlinux
+    bindir: /usr/bin
+    contents:
+      - src: gitlab_trackrd/packaging/gitlab_trackrd.service
+        dst: /usr/lib/systemd/user/gitlab_trackrd.service
+        file_info:
+          mode: 0644
+    recommends:
+      - "gitlab-trackr-cli"
+
   - id: gitlab_trackr_cli
     package_name: gitlab-trackr-cli
     maintainer: Bjarne Seger <bjarneseger@thehoster.org>
