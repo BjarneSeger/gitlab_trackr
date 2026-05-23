@@ -1,5 +1,5 @@
 # Install: append to ~/.config/nushell/config.nu (or `tt hook nu | save -a $nu.config-path`).
 # Verified against Nushell 0.90+ — older versions had a different hooks schema.
-$env.config = ($env.config | upsert hooks.pre_prompt (
-    ($env.config.hooks?.pre_prompt? | default []) ++ [{|| tt tick }]
+$env.config = ($env.config | upsert hooks.pre_execution (
+    ($env.config.hooks?.pre_execution? | default []) ++ [{|| tt tick }]
 ))
