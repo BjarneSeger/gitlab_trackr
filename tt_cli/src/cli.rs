@@ -1,11 +1,3 @@
-//! Clap-derived command-line surface.
-//!
-//! GitLab terminology note: every issue has both a global `id` and a
-//! per-project `iid` (the `#42` shown in the UI). The varlink API needs both
-//! `project_id` and `issue_iid` to address an issue; users almost always know
-//! the `iid` but rarely the `project_id`, so [`Command::Log`] accepts `iid`
-//! positionally and resolves the project lazily (see [`crate::cmd::log`]).
-
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]

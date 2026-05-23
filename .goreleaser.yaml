@@ -62,3 +62,12 @@ nfpms:
     bindir: /usr/bin
     dependencies:
       - "gitlab-trackrd"
+    contents:
+      - src: tt_cli/completions/tt.bash
+        dst: /usr/share/bash-completion/completions/tt
+      - src: tt_cli/completions/_tt
+        dst: /usr/share/zsh/site-functions/_tt
+      - src: tt_cli/completions/tt.fish
+        dst: /usr/share/fish/vendor_completions.d/tt.fish
+      - src: tt_cli/completions/tt.nu
+        dst: /usr/share/nushell/vendor/autoload/tt.nu
