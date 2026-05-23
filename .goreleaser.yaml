@@ -34,34 +34,17 @@ archives:
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 nfpms:
-  - id: gitlab_trackrd
-    package_name: gitlab-trackrd
+  - ids:
+      - gitlab_trackr_cli
+      - gitlab_trackrd
+    package_name: gitlab-trackr-utils
     maintainer: Bjarne Seger <bjarneseger@thehoster.org>
-    description: GitLab time-tracking varlink daemon
+    description: GitLab time-tracking utils
     formats:
       - deb
       - rpm
       - archlinux
     bindir: /usr/bin
-    contents:
-      - src: gitlab_trackrd/packaging/gitlab_trackrd.service
-        dst: /usr/lib/systemd/user/gitlab_trackrd.service
-        file_info:
-          mode: 0644
-    recommends:
-      - "gitlab-trackr-cli"
-
-  - id: gitlab_trackr_cli
-    package_name: gitlab-trackr-cli
-    maintainer: Bjarne Seger <bjarneseger@thehoster.org>
-    description: GitLab time-tracking cli
-    formats:
-      - deb
-      - rpm
-      - archlinux
-    bindir: /usr/bin
-    dependencies:
-      - "gitlab-trackrd"
     contents:
       - src: tt_cli/completions/tt.bash
         dst: /usr/share/bash-completion/completions/tt
@@ -71,3 +54,7 @@ nfpms:
         dst: /usr/share/fish/vendor_completions.d/tt.fish
       - src: tt_cli/completions/tt.nu
         dst: /usr/share/nushell/vendor/autoload/tt.nu
+      - src: gitlab_trackrd/packaging/gitlab_trackrd.service
+        dst: /usr/lib/systemd/user/gitlab_trackrd.service
+        file_info:
+          mode: 0644
