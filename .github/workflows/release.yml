@@ -3,7 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "gitlab_trackrd/v*"
+      - "gitlab_trackr_cli/v*"
 
 permissions:
   contents: write
@@ -37,11 +38,17 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Detect release ID
+        id: release-id
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "id=${TAG%%/*}" >> "$GITHUB_OUTPUT"
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          args: release --clean --id ${{ steps.release-id.outputs.id }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
