@@ -58,3 +58,7 @@ nfpms:
         dst: /usr/lib/systemd/user/gitlab_trackrd.service
         file_info:
           mode: 0644
+      - src: gitlab_trackrd/packaging/gitlab_trackrd.socket
+        dst: /usr/lib/systemd/user/gitlab_trackrd.socket
+        file_info:
+          mode: 0644

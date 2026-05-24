@@ -1,14 +1,15 @@
 //! `gitlab_trackrd` — GitLab time-tracking varlink daemon.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use redb::{Database, TableDefinition};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
-use varlink::{ListenAsyncConfig, listen_async};
 
 mod daemon;
 mod gl;
+mod server;
 mod service;
 mod utils;
 
@@ -58,11 +59,6 @@ async fn main() -> Result<()> {
 
     let token = std::env::var("GITLAB_TOKEN").map_err(|_| Error::Env("GITLAB_TOKEN"))?;
     let host = std::env::var("GITLAB_HOST").unwrap_or_else(|_| "gitlab.com".to_string());
-    let socket = std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(|d| format!("unix:{d}/gitlab_trackrd.socket"))
-            .unwrap_or_else(|_| "unix:/tmp/gitlab_trackrd.socket".to_string())
-    });
     let cache_ttl = std::env::var("GITLAB_TRACKRD_CACHE_TTL")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -91,12 +87,39 @@ async fn main() -> Result<()> {
         cache_ttl,
     });
 
-    info!(socket, cache_ttl, "starting gitlab_trackrd");
-    listen_async(
+    let socket = std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| format!("{d}/gitlab_trackrd.socket"))
+            .unwrap_or_else(|_| "/tmp/gitlab_trackrd.socket".to_string())
+    });
+
+    let listener = server::make_listener(&socket)?;
+
+    if server::is_socket_activated() {
+        info!(cache_ttl, "starting gitlab_trackrd from socket");
+    } else {
+        info!(socket, cache_ttl, "starting gitlab_trackrd");
+    }
+
+    let idle_timeout = Duration::from_secs(cache_ttl * 3);
+
+    let serve = server::serve(
         Arc::new(ServiceHandler::new(daemon)),
-        &socket,
-        &ListenAsyncConfig::default(),
-    )
-    .await?;
+        listener,
+        idle_timeout,
+    );
+
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        result = serve => result?,
+        _ = tokio::signal::ctrl_c() => { info!("received SIGINT, shutting down"); }
+        _ = sigterm.recv() => { info!("received SIGTERM, shutting down"); }
+    }
+
+    if !server::is_socket_activated() {
+        let _ = std::fs::remove_file(&socket);
+    }
     Ok(())
 }
