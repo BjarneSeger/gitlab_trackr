@@ -23,6 +23,12 @@ to get the snippet to add to your respective shellrc. After that, you will be as
 after 30 minutes when the next cli prompt should appear what you are working on, 
 with a list of assigned issues.
 
+### Completions
+Out of the box, completions are installed for fish, zsh and bash. Completions are
+also provided for carapace, but they need to be manually linked from
+`/usr/share/carapace/specs/tt.yaml` to `~/.config/carapace/specs/tt.yaml` manually,
+as carapace does not currently support globally installed specs.
+
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
 `gitlab_trackr_cli/config.toml`. You can run `tt config path` to see what it 
