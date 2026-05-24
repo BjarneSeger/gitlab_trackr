@@ -71,8 +71,8 @@ type Result<T> = std::result::Result<T, Error>;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_env("GITLAB_TRACKR")
-                .add_directive("gitlab_trackrd=info".parse().unwrap()),
+            EnvFilter::try_from_env("GITLAB_TRACKR")
+                .unwrap_or_else(|_| EnvFilter::new("gitlab_trackrd=info")),
         )
         .init();
 
