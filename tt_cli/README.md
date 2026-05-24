@@ -26,8 +26,8 @@ with a list of assigned issues.
 ### Completions
 Out of the box, completions are installed for fish, zsh and bash. Completions are
 also provided for carapace, but they need to be manually linked from
-`/usr/share/carapace/specs/tt.yaml` to `~/.config/carapace/specs/tt.yaml` manually,
-as carapace does not currently support globally installed specs.
+`/usr/share/carapace/specs/tt.yaml` to `~/.config/carapace/specs/tt.yaml`, as
+carapace does not currently support globally installed specs.
 
 ## Config
 The config lives at `$XDG_CONFIG_HOME/` or `$HOME/.config/` under
