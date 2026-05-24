@@ -1,52 +1,25 @@
 //! `gitlab_trackrd` — GitLab time-tracking varlink daemon.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use redb::{Database, TableDefinition};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod daemon;
-mod gl;
+mod cache;
+mod config;
+mod error;
+mod gitlab;
+mod handlers;
 mod server;
 mod service;
-mod utils;
 
-use daemon::Daemon;
-use gitlab_trackr_api::Issue;
+use cache::IssueCache;
+use config::Config;
+use error::Result;
+use gitlab::GitlabClient;
+use handlers::Handlers;
 use service::ServiceHandler;
-
-/// redb table that stores the serialised [`CachedData`](daemon::CachedData) blob under the key `"assigned"`.
-const ISSUES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("issues_cache");
-
-/// Default number of seconds before the cached issue list is considered stale.
-const DEFAULT_CACHE_TTL: u64 = 300;
-
-/// Top-level error type used throughout the daemon.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    /// A GitLab API call failed or returned an unexpected response.
-    #[error("GitLab error: {0}")]
-    Gitlab(String),
-    /// A redb read or write operation failed.
-    #[error("Cache error: {0}")]
-    Cache(String),
-    /// JSON serialisation / deserialisation failed.
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    /// An OS-level I/O operation failed (e.g. creating the cache directory).
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    /// A required environment variable was not set.
-    #[error("Environment variable '{0}' is not set")]
-    Env(&'static str),
-    /// The varlink runtime reported an error.
-    #[error("Varlink error: {0}")]
-    Varlink(#[from] varlink::Error),
-}
-
-type Result<T> = std::result::Result<T, Error>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -57,57 +30,21 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let token = std::env::var("GITLAB_TOKEN").map_err(|_| Error::Env("GITLAB_TOKEN"))?;
-    let host = std::env::var("GITLAB_HOST").unwrap_or_else(|_| "gitlab.com".to_string());
-    let cache_ttl = std::env::var("GITLAB_TRACKRD_CACHE_TTL")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_CACHE_TTL);
+    let cfg = Config::from_env()?;
+    let gitlab = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
+    let cache = Arc::new(IssueCache::open(&cfg.db_path, cfg.cache_ttl)?);
+    let handlers = Arc::new(Handlers { gitlab, cache });
 
-    let client = gitlab::GitlabBuilder::new(host, token)
-        .build_async()
-        .await
-        .map_err(|e| Error::Gitlab(e.to_string()))?;
-
-    let db_path = dirs::data_local_dir()
-        .unwrap_or_else(|| "~/.local/share".into())
-        .join("gitlab_trackrd/cache.redb");
-    std::fs::create_dir_all(db_path.parent().unwrap())?;
-    let db = Database::create(&db_path).map_err(|e| Error::Cache(e.to_string()))?;
-    {
-        let txn = db.begin_write().map_err(|e| Error::Cache(e.to_string()))?;
-        txn.open_table(ISSUES_TABLE)
-            .map_err(|e| Error::Cache(e.to_string()))?;
-        txn.commit().map_err(|e| Error::Cache(e.to_string()))?;
-    }
-
-    let daemon = Arc::new(Daemon {
-        client,
-        db: Arc::new(Mutex::new(db)),
-        cache_ttl,
-    });
-
-    let socket = std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(|d| format!("{d}/gitlab_trackrd.socket"))
-            .unwrap_or_else(|_| "/tmp/gitlab_trackrd.socket".to_string())
-    });
-
-    let listener = server::make_listener(&socket)?;
+    let listener = server::make_listener(&cfg.socket)?;
 
     if server::is_socket_activated() {
-        info!(cache_ttl, "starting gitlab_trackrd from socket");
+        info!(cache_ttl = cfg.cache_ttl, "starting gitlab_trackrd from socket");
     } else {
-        info!(socket, cache_ttl, "starting gitlab_trackrd");
+        info!(socket = cfg.socket, cache_ttl = cfg.cache_ttl, "starting gitlab_trackrd");
     }
 
-    let idle_timeout = Duration::from_secs(cache_ttl * 3);
-
-    let serve = server::serve(
-        Arc::new(ServiceHandler::new(daemon)),
-        listener,
-        idle_timeout,
-    );
+    let idle_timeout = Duration::from_secs(cfg.cache_ttl * 3);
+    let serve = server::serve(Arc::new(ServiceHandler::new(handlers)), listener, idle_timeout);
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate())?;
@@ -119,7 +56,7 @@ async fn main() -> Result<()> {
     }
 
     if !server::is_socket_activated() {
-        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(&cfg.socket);
     }
     Ok(())
 }

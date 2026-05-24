@@ -1,14 +1,20 @@
+//! Varlink protocol dispatcher.
+//!
+//! Splits the framework-level `org.varlink.service.*` methods from the
+//! trackrd methods so each match stays short and self-evident.
+
 use std::sync::Arc;
 
 use tracing::{debug, warn};
+use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    self, AsyncCall, Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, PostTime_Args,
-    VarlinkInterface as _,
+    AsyncCall, Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, PostTime_Args,
+    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
-use crate::daemon::Daemon;
+use crate::handlers::Handlers;
 
 const ORG_VARLINK_SERVICE_DESCRIPTION: &str = r#"interface org.varlink.service
 
@@ -28,15 +34,13 @@ error MethodNotImplemented (method: string)
 error InvalidParameter (parameter: string)
 "#;
 
-const TRACKRD_INTERFACE_DESCRIPTION: &str = include_str!("org.thehoster.gitlab.trackrd.varlink");
-
 pub struct ServiceHandler {
-    daemon: Arc<Daemon>,
+    handlers: Arc<Handlers>,
 }
 
 impl ServiceHandler {
-    pub fn new(daemon: Arc<Daemon>) -> Self {
-        ServiceHandler { daemon }
+    pub fn new(handlers: Arc<Handlers>) -> Self {
+        ServiceHandler { handlers }
     }
 }
 
@@ -51,94 +55,20 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
             match event {
                 ServerEvent::Request { request } => {
                     debug!(method = request.method.as_ref(), "varlink request");
-                    match request.method.as_ref() {
-                        "org.varlink.service.GetInfo" => {
-                            server.send_reply(varlink::Reply::parameters(Some(serde_json::json!({
-                            "vendor": "org.thehoster",
-                            "product": "gitlab_trackrd",
-                            "version": env!("CARGO_PKG_VERSION"),
-                            "url": "https://github.com/bjarneseger/gitlab_trackrd",
-                            "interfaces": ["org.varlink.service", "org.thehoster.gitlab.trackrd"]
-                        }))))?;
-                        }
-                        "org.varlink.service.GetInterfaceDescription" => {
-                            let desc = request
-                                .parameters
-                                .as_ref()
-                                .and_then(|p| p.get("interface"))
-                                .and_then(|v| v.as_str())
-                                .and_then(|name| match name {
-                                    "org.varlink.service" => Some(ORG_VARLINK_SERVICE_DESCRIPTION),
-                                    "org.thehoster.gitlab.trackrd" => {
-                                        Some(TRACKRD_INTERFACE_DESCRIPTION)
-                                    }
-                                    _ => None,
-                                });
-                            match desc {
-                                Some(d) => server.send_reply(varlink::Reply::parameters(Some(
-                                    serde_json::json!({"description": d}),
-                                )))?,
-                                None => server.send_reply(varlink::Reply::error(
-                                    "org.varlink.service.InvalidParameter",
-                                    Some(serde_json::json!({"parameter": "interface"})),
-                                ))?,
-                            }
-                        }
-                        "org.thehoster.gitlab.trackrd.ClearCache" => {
-                            let mut call = AsyncCall::default();
-                            self.daemon
-                                .clear_cache(&mut call as &mut dyn Call_ClearCache)
-                                .await?;
-                            if let Some(reply) = call.take_reply() {
-                                server.send_reply(reply)?;
-                            }
-                        }
-                        "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {
-                            let mut call = AsyncCall::default();
-                            self.daemon
-                                .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues)
-                                .await?;
-                            if let Some(reply) = call.take_reply() {
-                                server.send_reply(reply)?;
-                            }
-                        }
-                        "org.thehoster.gitlab.trackrd.PostTime" => {
-                            if let Some(args_val) = request.parameters {
-                                let args: PostTime_Args = serde_json::from_value(args_val)
-                                    .map_err(|e| {
-                                        varlink::Error(
-                                            varlink::ErrorKind::InvalidParameter(e.to_string()),
-                                            None,
-                                            None,
-                                        )
-                                    })?;
-                                let mut call = AsyncCall::default();
-                                self.daemon
-                                    .post_time(
-                                        &mut call as &mut dyn Call_PostTime,
-                                        args.project_id,
-                                        args.issue_iid,
-                                        args.duration,
-                                        args.summary,
-                                    )
-                                    .await?;
-                                if let Some(reply) = call.take_reply() {
-                                    server.send_reply(reply)?;
-                                }
-                            } else {
-                                server.send_reply(varlink::Reply::error(
-                                    "org.varlink.service.InvalidParameter",
-                                    Some(serde_json::json!({"parameter": "parameters"})),
-                                ))?;
-                            }
-                        }
-                        method => {
-                            warn!(method, "unknown varlink method");
-                            server.send_reply(varlink::Reply::error(
-                                "org.varlink.service.MethodNotFound",
-                                Some(serde_json::json!({"method": method})),
-                            ))?;
-                        }
+                    let method = request.method.as_ref();
+                    let reply = if let Some(reply) = handle_varlink_meta(method, &request) {
+                        Some(reply)
+                    } else if method.starts_with("org.thehoster.gitlab.trackrd.") {
+                        handle_trackrd(method, request.parameters, &self.handlers).await?
+                    } else {
+                        warn!(method, "unknown varlink method");
+                        Some(Reply::error(
+                            "org.varlink.service.MethodNotFound",
+                            Some(serde_json::json!({"method": method})),
+                        ))
+                    };
+                    if let Some(reply) = reply {
+                        server.send_reply(reply)?;
                     }
                 }
                 ServerEvent::Upgrade { interface } => return Ok(Some(interface)),
@@ -146,4 +76,86 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
         }
         Ok(None)
     }
+}
+
+/// Replies for the framework-level `org.varlink.service.*` methods, or `None`
+/// if the method isn't one of them.
+fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply> {
+    match method {
+        "org.varlink.service.GetInfo" => Some(Reply::parameters(Some(serde_json::json!({
+            "vendor": "org.thehoster",
+            "product": "gitlab_trackrd",
+            "version": env!("CARGO_PKG_VERSION"),
+            "url": "https://github.com/bjarneseger/gitlab_trackrd",
+            "interfaces": ["org.varlink.service", "org.thehoster.gitlab.trackrd"]
+        })))),
+        "org.varlink.service.GetInterfaceDescription" => {
+            let name = request
+                .parameters
+                .as_ref()
+                .and_then(|p| p.get("interface"))
+                .and_then(|v| v.as_str());
+            let desc = match name {
+                Some("org.varlink.service") => Some(ORG_VARLINK_SERVICE_DESCRIPTION),
+                Some("org.thehoster.gitlab.trackrd") => Some(VARLINK_INTERFACE_DESCRIPTION),
+                _ => None,
+            };
+            Some(match desc {
+                Some(d) => Reply::parameters(Some(serde_json::json!({"description": d}))),
+                None => Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "interface"})),
+                ),
+            })
+        }
+        _ => None,
+    }
+}
+
+async fn handle_trackrd(
+    method: &str,
+    params: Option<serde_json::Value>,
+    handlers: &Handlers,
+) -> varlink::Result<Option<Reply>> {
+    let mut call = AsyncCall::default();
+    match method {
+        "org.thehoster.gitlab.trackrd.ClearCache" => {
+            handlers
+                .clear_cache(&mut call as &mut dyn Call_ClearCache)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {
+            handlers
+                .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.PostTime" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: PostTime_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(varlink::ErrorKind::InvalidParameter(e.to_string()), None, None)
+            })?;
+            handlers
+                .post_time(
+                    &mut call as &mut dyn Call_PostTime,
+                    args.project_id,
+                    args.issue_iid,
+                    args.duration,
+                    args.summary,
+                )
+                .await?;
+        }
+        _ => {
+            warn!(method, "unknown trackrd method");
+            return Ok(Some(Reply::error(
+                "org.varlink.service.MethodNotFound",
+                Some(serde_json::json!({"method": method})),
+            )));
+        }
+    }
+    Ok(call.take_reply())
 }
