@@ -1,24 +1,4 @@
 //! `gitlab_trackrd` — GitLab time-tracking varlink daemon.
-//!
-//! Exposes a [varlink](https://varlink.org) IPC socket that clients use to:
-//!
-//! - retrieve the current user's open, assigned GitLab issues ([`iface::VarlinkInterface::get_assigned_issues`])
-//! - post spent time to an issue ([`iface::VarlinkInterface::post_time`])
-//!
-//! The interface is defined in `src/org.thehoster.gitlab.trackrd.varlink`; the
-//! Rust bindings are generated at compile time by [`build.rs`](../build.rs) via
-//! `varlink_generator` and included into the `iface` module.
-//!
-//! # Configuration
-//!
-//! All configuration is via environment variables:
-//!
-//! | Variable | Required | Default | Description |
-//! |---|---|---|---|
-//! | `GITLAB_TOKEN` | yes | — | Personal access token with `read_api` + `write_api` scopes |
-//! | `GITLAB_HOST` | no | `gitlab.com` | GitLab instance hostname |
-//! | `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket` | Varlink socket address |
-//! | `GITLAB_TRACKRD_CACHE_TTL` | no | `300` | Issue cache lifetime in seconds |
 
 use std::sync::{Arc, Mutex};
 
