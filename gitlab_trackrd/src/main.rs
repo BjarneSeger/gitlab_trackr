@@ -67,7 +67,7 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
