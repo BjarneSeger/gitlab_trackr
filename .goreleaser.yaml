@@ -52,8 +52,8 @@ nfpms:
         dst: /usr/share/zsh/site-functions/_tt
       - src: tt_cli/completions/tt.fish
         dst: /usr/share/fish/vendor_completions.d/tt.fish
-      - src: tt_cli/completions/tt.nu
-        dst: /usr/share/nushell/vendor/autoload/tt.nu
+      - src: tt_cli/completions/tt.yaml
+        dst: /usr/share/carapace/specs/tt.yaml
       - src: gitlab_trackrd/packaging/gitlab_trackrd.service
         dst: /usr/lib/systemd/user/gitlab_trackrd.service
         file_info:

@@ -5,7 +5,6 @@ use clap_complete::{
     generate_to,
     shells::{Bash, Fish, Zsh},
 };
-use clap_complete_nushell::Nushell;
 
 // Share the CLI definition without duplicating it.
 mod cli {
@@ -19,5 +18,5 @@ fn main() {
     generate_to(Bash, &mut cmd, "tt", &out_dir).unwrap();
     generate_to(Fish, &mut cmd, "tt", &out_dir).unwrap();
     generate_to(Zsh, &mut cmd, "tt", &out_dir).unwrap();
-    generate_to(Nushell, &mut cmd, "tt", &out_dir).unwrap();
+    generate_to(carapace_spec_clap::Spec, &mut cmd, "tt", &out_dir).unwrap();
 }
