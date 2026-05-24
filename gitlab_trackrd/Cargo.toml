@@ -6,7 +6,7 @@ license = "GPL-3.0-only"
 
 [dependencies]
 gitlab = "0.1811"
-redb = "4.1.0"
+redb = "4.1"
 varlink = { version = "13.0", features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "signal"] }
 serde = "1"
@@ -16,5 +16,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 http = "1"
-async-trait = "0.1.89"
+async-trait = "0.1"
 gitlab_trackr_api = { path = "../gitlab_trackr_api", version = "0.1.0" }
