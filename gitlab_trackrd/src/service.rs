@@ -57,7 +57,7 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                             "vendor": "org.thehoster",
                             "product": "gitlab_trackrd",
                             "version": env!("CARGO_PKG_VERSION"),
-                            "url": "https://github.com/lordi/gitlab_trackrd",
+                            "url": "https://github.com/bjarneseger/gitlab_trackrd",
                             "interfaces": ["org.varlink.service", "org.thehoster.gitlab.trackrd"]
                         }))))?;
                         }
