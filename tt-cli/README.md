@@ -1,4 +1,4 @@
-# tt_cli
+# tt-cli
 A cli helper for logging times in gitlab
 
 tt allows native-ish integration of timetracking into you workflow by regularly
@@ -9,11 +9,12 @@ asking you what you worked on, in the terminal.
 ## Installation
 Prebuilt binaries are available in the releases and packages are built for debian,
 rpm and arch.
+After installing the package, make sure to enable the systemd socket:
 
-> Note that you will need to install [gitlab_trackrd](../gitlab_trackrd/README.md)
-> for this tool to work, as it provides the backend that actually talks to gitlab.
+```sh
+systemctl enable --now --user gitlab-trackrd.socket
+```
 
-After installing `gitlab_trackrd` and `tt`, you can run
 
 ```sh
 tt hook <SHELL>

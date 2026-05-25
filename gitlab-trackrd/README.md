@@ -1,10 +1,10 @@
-# gitlab_trackrd
+# gitlab-trackrd
 
 A small daemon that exposes a [varlink](https://varlink.org) IPC socket for GitLab
 time tracking with caching. Provides the basis for other tools in this workspace.
 
 ## Installation
-gitlab_trackrd provides precompiled releases for arm64 and amd64, with packages for
+gitlab-trackrd provides precompiled releases for arm64 and amd64, with packages for
 debian, rpm and arch. See the `releases`-tab.
 
 ## Configuration

@@ -1,5 +1,5 @@
 [package]
-name = "gitlab_trackrd"
+name = "gitlab-trackrd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,4 +17,4 @@ tracing-subscriber.workspace = true
 dirs.workspace = true
 http.workspace = true
 async-trait.workspace = true
-gitlab_trackr_api.workspace = true
+gitlab-trackr-api.workspace = true

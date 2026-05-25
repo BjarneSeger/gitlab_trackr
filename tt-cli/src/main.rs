@@ -1,11 +1,11 @@
-//! `tt` — interactive client for the [`gitlab_trackrd`] varlink daemon.
+//! `tt` — interactive client for the [`gitlab-trackrd`] varlink daemon.
 //!
 //! See the per-subcommand modules under [`cmd`] for behaviour. The binary is
 //! deliberately thin: all GitLab access goes through the daemon over a unix
 //! socket, so `tt` only handles argument parsing, local state (last-prompt
 //! timestamp, last-used issue) and the interactive UI.
 //!
-//! [`gitlab_trackrd`]: ../../gitlab_trackrd/README.md
+//! [`gitlab-trackrd`]: ../../gitlab-trackrd/README.md
 
 use anyhow::Result;
 use clap::Parser;

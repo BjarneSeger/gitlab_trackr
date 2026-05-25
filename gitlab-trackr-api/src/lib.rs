@@ -1,4 +1,4 @@
-//! API for interacting with gitlab_trackrd
+//! API for interacting with gitlab-trackrd
 #![allow(non_camel_case_types)]
 
 include!(concat!(env!("OUT_DIR"), "/org.thehoster.gitlab.trackrd.rs"));

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["gitlab_trackr_api","gitlab_trackrd","tt_cli"]
+members = ["gitlab-trackr-api","gitlab-trackrd","tt-cli"]
 
 [workspace.package]
 edition = "2024"
@@ -21,7 +21,7 @@ anyhow = "1.0"
 
 # External APIs
 gitlab = "0.1811"
-gitlab_trackr_api = { path = "./gitlab_trackr_api", version = "0.1.0" }
+gitlab-trackr-api = { path = "./gitlab-trackr-api", version = "0.1.0" }
 varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
 dirs = "5"

@@ -1,4 +1,4 @@
-//! `gitlab_trackrd` — GitLab time-tracking varlink daemon.
+//! `gitlab-trackrd` — GitLab time-tracking varlink daemon.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("GITLAB_TRACKR")
-                .unwrap_or_else(|_| EnvFilter::new("gitlab_trackrd=info")),
+                .unwrap_or_else(|_| EnvFilter::new("gitlab-trackrd=info")),
         )
         .init();
 

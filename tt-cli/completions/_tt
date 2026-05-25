@@ -1,0 +1,364 @@
+#compdef tt
+
+autoload -U is-at-least
+
+_tt() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_tt_commands" \
+"*::: :->tt" \
+&& ret=0
+    case $state in
+    (tt)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tt-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(log)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Project ID. If omitted, resolved from the last-used issue cache or by scanning your assigned issues for one matching \`iid\`]:PROJECT_ID:_default' \
+'--project-id=[Project ID. If omitted, resolved from the last-used issue cache or by scanning your assigned issues for one matching \`iid\`]:PROJECT_ID:_default' \
+'-s+[Optional summary note]:SUMMARY:_default' \
+'--summary=[Optional summary note]:SUMMARY:_default' \
+'-h[Print help]' \
+'--help[Print help]' \
+':iid -- Issue IID (per-project number, shown as `#42` in the GitLab UI):_default' \
+':duration -- Duration string accepted by GitLab (e.g. `30m`, `1h15m`):_default' \
+&& ret=0
+;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(tick)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(hook)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':shell:(fish zsh bash nu)' \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+":: :_tt__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tt-config-command-$line[1]:"
+        case $line[1] in
+            (template)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(path)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tt__subcmd__config__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tt-config-help-command-$line[1]:"
+        case $line[1] in
+            (template)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(path)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_tt__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tt-help-command-$line[1]:"
+        case $line[1] in
+            (list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(log)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(prompt)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(tick)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(hook)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(refresh)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(config)
+_arguments "${_arguments_options[@]}" : \
+":: :_tt__subcmd__help__subcmd__config_commands" \
+"*::: :->config" \
+&& ret=0
+
+    case $state in
+    (config)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:tt-help-config-command-$line[1]:"
+        case $line[1] in
+            (template)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(path)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_tt_commands] )) ||
+_tt_commands() {
+    local commands; commands=(
+'list:List issues assigned to you' \
+'log:Log time on an issue non-interactively' \
+'prompt:Interactively pick an issue and log time' \
+'tick:Hook entry\: if enough time has elapsed, run the interactive prompt; otherwise exit silently' \
+'hook:Print a shell snippet that wires \`tt tick\` into the pre-prompt hook' \
+'refresh:Tell the daemon to drop its cached issue list' \
+'config:Inspect or scaffold the user configuration file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tt commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config_commands] )) ||
+_tt__subcmd__config_commands() {
+    local commands; commands=(
+'template:Print an annotated TOML template (with current defaults and doc comments) to stdout. Pipe into \`\$XDG_CONFIG_HOME/gitlab_trackr_cli/config.toml\`' \
+'path:Print the resolved path to the user config file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tt config commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__help_commands] )) ||
+_tt__subcmd__config__subcmd__help_commands() {
+    local commands; commands=(
+'template:Print an annotated TOML template (with current defaults and doc comments) to stdout. Pipe into \`\$XDG_CONFIG_HOME/gitlab_trackr_cli/config.toml\`' \
+'path:Print the resolved path to the user config file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tt config help commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__help__subcmd__help_commands] )) ||
+_tt__subcmd__config__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt config help help commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__help__subcmd__path_commands] )) ||
+_tt__subcmd__config__subcmd__help__subcmd__path_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt config help path commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__help__subcmd__template_commands] )) ||
+_tt__subcmd__config__subcmd__help__subcmd__template_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt config help template commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__path_commands] )) ||
+_tt__subcmd__config__subcmd__path_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt config path commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__config__subcmd__template_commands] )) ||
+_tt__subcmd__config__subcmd__template_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt config template commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help_commands] )) ||
+_tt__subcmd__help_commands() {
+    local commands; commands=(
+'list:List issues assigned to you' \
+'log:Log time on an issue non-interactively' \
+'prompt:Interactively pick an issue and log time' \
+'tick:Hook entry\: if enough time has elapsed, run the interactive prompt; otherwise exit silently' \
+'hook:Print a shell snippet that wires \`tt tick\` into the pre-prompt hook' \
+'refresh:Tell the daemon to drop its cached issue list' \
+'config:Inspect or scaffold the user configuration file' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'tt help commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__config_commands] )) ||
+_tt__subcmd__help__subcmd__config_commands() {
+    local commands; commands=(
+'template:Print an annotated TOML template (with current defaults and doc comments) to stdout. Pipe into \`\$XDG_CONFIG_HOME/gitlab_trackr_cli/config.toml\`' \
+'path:Print the resolved path to the user config file' \
+    )
+    _describe -t commands 'tt help config commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__config__subcmd__path_commands] )) ||
+_tt__subcmd__help__subcmd__config__subcmd__path_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help config path commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__config__subcmd__template_commands] )) ||
+_tt__subcmd__help__subcmd__config__subcmd__template_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help config template commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__help_commands] )) ||
+_tt__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help help commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__hook_commands] )) ||
+_tt__subcmd__help__subcmd__hook_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help hook commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__list_commands] )) ||
+_tt__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help list commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__log_commands] )) ||
+_tt__subcmd__help__subcmd__log_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help log commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__prompt_commands] )) ||
+_tt__subcmd__help__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help prompt commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__refresh_commands] )) ||
+_tt__subcmd__help__subcmd__refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help refresh commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__help__subcmd__tick_commands] )) ||
+_tt__subcmd__help__subcmd__tick_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt help tick commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__hook_commands] )) ||
+_tt__subcmd__hook_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt hook commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__list_commands] )) ||
+_tt__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt list commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__log_commands] )) ||
+_tt__subcmd__log_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt log commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__prompt_commands] )) ||
+_tt__subcmd__prompt_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt prompt commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__refresh_commands] )) ||
+_tt__subcmd__refresh_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt refresh commands' commands "$@"
+}
+(( $+functions[_tt__subcmd__tick_commands] )) ||
+_tt__subcmd__tick_commands() {
+    local commands; commands=()
+    _describe -t commands 'tt tick commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_tt" ]; then
+    _tt "$@"
+else
+    compdef _tt tt
+fi

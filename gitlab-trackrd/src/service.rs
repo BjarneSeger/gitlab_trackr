@@ -84,7 +84,7 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
     match method {
         "org.varlink.service.GetInfo" => Some(Reply::parameters(Some(serde_json::json!({
             "vendor": "org.thehoster",
-            "product": "gitlab_trackrd",
+            "product": "gitlab-trackrd",
             "version": env!("CARGO_PKG_VERSION"),
             "url": "https://github.com/bjarneseger/gitlab_trackr",
             "interfaces": ["org.varlink.service", "org.thehoster.gitlab.trackrd"]

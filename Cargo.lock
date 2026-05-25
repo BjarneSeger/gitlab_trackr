@@ -718,7 +718,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitlab_trackr_api"
+name = "gitlab-trackr-api"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -730,13 +730,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "gitlab_trackrd"
+name = "gitlab-trackrd"
 version = "0.2.7"
 dependencies = [
  "async-trait",
  "dirs",
  "gitlab",
- "gitlab_trackr_api",
+ "gitlab-trackr-api",
  "http",
  "redb",
  "serde",
@@ -2286,7 +2286,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
-name = "tt_cli"
+name = "tt-cli"
 version = "0.2.7"
 dependencies = [
  "anyhow",
@@ -2295,7 +2295,7 @@ dependencies = [
  "clap_complete",
  "confique",
  "dirs",
- "gitlab_trackr_api",
+ "gitlab-trackr-api",
  "inquire",
  "serde",
  "serde_json",
