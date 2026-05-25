@@ -9,15 +9,16 @@ use varlink::AsyncConnection;
 
 /// Resolve the daemon's varlink socket address.
 ///
-/// Precedence: `GITLAB_TRACKRD_SOCKET` env var → `unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket`
-/// → `unix:/tmp/gitlab_trackrd.socket`. **Must stay in sync with the daemon's
-/// own resolution in `gitlab_trackrd/src/main.rs`** — if the daemon's default
-/// changes, this must change too, or `tt` will silently miss the running daemon.
+/// Precedence: `GITLAB_TRACKRD_SOCKET` env var ->
+/// `unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket` ->
+/// `unix:/tmp/gitlab-trackrd.socket`. **Must stay in sync with the daemon's own
+/// resolution in `gitlab_trackrd/src/main.rs`** — if the daemon's default changes,
+/// this must change too, or `tt` will silently miss the running daemon.
 pub fn default_socket() -> String {
     std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
         std::env::var("XDG_RUNTIME_DIR")
-            .map(|d| format!("unix:{d}/gitlab_trackrd.socket"))
-            .unwrap_or_else(|_| "unix:/tmp/gitlab_trackrd.socket".to_string())
+            .map(|d| format!("unix:{d}/gitlab-trackrd.socket"))
+            .unwrap_or_else(|_| "unix:/tmp/gitlab-trackrd.socket".to_string())
     })
 }
 

@@ -2,9 +2,9 @@
 Description=GitLab time-tracking varlink daemon
 
 [Socket]
-ListenStream=%t/gitlab_trackrd.socket
+ListenStream=%t/gitlab-trackrd.socket
 FileDescriptorName=varlink
-Service=gitlab_trackrd.service
+Service=gitlab-trackrd.service
 
 [Install]
 WantedBy=sockets.target

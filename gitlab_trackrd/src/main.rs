@@ -38,13 +38,24 @@ async fn main() -> Result<()> {
     let listener = server::make_listener(&cfg.socket)?;
 
     if server::is_socket_activated() {
-        info!(cache_ttl = cfg.cache_ttl, "starting gitlab_trackrd from socket");
+        info!(
+            cache_ttl = cfg.cache_ttl,
+            "starting gitlab-trackrd from socket"
+        );
     } else {
-        info!(socket = cfg.socket, cache_ttl = cfg.cache_ttl, "starting gitlab_trackrd");
+        info!(
+            socket = cfg.socket,
+            cache_ttl = cfg.cache_ttl,
+            "starting gitlab-trackrd"
+        );
     }
 
     let idle_timeout = Duration::from_secs(cfg.cache_ttl * 3);
-    let serve = server::serve(Arc::new(ServiceHandler::new(handlers)), listener, idle_timeout);
+    let serve = server::serve(
+        Arc::new(ServiceHandler::new(handlers)),
+        listener,
+        idle_timeout,
+    );
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate())?;

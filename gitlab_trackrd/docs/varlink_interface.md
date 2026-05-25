@@ -16,7 +16,7 @@ type Issue (
 ## `GetAssignedIssues() -> (issues: []Issue)`
 
 Returns all open issues assigned to the authenticated user.  Results are
-served from the redb cache (`~/.local/share/gitlab_trackrd/cache.redb`) for
+served from the redb cache (`~/.local/share/gitlab-trackrd/cache.redb`) for
 up to `GITLAB_TRACKRD_CACHE_TTL` seconds before a live GitLab request is made.
 
 ## `PostTime(project_id: int, issue_iid: int, duration: string) -> ()`
@@ -34,9 +34,9 @@ etc.).
 
 ```sh
 # list assigned issues
-varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}
+varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}
 
 # post 1h30m to project 42, issue #7
-varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket org.thehoster.gitlab.trackrd.PostTime \
+varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket org.thehoster.gitlab.trackrd.PostTime \
   '{"project_id": 42, "issue_iid": 7, "duration": "1h30m"}'
 ```

@@ -86,7 +86,7 @@ fn handle_varlink_meta(method: &str, request: &varlink::Request) -> Option<Reply
             "vendor": "org.thehoster",
             "product": "gitlab_trackrd",
             "version": env!("CARGO_PKG_VERSION"),
-            "url": "https://github.com/bjarneseger/gitlab_trackrd",
+            "url": "https://github.com/bjarneseger/gitlab_trackr",
             "interfaces": ["org.varlink.service", "org.thehoster.gitlab.trackrd"]
         })))),
         "org.varlink.service.GetInterfaceDescription" => {
@@ -137,7 +137,11 @@ async fn handle_trackrd(
                 )));
             };
             let args: PostTime_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(varlink::ErrorKind::InvalidParameter(e.to_string()), None, None)
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
             })?;
             handlers
                 .post_time(

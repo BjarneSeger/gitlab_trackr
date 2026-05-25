@@ -2,4 +2,4 @@
 Description=GitLab time-tracking varlink daemon
 
 [Service]
-ExecStart=/usr/bin/gitlab_trackrd
+ExecStart=/usr/bin/gitlab-trackrd

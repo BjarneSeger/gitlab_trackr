@@ -1,4 +1,4 @@
-//! User configuration loaded from `$XDG_CONFIG_HOME/gitlab_trackr_cli/config.toml`.
+//! User configuration loaded from `$XDG_CONFIG_HOME/gitlab-trackr-cli/config.toml`.
 //!
 //! Schema and defaults are owned by the [`Config`] derive — run
 //! `tt config template` to print an annotated TOML file with the current
@@ -35,7 +35,7 @@ pub struct Config {
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("gitlab_trackr_cli/config.toml")
+        .join("gitlab-trackr-cli/config.toml")
 }
 
 /// Load the config: file values fill in, then `#[config(default)]` plugs the rest.

@@ -25,12 +25,12 @@ impl Config {
             .unwrap_or(DEFAULT_CACHE_TTL);
         let socket = std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
             std::env::var("XDG_RUNTIME_DIR")
-                .map(|d| format!("{d}/gitlab_trackrd.socket"))
-                .unwrap_or_else(|_| "/tmp/gitlab_trackrd.socket".to_string())
+                .map(|d| format!("{d}/gitlab-trackrd.socket"))
+                .unwrap_or_else(|_| "/tmp/gitlab-trackrd.socket".to_string())
         });
         let db_path = dirs::data_local_dir()
             .unwrap_or_else(|| "~/.local/share".into())
-            .join("gitlab_trackrd/cache.redb");
+            .join("gitlab-trackrd/cache.redb");
 
         Ok(Self {
             token,

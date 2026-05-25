@@ -16,12 +16,12 @@ required; everything else has a sensible default.
 |---|---|---|---|
 | `GITLAB_TOKEN` | **yes** | — | Personal access token |
 | `GITLAB_HOST` | no | `gitlab.com` | GitLab instance hostname (e.g. `gitlab.example.com`) |
-| `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket` | Varlink socket address.  Falls back to `unix:/tmp/gitlab_trackrd.socket` when `$XDG_RUNTIME_DIR` is unset. |
+| `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket` | Varlink socket address.  Falls back to `unix:/tmp/gitlab-trackrd.socket` when `$XDG_RUNTIME_DIR` is unset. |
 | `GITLAB_TRACKRD_CACHE_TTL` | no | `300` | Seconds before the issue cache is considered stale |
 
 ## Checking everything works
 ```sh
-varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab_trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}
+varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}
 ```
 
 ## Building locally
@@ -47,4 +47,4 @@ cargo run --release
 
 The interface name is `org.thehoster.gitlab.trackrd`.
 For more information, see [the interface docs](docs/varlink_interface.md) and
-[the interface definition](src/org.thehoster.gitlab_trackrd.varlink).
+[the library crate](../gitlab_trackr_api/README.md).
