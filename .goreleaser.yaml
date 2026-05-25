@@ -12,7 +12,7 @@ builds:
     flags:
       - --release
       - --package=gitlab-trackrd
-  - id: gitlab_trackr_cli
+  - id: tt-cli
     binary: tt
     builder: rust
     targets:
@@ -21,20 +21,20 @@ builds:
     command: zigbuild
     flags:
       - --release
-      - --package=tt_cli
+      - --package=tt-cli
 
 archives:
   - id: gitlab-trackrd
     ids:
       - gitlab-trackrd
-      - gitlab_trackr_cli
+      - tt-cli
     formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 nfpms:
   - ids:
-      - gitlab_trackr_cli
+      - tt-cli
       - gitlab-trackrd
     package_name: gitlab-trackr-utils
     maintainer: Bjarne Seger <bjarneseger@thehoster.org>
@@ -45,19 +45,19 @@ nfpms:
       - archlinux
     bindir: /usr/bin
     contents:
-      - src: tt_cli/completions/tt.bash
+      - src: tt-cli/completions/tt.bash
         dst: /usr/share/bash-completion/completions/tt
-      - src: tt_cli/completions/_tt
+      - src: tt-cli/completions/_tt
         dst: /usr/share/zsh/site-functions/_tt
-      - src: tt_cli/completions/tt.fish
+      - src: tt-cli/completions/tt.fish
         dst: /usr/share/fish/vendor_completions.d/tt.fish
-      - src: tt_cli/completions/tt.yaml
+      - src: tt-cli/completions/tt.yaml
         dst: /usr/share/carapace/specs/tt.yaml
-      - src: gitlab_trackrd/packaging/gitlab-trackrd.service
+      - src: gitlab-trackrd/packaging/gitlab-trackrd.service
         dst: /usr/lib/systemd/user/gitlab-trackrd.service
         file_info:
           mode: 0644
-      - src: gitlab_trackrd/packaging/gitlab-trackrd.socket
+      - src: gitlab-trackrd/packaging/gitlab-trackrd.socket
         dst: /usr/lib/systemd/user/gitlab-trackrd.socket
         file_info:
           mode: 0644
