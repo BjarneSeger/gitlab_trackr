@@ -4,6 +4,7 @@ project_name: gitlab-trackr
 
 builds:
   - id: gitlab-trackrd
+    binary: gitlab-trackrd
     builder: rust
     targets:
       - "x86_64-unknown-linux-gnu"
