@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["gitlab_trackr_api","gitlab_trackrd", "tt_cli"]
+members = ["gitlab_trackr_api","gitlab_trackrd","tt_cli"]
 
 [workspace.package]
 edition = "2024"
