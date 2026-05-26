@@ -11,7 +11,7 @@ type Issue (
 
 error GitlabError (message: string)
 
-method GetAssignedIssues() -> (issues: []Issue)
+method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
 

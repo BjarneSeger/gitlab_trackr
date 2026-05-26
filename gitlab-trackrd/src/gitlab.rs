@@ -30,14 +30,23 @@ impl GitlabClient {
     ///
     /// Retries up to three times on transient network errors with exponential backoff.
     #[instrument(skip(self))]
-    pub async fn fetch_assigned_issues(&self) -> Result<Vec<Issue>> {
-        use gitlab::api::issues::{IssueScope, IssueState, Issues};
+    pub async fn fetch_assigned_issues(&self, group: Option<String>) -> Result<Vec<Issue>> {
+        use gitlab::api::issues::{GroupIssues, IssueScope, IssueState};
 
-        let query = Issues::builder()
-            .scope(IssueScope::AssignedToMe)
-            .state(IssueState::Opened)
-            .build()
-            .map_err(|e| Error::Gitlab(e.to_string()))?;
+        let query = if let Some(group) = group {
+            GroupIssues::builder()
+                .scope(IssueScope::AssignedToMe)
+                .state(IssueState::Opened)
+                .group(group)
+                .build()
+                .map_err(|e| Error::Gitlab(e.to_string()))?
+        } else {
+            GroupIssues::builder()
+                .scope(IssueScope::AssignedToMe)
+                .state(IssueState::Opened)
+                .build()
+                .map_err(|e| Error::Gitlab(e.to_string()))?
+        };
 
         let mut delay = Duration::from_secs(1);
         let mut attempt = 0u32;
@@ -58,6 +67,18 @@ impl GitlabClient {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Fetch all assigned issues from the provided groups
+    #[instrument(skip(self))]
+    pub async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<Issue>> {
+        let mut issues = Vec::new();
+
+        for group in groups {
+            issues.extend(self.fetch_assigned_issues(Some(group)).await?);
+        }
+
+        Ok(issues)
     }
 
     /// Record time spent on a GitLab issue.
@@ -92,7 +113,11 @@ where
 {
     let is_network = matches!(e, gitlab::api::ApiError::Client { .. });
     let msg = e.to_string();
-    if is_network { Error::Transient(msg) } else { Error::Gitlab(msg) }
+    if is_network {
+        Error::Transient(msg)
+    } else {
+        Error::Gitlab(msg)
+    }
 }
 
 /// Convert a raw JSON value from the GitLab issues API into [`Issue`].

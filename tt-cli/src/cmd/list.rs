@@ -13,7 +13,7 @@ pub async fn run() -> Result<()> {
     let socket = cfg.socket.unwrap_or_else(client::default_socket);
     let client = client::connect(&socket).await?;
     let reply = client
-        .get_assigned_issues()
+        .get_assigned_issues(None)
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;

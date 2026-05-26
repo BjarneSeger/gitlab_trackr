@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, instrument, warn};
 
-use gitlab_trackr_api::{
-    Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, VarlinkInterface,
-};
+use gitlab_trackr_api::{Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, VarlinkInterface};
 
 use crate::cache::IssueCache;
 use crate::error::Error;
@@ -29,6 +27,7 @@ impl VarlinkInterface for Handlers {
     async fn get_assigned_issues(
         &self,
         call: &mut dyn Call_GetAssignedIssues,
+        groups: Option<Vec<String>>,
     ) -> varlink::Result<()> {
         match self.cache.get() {
             Ok(Some(issues)) => {
@@ -39,16 +38,31 @@ impl VarlinkInterface for Handlers {
             Err(e) => warn!("cache read failed, treating as miss: {e}"),
         }
 
-        match self.gitlab.fetch_assigned_issues().await {
-            Ok(issues) => {
-                if let Err(e) = self.cache.put(&issues) {
-                    warn!("cache write failed: {e}");
+        if let Some(groups) = groups {
+            match self.gitlab.fetch_group_issues(groups).await {
+                Ok(issues) => {
+                    if let Err(e) = self.cache.put(&issues) {
+                        warn!(error = %e, "cache write failed");
+                    }
+                    call.reply(issues)
                 }
-                call.reply(issues)
+                Err(e) => {
+                    warn!(error = %e, "GitLab fetch failed");
+                    call.reply_gitlab_error(e.to_string())
+                }
             }
-            Err(e) => {
-                warn!(error = %e, "GitLab fetch failed");
-                call.reply_gitlab_error(e.to_string())
+        } else {
+            match self.gitlab.fetch_assigned_issues(None).await {
+                Ok(issues) => {
+                    if let Err(e) = self.cache.put(&issues) {
+                        warn!(eror = %e, "cache write failed");
+                    }
+                    call.reply(issues)
+                }
+                Err(e) => {
+                    warn!(error = %e, "GitLab fetch failed");
+                    call.reply_gitlab_error(e.to_string())
+                }
             }
         }
     }
@@ -83,7 +97,9 @@ impl VarlinkInterface for Handlers {
             }
             Err(Error::Transient(ref e)) => {
                 warn!(error = %e, project_id, issue_iid, "PostTime network error, queuing for retry");
-                self.queue.post_time(project_id, issue_iid, duration, summary).await;
+                self.queue
+                    .post_time(project_id, issue_iid, duration, summary)
+                    .await;
                 call.reply()
             }
             Err(e) => {

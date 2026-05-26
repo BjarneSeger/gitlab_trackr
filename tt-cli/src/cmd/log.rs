@@ -60,7 +60,7 @@ async fn resolve_project_id(iid: i64, socket: &str) -> Result<i64> {
     }
     let client = client::connect(socket).await?;
     let reply = client
-        .get_assigned_issues()
+        .get_assigned_issues(None)
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;

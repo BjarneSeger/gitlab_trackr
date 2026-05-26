@@ -38,7 +38,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     let socket = cfg.socket.clone().unwrap_or_else(client::default_socket);
     let client = client::connect(&socket).await?;
     let reply = client
-        .get_assigned_issues()
+        .get_assigned_issues(None)
         .call()
         .await
         .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;
@@ -60,7 +60,10 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     let issue = picked.0;
 
     let suggested = suggested_duration.unwrap_or(cfg.default_duration);
-    let duration = match Text::new("Duration:").with_initial_value(&suggested).prompt() {
+    let duration = match Text::new("Duration:")
+        .with_initial_value(&suggested)
+        .prompt()
+    {
         Ok(d) => d,
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
             println!("(skipped)");
