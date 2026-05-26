@@ -9,7 +9,7 @@ license = "GPL-3.0-only"
 
 [workspace.dependencies]
 # Shared error / serde / async core
-tokio = { version = "1", features = ["macros", "signal"] }
+tokio = { version = "1", features = ["macros", "signal", "time", "sync"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_derive = "1.0"

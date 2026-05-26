@@ -5,9 +5,10 @@
 //! daemon never touches `serde_json::Value`.
 
 use std::borrow::Cow;
+use std::time::Duration;
 
 use gitlab::api::AsyncQuery;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
 use gitlab_trackr_api::Issue;
@@ -26,22 +27,37 @@ impl GitlabClient {
     }
 
     /// Fetch all open issues assigned to the authenticated user.
+    ///
+    /// Retries up to three times on transient network errors with exponential backoff.
     #[instrument(skip(self))]
     pub async fn fetch_assigned_issues(&self) -> Result<Vec<Issue>> {
         use gitlab::api::issues::{IssueScope, IssueState, Issues};
 
-        let raw: Vec<serde_json::Value> = Issues::builder()
+        let query = Issues::builder()
             .scope(IssueScope::AssignedToMe)
             .state(IssueState::Opened)
             .build()
-            .map_err(|e| Error::Gitlab(e.to_string()))?
-            .query_async(&self.inner)
-            .await
             .map_err(|e| Error::Gitlab(e.to_string()))?;
 
-        let issues: Vec<Issue> = raw.iter().map(issue_from_value).collect();
-        info!(count = issues.len(), "fetched issues from GitLab");
-        Ok(issues)
+        let mut delay = Duration::from_secs(1);
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match query.query_async(&self.inner).await.map_err(classify) {
+                Ok(raw) => {
+                    let raw: Vec<serde_json::Value> = raw;
+                    let issues: Vec<Issue> = raw.iter().map(issue_from_value).collect();
+                    info!(count = issues.len(), "fetched issues from GitLab");
+                    return Ok(issues);
+                }
+                Err(e @ Error::Transient(_)) if attempt < 4 => {
+                    warn!(attempt, error = %e, delay_secs = delay.as_secs(), "fetch failed, retrying");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(4));
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// Record time spent on a GitLab issue.
@@ -63,9 +79,20 @@ impl GitlabClient {
         })
         .query_async(&self.inner)
         .await
-        .map_err(|e| Error::Gitlab(e.to_string()))?;
+        .map_err(classify)?;
         Ok(())
     }
+}
+
+/// Map a GitLab API error to [`Error::Transient`] for network failures and
+/// [`Error::Gitlab`] for permanent rejections (auth, 4xx, bad JSON, …).
+fn classify<E>(e: gitlab::api::ApiError<E>) -> Error
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let is_network = matches!(e, gitlab::api::ApiError::Client { .. });
+    let msg = e.to_string();
+    if is_network { Error::Transient(msg) } else { Error::Gitlab(msg) }
 }
 
 /// Convert a raw JSON value from the GitLab issues API into [`Issue`].

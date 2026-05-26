@@ -11,6 +11,7 @@ mod config;
 mod error;
 mod gitlab;
 mod handlers;
+mod queue;
 mod server;
 mod service;
 
@@ -19,6 +20,7 @@ use config::Config;
 use error::Result;
 use gitlab::GitlabClient;
 use handlers::Handlers;
+use queue::RetryQueue;
 use service::ServiceHandler;
 
 #[tokio::main(flavor = "current_thread")]
@@ -33,7 +35,9 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let gitlab = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
     let cache = Arc::new(IssueCache::open(&cfg.db_path, cfg.cache_ttl)?);
-    let handlers = Arc::new(Handlers { gitlab, cache });
+    let queue_db_path = cfg.db_path.with_file_name("queue.redb");
+    let queue = RetryQueue::new(Arc::clone(&gitlab), &queue_db_path)?;
+    let handlers = Arc::new(Handlers { gitlab, cache, queue });
 
     let listener = server::make_listener(&cfg.socket)?;
 

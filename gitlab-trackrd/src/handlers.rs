@@ -13,11 +13,14 @@ use gitlab_trackr_api::{
 };
 
 use crate::cache::IssueCache;
+use crate::error::Error;
 use crate::gitlab::GitlabClient;
+use crate::queue::RetryQueue;
 
 pub struct Handlers {
     pub gitlab: Arc<GitlabClient>,
     pub cache: Arc<IssueCache>,
+    pub queue: RetryQueue,
 }
 
 #[async_trait::async_trait]
@@ -78,8 +81,13 @@ impl VarlinkInterface for Handlers {
                 info!(project_id, issue_iid, duration, "posted time");
                 call.reply()
             }
+            Err(Error::Transient(ref e)) => {
+                warn!(error = %e, project_id, issue_iid, "PostTime network error, queuing for retry");
+                self.queue.post_time(project_id, issue_iid, duration, summary).await;
+                call.reply()
+            }
             Err(e) => {
-                warn!(error = %e, "PostTime failed");
+                warn!(error = %e, "PostTime rejected by GitLab");
                 call.reply_gitlab_error(e.to_string())
             }
         }

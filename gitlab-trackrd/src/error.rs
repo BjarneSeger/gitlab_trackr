@@ -8,6 +8,10 @@ pub enum Error {
     #[error("GitLab error: {0}")]
     Gitlab(String),
 
+    /// Transient network error — safe to retry.
+    #[error("network error: {0}")]
+    Transient(String),
+
     #[error(transparent)]
     CacheDatabase(#[from] redb::DatabaseError),
 
