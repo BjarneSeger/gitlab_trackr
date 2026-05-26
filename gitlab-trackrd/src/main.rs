@@ -1,8 +1,6 @@
 //! `gitlab-trackrd` — GitLab time-tracking varlink daemon.
 
 use std::sync::Arc;
-use std::time::Duration;
-
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -54,11 +52,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let idle_timeout = Duration::from_secs(cfg.cache_ttl * 3);
     let serve = server::serve(
         Arc::new(ServiceHandler::new(handlers)),
         listener,
-        idle_timeout,
     );
 
     use tokio::signal::unix::{SignalKind, signal};

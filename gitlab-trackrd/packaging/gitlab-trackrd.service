@@ -3,3 +3,6 @@ Description=GitLab time-tracking varlink daemon
 
 [Service]
 ExecStart=/usr/bin/gitlab-trackrd
+
+[Install]
+WantedBy=default.target
