@@ -12,6 +12,17 @@ type Issue (
   graph_status: string
 )
 
+type HistoryEvent (
+  timestamp: int,
+  source: string,
+  project_id: int,
+  issue_iid: int,
+  issue_title: string,
+  web_url: string,
+  duration: string,
+  summary: string
+)
+
 error GitlabError (message: string)
 
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
@@ -21,3 +32,5 @@ method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?str
 method CloseIssue(project_id: int, issue_iid: int) -> ()
 
 method ClearCache() -> ()
+
+method GetHistory() -> (events: []HistoryEvent)

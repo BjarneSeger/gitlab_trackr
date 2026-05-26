@@ -68,6 +68,15 @@ pub struct RetryQueue {
     next_id: AtomicU64,
 }
 
+/// A PostTime task currently in the retry queue, projected for the history view.
+pub struct PendingPostTime {
+    pub project_id: i64,
+    pub issue_iid: i64,
+    pub duration: String,
+    pub summary: Option<String>,
+    pub queued_at_secs: u64,
+}
+
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
@@ -148,6 +157,35 @@ impl RetryQueue {
     pub async fn close_issue(&self, project_id: i64, issue_iid: i64) {
         self.enqueue(project_id, issue_iid, QueueOp::CloseIssue)
             .await
+    }
+
+    /// Snapshot of PostTime tasks currently sitting in the queue.
+    ///
+    /// Used by the history view to prepend not-yet-flushed entries so the
+    /// user sees their just-logged time before the round-trip completes.
+    /// Once the worker succeeds and removes the task, the next history poll
+    /// surfaces the canonical GitLab record in its place.
+    pub fn pending_post_time(&self) -> Result<Vec<PendingPostTime>> {
+        let mut out = self.store.scan(|_, stored| {
+            Ok(match stored.op {
+                QueueOp::PostTime {
+                    duration, summary, ..
+                } => Some(PendingPostTime {
+                    project_id: stored.project_id,
+                    issue_iid: stored.issue_iid,
+                    duration,
+                    summary,
+                    queued_at_secs: stored.queued_at_secs,
+                }),
+                QueueOp::CloseIssue => None,
+            })
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+        out.sort_by_key(|p| std::cmp::Reverse(p.queued_at_secs));
+        Ok(out)
     }
 
     async fn enqueue(&self, project_id: i64, issue_iid: i64, op: QueueOp) {

@@ -26,6 +26,18 @@ pub struct IssueWithLabels {
     pub labels: Vec<String>,
 }
 
+/// A timelog entry as returned by GraphQL `currentUser.timelogs`. The handler
+/// fills in `project_id` from the issue cache before persisting.
+pub struct FetchedTimelog {
+    pub timelog_id: u64,
+    pub spent_at_secs: u64,
+    pub issue_iid: i64,
+    pub issue_title: String,
+    pub web_url: String,
+    pub duration: String,
+    pub summary: String,
+}
+
 impl GitlabClient {
     pub async fn connect(host: &str, token: &str) -> Result<Self> {
         let inner = gitlab::GitlabBuilder::new(host.to_string(), token.to_string())
@@ -149,6 +161,60 @@ impl GitlabClient {
         }
 
         Ok(())
+    }
+
+    /// Fetch the authenticated user's recent timelogs via GraphQL.
+    ///
+    /// Returns entries with `spent_at >= since`, newest first. Used by the
+    /// history refresh cycle to catch time logged via the web UI or other
+    /// clients. `time_spent` is converted from seconds into the same
+    /// "1h 30m"-style string GitLab returns elsewhere, so stored values look
+    /// like what users typed.
+    #[instrument(skip(self))]
+    pub async fn fetch_my_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<FetchedTimelog>> {
+        let endpoint = MyTimelogs {
+            start_time: since.to_rfc3339(),
+        };
+
+        let raw: serde_json::Value = endpoint.query_async(&self.inner).await.map_err(classify)?;
+
+        let nodes = raw["data"]["currentUser"]["timelogs"]["nodes"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+
+        let mut out = Vec::with_capacity(nodes.len());
+        for n in &nodes {
+            let Some(timelog_id) = parse_gid(n["id"].as_str().unwrap_or("")) else {
+                continue;
+            };
+            let spent_at = n["spentAt"].as_str().unwrap_or("");
+            let spent_at_secs = chrono::DateTime::parse_from_rfc3339(spent_at)
+                .map(|d| d.timestamp().max(0) as u64)
+                .unwrap_or(0);
+            let time_spent_secs = n["timeSpent"].as_i64().unwrap_or(0).max(0) as u64;
+
+            out.push(FetchedTimelog {
+                timelog_id,
+                spent_at_secs,
+                issue_iid: n["issue"]["iid"]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .or_else(|| n["issue"]["iid"].as_i64())
+                    .unwrap_or(0),
+                issue_title: n["issue"]["title"].as_str().unwrap_or("").to_string(),
+                web_url: n["issue"]["webUrl"].as_str().unwrap_or("").to_string(),
+                duration: format_duration(time_spent_secs),
+                summary: n["summary"].as_str().unwrap_or("").to_string(),
+            });
+        }
+
+        out.sort_by_key(|t| std::cmp::Reverse(t.spent_at_secs));
+        info!(count = out.len(), "fetched timelogs from GitLab");
+        Ok(out)
     }
 
     /// Close a GitLab issue (`PUT /projects/:id/issues/:iid` with `state_event=close`).
@@ -356,6 +422,77 @@ impl gitlab::api::Endpoint for ListProjectBoards {
     fn endpoint(&self) -> Cow<'static, str> {
         format!("projects/{}/boards", self.project_id).into()
     }
+}
+
+/// `POST /api/graphql` for `currentUser.timelogs`.
+///
+/// Pulls the authenticated user's timelogs since `start_time`. Used by the
+/// history refresh cycle so entries logged outside the daemon (web UI, other
+/// clients) still show up.
+struct MyTimelogs {
+    start_time: String,
+}
+
+impl gitlab::api::Endpoint for MyTimelogs {
+    fn method(&self) -> http::Method {
+        http::Method::POST
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "api/graphql".into()
+    }
+
+    fn url_base(&self) -> UrlBase {
+        UrlBase::Instance
+    }
+
+    fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
+        let body = serde_json::json!({
+            "query": "query($start: Time!) {\
+                currentUser {\
+                    timelogs(startTime: $start) {\
+                        nodes {\
+                            id\
+                            timeSpent\
+                            spentAt\
+                            summary\
+                            issue { iid title webUrl }\
+                        }\
+                    }\
+                }\
+            }",
+            "variables": { "start": self.start_time },
+        });
+        Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// Pull the trailing integer out of a `gid://gitlab/Timelog/<id>` global ID.
+fn parse_gid(gid: &str) -> Option<u64> {
+    gid.rsplit('/').next().and_then(|s| s.parse().ok())
+}
+
+/// Format a duration in seconds as `"1h 30m"` (or `"45s"` when sub-minute).
+/// Matches the style GitLab itself uses for `human_total_time_spent`.
+fn format_duration(secs: u64) -> String {
+    if secs == 0 {
+        return "0m".to_string();
+    }
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let rem = secs % 60;
+
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if hours == 0 && mins == 0 && rem > 0 {
+        parts.push(format!("{rem}s"));
+    }
+    parts.join(" ")
 }
 
 /// `GET /projects/:project_id/boards/:board_id/lists`

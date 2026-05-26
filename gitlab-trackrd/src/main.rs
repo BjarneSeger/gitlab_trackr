@@ -11,6 +11,7 @@ mod db;
 mod error;
 mod gitlab;
 mod handlers;
+mod history;
 mod queue;
 mod server;
 mod service;
@@ -21,6 +22,7 @@ use config::Config;
 use error::Result;
 use gitlab::GitlabClient;
 use handlers::Handlers;
+use history::HistoryCache;
 use queue::RetryQueue;
 use service::ServiceHandler;
 
@@ -38,12 +40,15 @@ async fn main() -> Result<()> {
     let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
     let boards_db_path = cfg.db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);
+    let history_db_path = cfg.db_path.with_file_name("history.redb");
+    let history = Arc::new(HistoryCache::open(&history_db_path)?);
     let queue_db_path = cfg.db_path.with_file_name("queue.redb");
     let queue = RetryQueue::new(Arc::clone(&gitlab), &queue_db_path)?;
     let handlers = Arc::new(Handlers {
         gitlab,
         cache,
         boards,
+        history,
         queue,
     });
 

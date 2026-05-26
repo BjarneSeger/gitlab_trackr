@@ -10,9 +10,9 @@ use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    AsyncCall, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_PostTime,
-    CloseIssue_Args, GetAssignedIssues_Args, PostTime_Args, VARLINK_INTERFACE_DESCRIPTION,
-    VarlinkInterface as _,
+    AsyncCall, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory,
+    Call_PostTime, CloseIssue_Args, GetAssignedIssues_Args, PostTime_Args,
+    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -123,6 +123,11 @@ async fn handle_trackrd(
         "org.thehoster.gitlab.trackrd.ClearCache" => {
             handlers
                 .clear_cache(&mut call as &mut dyn Call_ClearCache)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.GetHistory" => {
+            handlers
+                .get_history(&mut call as &mut dyn Call_GetHistory)
                 .await?;
         }
         "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {
