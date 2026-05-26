@@ -6,7 +6,10 @@ type Issue (
   project_id: int,
   title: string,
   web_url: string,
-  state: string
+  state: string,
+  parent: string,
+  total_time: string,
+  graph_status: string
 )
 
 error GitlabError (message: string)
@@ -14,5 +17,7 @@ error GitlabError (message: string)
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
+
+method CloseIssue(project_id: int, issue_iid: int) -> ()
 
 method ClearCache() -> ()

@@ -196,6 +196,15 @@ impl<K: Key + 'static, V: Owned> KvStore<K, V> {
         txn.commit()?;
         Ok(())
     }
+
+    /// Drop every entry in the table.
+    pub fn clear(&self) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        txn.delete_table(self.table)?;
+        txn.open_table(self.table)?;
+        txn.commit()?;
+        Ok(())
+    }
 }
 
 impl<V: Owned> KvStore<u64, V> {

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+mod boards;
 mod cache;
 mod config;
 mod db;
@@ -14,6 +15,7 @@ mod queue;
 mod server;
 mod service;
 
+use boards::BoardCache;
 use cache::IssueCache;
 use config::Config;
 use error::Result;
@@ -34,9 +36,16 @@ async fn main() -> Result<()> {
     let cfg = Config::from_env()?;
     let gitlab = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
     let cache = Arc::new(IssueCache::open(&cfg.db_path, cfg.cache_ttl)?);
+    let boards_db_path = cfg.db_path.with_file_name("boards.redb");
+    let boards = Arc::new(BoardCache::open(&boards_db_path)?);
     let queue_db_path = cfg.db_path.with_file_name("queue.redb");
     let queue = RetryQueue::new(Arc::clone(&gitlab), &queue_db_path)?;
-    let handlers = Arc::new(Handlers { gitlab, cache, queue });
+    let handlers = Arc::new(Handlers {
+        gitlab,
+        cache,
+        boards,
+        queue,
+    });
 
     let listener = server::make_listener(&cfg.socket)?;
 

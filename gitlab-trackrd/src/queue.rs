@@ -5,10 +5,10 @@
 //! exponential backoff (1 s base, 30 min cap).  Network errors trigger
 //! retries for up to 7 days; GitLab rejections drop the task immediately.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::path::Path;
 
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
@@ -17,34 +17,42 @@ use tracing::{error, info, warn};
 
 use crate::db::KvStore;
 use crate::error::{Error, Result};
-use crate::impl_redb_json_value;
 use crate::gitlab::GitlabClient;
+use crate::impl_redb_json_value;
 
-const QUEUE_TABLE: TableDefinition<u64, StoredTask> =
-    TableDefinition::new("post_time_queue");
+// Table name bumped from `post_time_queue` so older `StoredTask` records that
+// don't carry the new `op` field don't crash deserialization on startup.
+const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v2");
 
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
 const MAX_LIFETIME: Duration = Duration::from_hours(168);
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum QueueOp {
+    PostTime {
+        duration: String,
+        summary: Option<String>,
+    },
+    CloseIssue,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredTask {
     project_id: i64,
     issue_iid: i64,
-    duration: String,
-    summary: Option<String>,
+    op: QueueOp,
     /// UNIX timestamp (seconds) when the task was first enqueued.
     queued_at_secs: u64,
 }
 
-impl_redb_json_value!(StoredTask, "StoredTask");
+impl_redb_json_value!(StoredTask, "StoredTaskV2");
 
 struct QueuedTask {
     id: u64,
     project_id: i64,
     issue_iid: i64,
-    duration: String,
-    summary: Option<String>,
+    op: QueueOp,
     queued_at_secs: u64,
 }
 
@@ -65,8 +73,7 @@ impl RetryQueue {
                 id,
                 project_id: stored.project_id,
                 issue_iid: stored.issue_iid,
-                duration: stored.duration,
-                summary: stored.summary,
+                op: stored.op,
                 queued_at_secs: stored.queued_at_secs,
             })
         })?;
@@ -76,7 +83,7 @@ impl RetryQueue {
         if !initial_tasks.is_empty() {
             info!(
                 count = initial_tasks.len(),
-                "reloaded pending PostTime tasks from queue database"
+                "reloaded pending tasks from queue database"
             );
         }
 
@@ -102,7 +109,7 @@ impl RetryQueue {
         })
     }
 
-    /// Persist `task` to disk and hand it to the background worker.
+    /// Persist a `PostTime` task to disk and hand it to the background worker.
     /// Returns immediately; the caller does not wait for the network operation.
     pub async fn post_time(
         &self,
@@ -111,20 +118,35 @@ impl RetryQueue {
         duration: String,
         summary: Option<String>,
     ) {
+        self.enqueue(
+            project_id,
+            issue_iid,
+            QueueOp::PostTime { duration, summary },
+        )
+        .await
+    }
+
+    /// Persist a `CloseIssue` task to disk and hand it to the background worker.
+    /// Returns immediately; the caller does not wait for the network operation.
+    pub async fn close_issue(&self, project_id: i64, issue_iid: i64) {
+        self.enqueue(project_id, issue_iid, QueueOp::CloseIssue)
+            .await
+    }
+
+    async fn enqueue(&self, project_id: i64, issue_iid: i64, op: QueueOp) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let queued_at_secs = now_secs();
 
         let stored = StoredTask {
             project_id,
             issue_iid,
-            duration: duration.clone(),
-            summary: summary.clone(),
+            op: op.clone(),
             queued_at_secs,
         };
         if let Err(e) = self.store.put(id, stored) {
             warn!(
                 error = %e,
-                "failed to persist PostTime task to queue db; it will not survive a restart"
+                "failed to persist task to queue db; it will not survive a restart"
             );
         }
 
@@ -132,12 +154,11 @@ impl RetryQueue {
             id,
             project_id,
             issue_iid,
-            duration,
-            summary,
+            op,
             queued_at_secs,
         };
         if self.sender.send(task).await.is_err() {
-            error!("retry queue channel closed; dropping PostTime task");
+            error!("retry queue channel closed; dropping task");
         }
     }
 }
@@ -153,22 +174,29 @@ async fn worker(
 
         'retry: loop {
             attempt += 1;
-            match gitlab
-                .add_spent_time(
-                    task.project_id,
-                    task.issue_iid,
-                    &task.duration,
-                    task.summary.as_deref(),
-                )
-                .await
-            {
+            let outcome = match &task.op {
+                QueueOp::PostTime { duration, summary } => {
+                    gitlab
+                        .add_spent_time(
+                            task.project_id,
+                            task.issue_iid,
+                            duration,
+                            summary.as_deref(),
+                        )
+                        .await
+                }
+                QueueOp::CloseIssue => gitlab.close_issue(task.project_id, task.issue_iid).await,
+            };
+
+            match outcome {
                 Ok(()) => {
                     if attempt > 1 {
                         info!(
                             attempt,
                             project_id = task.project_id,
                             issue_iid = task.issue_iid,
-                            "PostTime succeeded after retry"
+                            op = task.op.kind(),
+                            "task succeeded after retry"
                         );
                     }
                     break 'retry;
@@ -182,8 +210,8 @@ async fn worker(
                             error = %e,
                             project_id = task.project_id,
                             issue_iid = task.issue_iid,
-                            duration = %task.duration,
-                            "PostTime dropping task after 7-day retry window"
+                            op = task.op.kind(),
+                            "dropping task after 7-day retry window"
                         );
                         break 'retry;
                     }
@@ -193,7 +221,8 @@ async fn worker(
                         error = %e,
                         delay_secs = sleep.as_secs(),
                         project_id = task.project_id,
-                        "PostTime network error, retrying"
+                        op = task.op.kind(),
+                        "task network error, retrying"
                     );
                     tokio::time::sleep(sleep).await;
                     delay = (delay * 2).min(MAX_DELAY);
@@ -203,8 +232,8 @@ async fn worker(
                         error = %e,
                         project_id = task.project_id,
                         issue_iid = task.issue_iid,
-                        duration = %task.duration,
-                        "PostTime rejected by GitLab; dropping task"
+                        op = task.op.kind(),
+                        "task rejected by GitLab; dropping"
                     );
                     break 'retry;
                 }
@@ -215,8 +244,17 @@ async fn worker(
             warn!(
                 error = %e,
                 task_id = task.id,
-                "failed to remove completed PostTime task from queue db"
+                "failed to remove completed task from queue db"
             );
+        }
+    }
+}
+
+impl QueueOp {
+    fn kind(&self) -> &'static str {
+        match self {
+            QueueOp::PostTime { .. } => "PostTime",
+            QueueOp::CloseIssue => "CloseIssue",
         }
     }
 }

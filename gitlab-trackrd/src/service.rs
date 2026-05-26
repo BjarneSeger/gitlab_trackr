@@ -10,8 +10,9 @@ use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    AsyncCall, Call_ClearCache, Call_GetAssignedIssues, Call_PostTime, GetAssignedIssues_Args,
-    PostTime_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    AsyncCall, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_PostTime,
+    CloseIssue_Args, GetAssignedIssues_Args, PostTime_Args, VARLINK_INTERFACE_DESCRIPTION,
+    VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -164,6 +165,28 @@ async fn handle_trackrd(
                     args.issue_iid,
                     args.duration,
                     args.summary,
+                )
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.CloseIssue" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: CloseIssue_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .close_issue(
+                    &mut call as &mut dyn Call_CloseIssue,
+                    args.project_id,
+                    args.issue_iid,
                 )
                 .await?;
         }
