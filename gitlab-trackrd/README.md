@@ -17,7 +17,7 @@ required; everything else has a sensible default.
 | `GITLAB_TOKEN` | **yes** | — | Personal access token |
 | `GITLAB_HOST` | no | `gitlab.com` | GitLab instance hostname (e.g. `gitlab.example.com`) |
 | `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket` | Varlink socket address.  Falls back to `unix:/tmp/gitlab-trackrd.socket` when `$XDG_RUNTIME_DIR` is unset. |
-| `GITLAB_TRACKRD_CACHE_TTL` | no | `300` | Seconds before the issue cache is considered stale |
+| `GITLAB_TRACKRD_REFRESH_INTERVAL` | no | `300` | Seconds before the issue cache is refreshed |
 
 ## Checking everything works
 ```sh

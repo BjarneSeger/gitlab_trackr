@@ -28,6 +28,24 @@ pub struct Handlers {
 }
 
 impl Handlers {
+    /// Unconditionally fetch issues and boards from GitLab and update both caches.
+    /// Called by the background refresh task; errors are logged and not propagated.
+    pub async fn refresh_cache(&self) {
+        match self.gitlab.fetch_assigned_issues(None).await {
+            Ok(raw) => {
+                let issues = self.enrich_graph_status(raw).await;
+                if let Err(e) = self.cache.put(&issues) {
+                    warn!(error = %e, "background cache write failed");
+                } else {
+                    info!(count = issues.len(), "background cache refresh complete");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "background cache refresh: GitLab fetch failed");
+            }
+        }
+    }
+
     /// Fill `graph_status` on each issue using cached or freshly-fetched board
     /// list labels. Best-effort: a board fetch failure for a project leaves
     /// that project's issues with an empty `graph_status`.

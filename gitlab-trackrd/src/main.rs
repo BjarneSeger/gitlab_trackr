@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     let cfg = Config::from_env()?;
     let gitlab = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
-    let cache = Arc::new(IssueCache::open(&cfg.db_path, cfg.cache_ttl)?);
+    let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
     let boards_db_path = cfg.db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);
     let queue_db_path = cfg.db_path.with_file_name("queue.redb");
@@ -51,21 +51,31 @@ async fn main() -> Result<()> {
 
     if server::is_socket_activated() {
         info!(
-            cache_ttl = cfg.cache_ttl,
+            refresh_interval = cfg.refresh_interval,
             "starting gitlab-trackrd from socket"
         );
     } else {
         info!(
             socket = cfg.socket,
-            cache_ttl = cfg.cache_ttl,
+            refresh_interval = cfg.refresh_interval,
             "starting gitlab-trackrd"
         );
     }
 
-    let serve = server::serve(
-        Arc::new(ServiceHandler::new(handlers)),
-        listener,
-    );
+    {
+        let handlers_ref = Arc::clone(&handlers);
+        let interval_secs = cfg.refresh_interval;
+        tokio::spawn(async move {
+            let duration = std::time::Duration::from_secs(interval_secs);
+            loop {
+                tokio::time::sleep(duration).await;
+                info!("background cache refresh triggered");
+                handlers_ref.refresh_cache().await;
+            }
+        });
+    }
+
+    let serve = server::serve(Arc::new(ServiceHandler::new(handlers)), listener);
 
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate())?;

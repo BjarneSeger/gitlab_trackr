@@ -24,29 +24,23 @@ struct CachedData {
 
 impl_redb_json_value!(CachedData, "CachedData");
 
-const ISSUES_TABLE: TableDefinition<&str, CachedData> =
-    TableDefinition::new("issues_cache");
+const ISSUES_TABLE: TableDefinition<&str, CachedData> = TableDefinition::new("issues_cache");
 
 pub struct IssueCache {
     store: KvStore<&'static str, CachedData>,
-    ttl_secs: u64,
 }
 
 impl IssueCache {
     /// Open (or create) the cache database at `path`.
-    pub fn open(path: &Path, ttl_secs: u64) -> Result<Self> {
+    pub fn open(path: &Path) -> Result<Self> {
         Ok(Self {
             store: KvStore::open(path, ISSUES_TABLE)?,
-            ttl_secs,
         })
     }
 
     /// Return a fresh-enough cached issue list, or `None` if absent/stale.
     pub fn get(&self) -> Result<Option<Vec<Issue>>> {
-        let Some(data) = self.store.get("assigned")? else {
-            return Ok(None);
-        };
-        Ok((now_secs().saturating_sub(data.timestamp) < self.ttl_secs).then_some(data.issues))
+        Ok(self.store.get("assigned")?.map(|data| data.issues))
     }
 
     /// Replace the cached issue list with `issues`, stamped at the current time.
