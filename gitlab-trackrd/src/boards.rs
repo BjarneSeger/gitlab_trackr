@@ -50,3 +50,51 @@ impl BoardCache {
         self.store.clear()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cache() -> (BoardCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boards.redb");
+        (BoardCache::open(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn fresh_cache_returns_none() {
+        let (c, _td) = cache();
+        assert!(c.get(42).unwrap().is_none());
+    }
+
+    #[test]
+    fn put_then_get_roundtrips_per_project() {
+        let (c, _td) = cache();
+        c.put(1, vec!["Doing".into(), "Done".into()]).unwrap();
+        c.put(2, vec!["Review".into()]).unwrap();
+        assert_eq!(
+            c.get(1).unwrap(),
+            Some(vec!["Doing".into(), "Done".into()])
+        );
+        assert_eq!(c.get(2).unwrap(), Some(vec!["Review".into()]));
+        assert!(c.get(3).unwrap().is_none());
+    }
+
+    #[test]
+    fn put_overwrites_same_project() {
+        let (c, _td) = cache();
+        c.put(1, vec!["old".into()]).unwrap();
+        c.put(1, vec!["new".into()]).unwrap();
+        assert_eq!(c.get(1).unwrap(), Some(vec!["new".into()]));
+    }
+
+    #[test]
+    fn clear_empties_all_projects() {
+        let (c, _td) = cache();
+        c.put(1, vec!["a".into()]).unwrap();
+        c.put(2, vec!["b".into()]).unwrap();
+        c.clear().unwrap();
+        assert!(c.get(1).unwrap().is_none());
+        assert!(c.get(2).unwrap().is_none());
+    }
+}

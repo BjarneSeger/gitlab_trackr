@@ -67,3 +67,81 @@ fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_issue(iid: i64, title: &str) -> Issue {
+        Issue {
+            id: iid * 10,
+            iid,
+            project_id: 1,
+            title: title.to_string(),
+            web_url: format!("https://gl/-/issues/{iid}"),
+            state: "opened".to_string(),
+            parent: String::new(),
+            total_time: String::new(),
+            graph_status: String::new(),
+        }
+    }
+
+    fn cache() -> (IssueCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.redb");
+        (IssueCache::open(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn fresh_cache_returns_none() {
+        let (c, _td) = cache();
+        assert!(c.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn put_then_get_roundtrips_issues() {
+        let (c, _td) = cache();
+        let issues = vec![make_issue(1, "a"), make_issue(2, "b")];
+        c.put(&issues).unwrap();
+        let got = c.get().unwrap().expect("cache should have an entry");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].iid, 1);
+        assert_eq!(got[1].title, "b");
+    }
+
+    #[test]
+    fn put_overwrites_previous_entry() {
+        let (c, _td) = cache();
+        c.put(&[make_issue(1, "old")]).unwrap();
+        c.put(&[make_issue(2, "new")]).unwrap();
+        let got = c.get().unwrap().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].title, "new");
+    }
+
+    #[test]
+    fn clear_removes_entry() {
+        let (c, _td) = cache();
+        c.put(&[make_issue(1, "a")]).unwrap();
+        c.clear().unwrap();
+        assert!(c.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.redb");
+        {
+            let c = IssueCache::open(&path).unwrap();
+            c.put(&[make_issue(1, "persisted")]).unwrap();
+        }
+        let c = IssueCache::open(&path).unwrap();
+        let got = c.get().unwrap().unwrap();
+        assert_eq!(got[0].title, "persisted");
+    }
+
+    #[test]
+    fn now_secs_is_positive() {
+        assert!(now_secs() > 0);
+    }
+}

@@ -20,7 +20,7 @@ use boards::BoardCache;
 use cache::IssueCache;
 use config::Config;
 use error::Result;
-use gitlab::GitlabClient;
+use gitlab::{GitlabApi, GitlabClient};
 use handlers::Handlers;
 use history::HistoryCache;
 use queue::RetryQueue;
@@ -36,7 +36,8 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let gitlab = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
+    let gitlab: Arc<dyn GitlabApi> =
+        Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
     let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
     let boards_db_path = cfg.db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);

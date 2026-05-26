@@ -38,6 +38,44 @@ pub struct FetchedTimelog {
     pub summary: String,
 }
 
+/// Daemon-facing GitLab surface. Lets tests substitute a fake without touching
+/// the real `gitlab` crate. Production code path goes through the impl on
+/// [`GitlabClient`].
+#[async_trait::async_trait]
+pub trait GitlabApi: Send + Sync {
+    async fn fetch_assigned_issues(
+        &self,
+        group: Option<String>,
+    ) -> Result<Vec<IssueWithLabels>>;
+
+    async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>>;
+
+    async fn add_spent_time(
+        &self,
+        project_id: i64,
+        issue_iid: i64,
+        duration: &str,
+        summary: Option<&str>,
+    ) -> Result<()>;
+
+    async fn create_timelog(
+        &self,
+        issue_id: i64,
+        duration: &str,
+        summary: &str,
+        spent_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()>;
+
+    async fn fetch_my_timelogs(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<FetchedTimelog>>;
+
+    async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+
+    async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>>;
+}
+
 impl GitlabClient {
     pub async fn connect(host: &str, token: &str) -> Result<Self> {
         let inner = gitlab::GitlabBuilder::new(host.to_string(), token.to_string())
@@ -46,12 +84,15 @@ impl GitlabClient {
             .map_err(|e| Error::Gitlab(e.to_string()))?;
         Ok(Self { inner })
     }
+}
 
+#[async_trait::async_trait]
+impl GitlabApi for GitlabClient {
     /// Fetch all open issues assigned to the authenticated user.
     ///
     /// Retries up to three times on transient network errors with exponential backoff.
     #[instrument(skip(self))]
-    pub async fn fetch_assigned_issues(
+    async fn fetch_assigned_issues(
         &self,
         group: Option<String>,
     ) -> Result<Vec<IssueWithLabels>> {
@@ -95,7 +136,7 @@ impl GitlabClient {
 
     /// Fetch all assigned issues from the provided groups
     #[instrument(skip(self))]
-    pub async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>> {
+    async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>> {
         let mut issues = Vec::new();
 
         for group in groups {
@@ -107,7 +148,7 @@ impl GitlabClient {
 
     /// Record time spent on a GitLab issue.
     #[instrument(skip(self))]
-    pub async fn add_spent_time(
+    async fn add_spent_time(
         &self,
         project_id: i64,
         issue_iid: i64,
@@ -133,7 +174,7 @@ impl GitlabClient {
     /// task that was queued during an outage appears in GitLab at the time the
     /// user actually logged it, not the time we reconnected.
     #[instrument(skip(self))]
-    pub async fn create_timelog(
+    async fn create_timelog(
         &self,
         issue_id: i64,
         duration: &str,
@@ -171,7 +212,7 @@ impl GitlabClient {
     /// "1h 30m"-style string GitLab returns elsewhere, so stored values look
     /// like what users typed.
     #[instrument(skip(self))]
-    pub async fn fetch_my_timelogs(
+    async fn fetch_my_timelogs(
         &self,
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<FetchedTimelog>> {
@@ -219,7 +260,7 @@ impl GitlabClient {
 
     /// Close a GitLab issue (`PUT /projects/:id/issues/:iid` with `state_event=close`).
     #[instrument(skip(self))]
-    pub async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()> {
+    async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()> {
         use gitlab::api::ignore;
 
         ignore(CloseIssueEndpoint {
@@ -238,7 +279,7 @@ impl GitlabClient {
     /// to the first of its labels that appears in this list. Lists without a
     /// label (e.g. backlog/closed) are skipped.
     #[instrument(skip(self))]
-    pub async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>> {
+    async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>> {
         let boards: Vec<serde_json::Value> = ListProjectBoards { project_id }
             .query_async(&self.inner)
             .await
@@ -512,5 +553,123 @@ impl gitlab::api::Endpoint for ListBoardLists {
             self.project_id, self.board_id
         )
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_duration_zero() {
+        assert_eq!(format_duration(0), "0m");
+    }
+
+    #[test]
+    fn format_duration_sub_minute() {
+        assert_eq!(format_duration(45), "45s");
+    }
+
+    #[test]
+    fn format_duration_exact_minute() {
+        assert_eq!(format_duration(60), "1m");
+    }
+
+    #[test]
+    fn format_duration_drops_sub_minute_when_minutes_present() {
+        // 90s is 1m 30s, but the formatter only emits seconds when both
+        // hours and minutes are zero — anything past a minute rounds down.
+        assert_eq!(format_duration(90), "1m");
+    }
+
+    #[test]
+    fn format_duration_exact_hour() {
+        assert_eq!(format_duration(3600), "1h");
+    }
+
+    #[test]
+    fn format_duration_hours_and_minutes() {
+        assert_eq!(format_duration(5400), "1h 30m");
+    }
+
+    #[test]
+    fn format_duration_large() {
+        // 100h 1m
+        assert_eq!(format_duration(360_060), "100h 1m");
+    }
+
+    #[test]
+    fn parse_gid_full_form() {
+        assert_eq!(parse_gid("gid://gitlab/Timelog/42"), Some(42));
+    }
+
+    #[test]
+    fn parse_gid_bare_number() {
+        assert_eq!(parse_gid("42"), Some(42));
+    }
+
+    #[test]
+    fn parse_gid_empty() {
+        assert_eq!(parse_gid(""), None);
+    }
+
+    #[test]
+    fn parse_gid_non_numeric_tail() {
+        assert_eq!(parse_gid("gid://gitlab/Timelog/abc"), None);
+    }
+
+    #[test]
+    fn parse_gid_trailing_slash() {
+        assert_eq!(parse_gid("gid://gitlab/Timelog/"), None);
+    }
+
+    #[test]
+    fn issue_with_labels_complete() {
+        let v = serde_json::json!({
+            "id": 123,
+            "iid": 7,
+            "project_id": 9,
+            "title": "Fix it",
+            "web_url": "https://example.com/issues/7",
+            "state": "opened",
+            "epic": { "url": "https://example.com/epics/1" },
+            "time_stats": { "human_total_time_spent": "2h" },
+            "labels": ["bug", "high"],
+        });
+        let r = issue_with_labels(&v);
+        assert_eq!(r.issue.id, 123);
+        assert_eq!(r.issue.iid, 7);
+        assert_eq!(r.issue.project_id, 9);
+        assert_eq!(r.issue.title, "Fix it");
+        assert_eq!(r.issue.web_url, "https://example.com/issues/7");
+        assert_eq!(r.issue.state, "opened");
+        assert_eq!(r.issue.parent, "https://example.com/epics/1");
+        assert_eq!(r.issue.total_time, "2h");
+        assert!(r.issue.graph_status.is_empty(), "graph_status is filled later");
+        assert_eq!(r.labels, vec!["bug".to_string(), "high".to_string()]);
+    }
+
+    #[test]
+    fn issue_with_labels_missing_fields_default() {
+        let v = serde_json::json!({});
+        let r = issue_with_labels(&v);
+        assert_eq!(r.issue.id, 0);
+        assert_eq!(r.issue.iid, 0);
+        assert_eq!(r.issue.project_id, 0);
+        assert!(r.issue.title.is_empty());
+        assert!(r.issue.web_url.is_empty());
+        assert!(r.issue.state.is_empty());
+        assert!(r.issue.parent.is_empty());
+        assert!(r.issue.total_time.is_empty());
+        assert!(r.labels.is_empty());
+    }
+
+    #[test]
+    fn issue_with_labels_filters_non_string_labels() {
+        let v = serde_json::json!({
+            "labels": ["ok", 42, null, "good"],
+        });
+        let r = issue_with_labels(&v);
+        assert_eq!(r.labels, vec!["ok".to_string(), "good".to_string()]);
     }
 }

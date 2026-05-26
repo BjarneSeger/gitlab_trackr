@@ -18,12 +18,12 @@ use gitlab_trackr_api::{
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::error::Error;
-use crate::gitlab::{FetchedTimelog, GitlabClient, IssueWithLabels};
+use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
 use crate::history::{HISTORY_WINDOW, HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
 
 pub struct Handlers {
-    pub gitlab: Arc<GitlabClient>,
+    pub gitlab: Arc<dyn GitlabApi>,
     pub cache: Arc<IssueCache>,
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
@@ -36,7 +36,7 @@ impl Handlers {
     pub async fn refresh_cache(&self) {
         match self.gitlab.fetch_assigned_issues(None).await {
             Ok(raw) => {
-                let issues = self.enrich_graph_status(raw).await;
+                let issues = enrich_graph_status(&*self.gitlab, &self.boards, raw).await;
                 if let Err(e) = self.cache.put(&issues) {
                     warn!(error = %e, "background cache write failed");
                 } else {
@@ -92,57 +92,62 @@ impl Handlers {
         }
     }
 
-    /// Fill `graph_status` on each issue using cached or freshly-fetched board
-    /// list labels. Best-effort: a board fetch failure for a project leaves
-    /// that project's issues with an empty `graph_status`.
-    async fn enrich_graph_status(&self, raw: Vec<IssueWithLabels>) -> Vec<Issue> {
-        let mut by_project: HashMap<i64, Option<Vec<String>>> = HashMap::new();
-        let mut out = Vec::with_capacity(raw.len());
+}
 
-        for IssueWithLabels { mut issue, labels } in raw {
-            let project_id = issue.project_id;
+/// Fill `graph_status` on each issue using cached or freshly-fetched board
+/// list labels. Best-effort: a board fetch failure for a project leaves
+/// that project's issues with an empty `graph_status`.
+async fn enrich_graph_status(
+    gitlab: &dyn GitlabApi,
+    boards: &BoardCache,
+    raw: Vec<IssueWithLabels>,
+) -> Vec<Issue> {
+    let mut by_project: HashMap<i64, Option<Vec<String>>> = HashMap::new();
+    let mut out = Vec::with_capacity(raw.len());
 
-            let board_labels = match by_project.get(&project_id) {
-                Some(entry) => entry.clone(),
-                None => {
-                    let resolved = match self.boards.get(project_id) {
-                        Ok(Some(cached)) => Some(cached),
-                        Ok(None) => match self.gitlab.fetch_board_list_labels(project_id).await {
-                            Ok(fetched) => {
-                                if let Err(e) = self.boards.put(project_id, fetched.clone()) {
-                                    warn!(error = %e, project_id, "failed to persist board labels");
-                                }
-                                Some(fetched)
+    for IssueWithLabels { mut issue, labels } in raw {
+        let project_id = issue.project_id;
+
+        let board_labels = match by_project.get(&project_id) {
+            Some(entry) => entry.clone(),
+            None => {
+                let resolved = match boards.get(project_id) {
+                    Ok(Some(cached)) => Some(cached),
+                    Ok(None) => match gitlab.fetch_board_list_labels(project_id).await {
+                        Ok(fetched) => {
+                            if let Err(e) = boards.put(project_id, fetched.clone()) {
+                                warn!(error = %e, project_id, "failed to persist board labels");
                             }
-                            Err(e) => {
-                                warn!(error = %e, project_id, "board fetch failed; graph_status will be empty");
-                                None
-                            }
-                        },
+                            Some(fetched)
+                        }
                         Err(e) => {
-                            warn!(error = %e, project_id, "board cache read failed");
+                            warn!(error = %e, project_id, "board fetch failed; graph_status will be empty");
                             None
                         }
-                    };
-                    by_project.insert(project_id, resolved.clone());
-                    resolved
-                }
-            };
+                    },
+                    Err(e) => {
+                        warn!(error = %e, project_id, "board cache read failed");
+                        None
+                    }
+                };
+                by_project.insert(project_id, resolved.clone());
+                resolved
+            }
+        };
 
-            issue.graph_status = match board_labels {
-                Some(board) => labels
-                    .iter()
-                    .find(|l| board.iter().any(|b| b == *l))
-                    .cloned()
-                    .unwrap_or_else(|| issue.state.clone()),
-                None => String::new(),
-            };
+        issue.graph_status = match board_labels {
+            Some(board) => labels
+                .iter()
+                .find(|l| board.iter().any(|b| b == *l))
+                .cloned()
+                .unwrap_or_else(|| issue.state.clone()),
+            None => String::new(),
+        };
 
-            out.push(issue);
-        }
-
-        out
+        out.push(issue);
     }
+
+    out
 }
 
 #[async_trait::async_trait]
@@ -170,7 +175,7 @@ impl VarlinkInterface for Handlers {
 
         match fetched {
             Ok(raw) => {
-                let issues = self.enrich_graph_status(raw).await;
+                let issues = enrich_graph_status(&*self.gitlab, &self.boards, raw).await;
                 if let Err(e) = self.cache.put(&issues) {
                     warn!(error = %e, "cache write failed");
                 }
@@ -353,4 +358,312 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result as TrackrResult;
+    use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn issue(project_id: i64, iid: i64, title: &str, web_url: &str) -> Issue {
+        Issue {
+            id: 0,
+            iid,
+            project_id,
+            title: title.to_string(),
+            web_url: web_url.to_string(),
+            state: "opened".to_string(),
+            parent: String::new(),
+            total_time: String::new(),
+            graph_status: String::new(),
+        }
+    }
+
+    // ── enrich_timelog ──────────────────────────────────────────────────────
+
+    #[test]
+    fn enrich_timelog_matches_by_web_url() {
+        let i = issue(7, 42, "Title", "https://gl/-/issues/42");
+        let by_url = HashMap::from([(i.web_url.as_str(), &i)]);
+        let by_iid = HashMap::<i64, &Issue>::new();
+
+        let t = FetchedTimelog {
+            timelog_id: 1,
+            spent_at_secs: 100,
+            issue_iid: 42,
+            issue_title: "fresh".to_string(),
+            web_url: "https://gl/-/issues/42".to_string(),
+            duration: "1h".to_string(),
+            summary: "s".to_string(),
+        };
+        let r = enrich_timelog(t, &by_url, &by_iid);
+        assert_eq!(r.project_id, 7);
+        assert_eq!(r.issue_title, "fresh", "fresh title preserved");
+        assert_eq!(r.web_url, "https://gl/-/issues/42");
+    }
+
+    #[test]
+    fn enrich_timelog_falls_back_to_iid_when_url_misses() {
+        let i = issue(7, 42, "Cached", "https://gl/-/issues/42");
+        let by_url = HashMap::<&str, &Issue>::new();
+        let by_iid = HashMap::from([(42_i64, &i)]);
+
+        let t = FetchedTimelog {
+            timelog_id: 1,
+            spent_at_secs: 100,
+            issue_iid: 42,
+            issue_title: "fresh".to_string(),
+            web_url: String::new(),
+            duration: "1h".to_string(),
+            summary: String::new(),
+        };
+        let r = enrich_timelog(t, &by_url, &by_iid);
+        assert_eq!(r.project_id, 7);
+        assert_eq!(
+            r.web_url, "https://gl/-/issues/42",
+            "empty url filled from cache"
+        );
+    }
+
+    #[test]
+    fn enrich_timelog_no_match_leaves_project_id_zero() {
+        let by_url = HashMap::<&str, &Issue>::new();
+        let by_iid = HashMap::<i64, &Issue>::new();
+
+        let t = FetchedTimelog {
+            timelog_id: 1,
+            spent_at_secs: 100,
+            issue_iid: 99,
+            issue_title: "fresh".to_string(),
+            web_url: "https://gl/-/issues/99".to_string(),
+            duration: "30m".to_string(),
+            summary: String::new(),
+        };
+        let r = enrich_timelog(t, &by_url, &by_iid);
+        assert_eq!(r.project_id, 0);
+        assert_eq!(r.issue_title, "fresh");
+        assert_eq!(r.web_url, "https://gl/-/issues/99");
+    }
+
+    #[test]
+    fn enrich_timelog_empty_title_filled_from_cache() {
+        let i = issue(7, 42, "From cache", "https://gl/-/issues/42");
+        let by_url = HashMap::from([(i.web_url.as_str(), &i)]);
+        let by_iid = HashMap::<i64, &Issue>::new();
+
+        let t = FetchedTimelog {
+            timelog_id: 1,
+            spent_at_secs: 100,
+            issue_iid: 42,
+            issue_title: String::new(),
+            web_url: "https://gl/-/issues/42".to_string(),
+            duration: "1h".to_string(),
+            summary: String::new(),
+        };
+        let r = enrich_timelog(t, &by_url, &by_iid);
+        assert_eq!(r.issue_title, "From cache");
+    }
+
+    // ── enrich_graph_status with FakeGitlab ────────────────────────────────
+
+    /// Minimal `GitlabApi` impl that returns pre-canned `fetch_board_list_labels`
+    /// responses and counts how many times each method was called.
+    #[derive(Default)]
+    struct FakeGitlab {
+        board_labels: Mutex<HashMap<i64, TrackrResult<Vec<String>>>>,
+        board_calls: AtomicUsize,
+    }
+
+    impl FakeGitlab {
+        fn with_board_labels(project_id: i64, labels: Vec<String>) -> Self {
+            let me = Self::default();
+            me.board_labels
+                .lock()
+                .unwrap()
+                .insert(project_id, Ok(labels));
+            me
+        }
+
+        fn with_board_error(project_id: i64) -> Self {
+            let me = Self::default();
+            me.board_labels.lock().unwrap().insert(
+                project_id,
+                Err(crate::error::Error::Transient("offline".to_string())),
+            );
+            me
+        }
+
+        fn board_calls(&self) -> usize {
+            self.board_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitlabApi for FakeGitlab {
+        async fn fetch_assigned_issues(
+            &self,
+            _group: Option<String>,
+        ) -> TrackrResult<Vec<IssueWithLabels>> {
+            unimplemented!("not used in enrich_graph_status tests")
+        }
+        async fn fetch_group_issues(
+            &self,
+            _groups: Vec<String>,
+        ) -> TrackrResult<Vec<IssueWithLabels>> {
+            unimplemented!()
+        }
+        async fn add_spent_time(
+            &self,
+            _project_id: i64,
+            _issue_iid: i64,
+            _duration: &str,
+            _summary: Option<&str>,
+        ) -> TrackrResult<()> {
+            unimplemented!()
+        }
+        async fn create_timelog(
+            &self,
+            _issue_id: i64,
+            _duration: &str,
+            _summary: &str,
+            _spent_at: chrono::DateTime<chrono::Utc>,
+        ) -> TrackrResult<()> {
+            unimplemented!()
+        }
+        async fn fetch_my_timelogs(
+            &self,
+            _since: chrono::DateTime<chrono::Utc>,
+        ) -> TrackrResult<Vec<FetchedTimelog>> {
+            unimplemented!()
+        }
+        async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+            unimplemented!()
+        }
+        async fn fetch_board_list_labels(&self, project_id: i64) -> TrackrResult<Vec<String>> {
+            self.board_calls.fetch_add(1, Ordering::SeqCst);
+            match self.board_labels.lock().unwrap().remove(&project_id) {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(e)) => Err(e),
+                None => Ok(vec![]),
+            }
+        }
+    }
+
+    fn boards_cache() -> (BoardCache, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boards.redb");
+        (BoardCache::open(&path).unwrap(), dir)
+    }
+
+    fn iwl(project_id: i64, state: &str, labels: &[&str]) -> IssueWithLabels {
+        IssueWithLabels {
+            issue: Issue {
+                id: 1,
+                iid: 1,
+                project_id,
+                title: "t".into(),
+                web_url: "u".into(),
+                state: state.into(),
+                parent: String::new(),
+                total_time: String::new(),
+                graph_status: String::new(),
+            },
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_uses_cached_board_labels() {
+        let (boards, _td) = boards_cache();
+        boards.put(7, vec!["Doing".into(), "Done".into()]).unwrap();
+        let gitlab = FakeGitlab::default();
+
+        let out = enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["bug", "Doing"])])
+            .await;
+
+        assert_eq!(out[0].graph_status, "Doing");
+        assert_eq!(gitlab.board_calls(), 0, "cache hit must skip the API call");
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_fetches_and_persists_on_cache_miss() {
+        let (boards, _td) = boards_cache();
+        let gitlab = FakeGitlab::with_board_labels(7, vec!["Review".into()]);
+
+        let out = enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["Review"])]).await;
+
+        assert_eq!(out[0].graph_status, "Review");
+        assert_eq!(gitlab.board_calls(), 1);
+        assert_eq!(
+            boards.get(7).unwrap(),
+            Some(vec!["Review".into()]),
+            "freshly fetched labels are persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_empty_when_fetch_fails() {
+        let (boards, _td) = boards_cache();
+        let gitlab = FakeGitlab::with_board_error(7);
+
+        let out = enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["bug"])]).await;
+
+        assert!(out[0].graph_status.is_empty());
+        assert_eq!(boards.get(7).unwrap(), None, "errored fetch is not cached");
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_falls_back_to_state_when_no_label_matches() {
+        let (boards, _td) = boards_cache();
+        boards.put(7, vec!["Doing".into()]).unwrap();
+        let gitlab = FakeGitlab::default();
+
+        let out =
+            enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["bug", "high"])]).await;
+
+        assert_eq!(out[0].graph_status, "opened");
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_picks_first_matching_label() {
+        let (boards, _td) = boards_cache();
+        boards
+            .put(7, vec!["Backlog".into(), "Doing".into(), "Review".into()])
+            .unwrap();
+        let gitlab = FakeGitlab::default();
+
+        // Issue labels: ["random", "Review", "Doing"] — first to also appear in
+        // the board list is "Review".
+        let out = enrich_graph_status(
+            &gitlab,
+            &boards,
+            vec![iwl(7, "opened", &["random", "Review", "Doing"])],
+        )
+        .await;
+
+        assert_eq!(out[0].graph_status, "Review");
+    }
+
+    #[tokio::test]
+    async fn enrich_graph_status_caches_per_project_within_one_call() {
+        let (boards, _td) = boards_cache();
+        let gitlab = FakeGitlab::with_board_labels(7, vec!["Doing".into()]);
+
+        let out = enrich_graph_status(
+            &gitlab,
+            &boards,
+            vec![
+                iwl(7, "opened", &["Doing"]),
+                iwl(7, "opened", &["Doing"]),
+                iwl(7, "opened", &["nope"]),
+            ],
+        )
+        .await;
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(gitlab.board_calls(), 1, "single fetch per project");
+    }
 }

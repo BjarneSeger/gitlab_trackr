@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 
 use crate::db::KvStore;
 use crate::error::{Error, Result};
-use crate::gitlab::GitlabClient;
+use crate::gitlab::GitlabApi;
 use crate::impl_redb_json_value;
 
 // Table name bumped from `post_time_queue` so older `StoredTask` records that
@@ -80,7 +80,7 @@ pub struct PendingPostTime {
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
-    pub fn new(gitlab: Arc<GitlabClient>, db_path: &Path) -> Result<Self> {
+    pub fn new(gitlab: Arc<dyn GitlabApi>, db_path: &Path) -> Result<Self> {
         let store = KvStore::open(db_path, QUEUE_TABLE)?;
 
         let initial_tasks = store.scan(|id, stored| {
@@ -166,26 +166,7 @@ impl RetryQueue {
     /// Once the worker succeeds and removes the task, the next history poll
     /// surfaces the canonical GitLab record in its place.
     pub fn pending_post_time(&self) -> Result<Vec<PendingPostTime>> {
-        let mut out = self.store.scan(|_, stored| {
-            Ok(match stored.op {
-                QueueOp::PostTime {
-                    duration, summary, ..
-                } => Some(PendingPostTime {
-                    project_id: stored.project_id,
-                    issue_iid: stored.issue_iid,
-                    duration,
-                    summary,
-                    queued_at_secs: stored.queued_at_secs,
-                }),
-                QueueOp::CloseIssue => None,
-            })
-        })?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-        out.sort_by_key(|p| std::cmp::Reverse(p.queued_at_secs));
-        Ok(out)
+        snapshot_pending(&self.store)
     }
 
     async fn enqueue(&self, project_id: i64, issue_iid: i64, op: QueueOp) {
@@ -218,8 +199,32 @@ impl RetryQueue {
     }
 }
 
+fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingPostTime>> {
+    let mut out = store
+        .scan(|_, stored| {
+            Ok(match stored.op {
+                QueueOp::PostTime {
+                    duration, summary, ..
+                } => Some(PendingPostTime {
+                    project_id: stored.project_id,
+                    issue_iid: stored.issue_iid,
+                    duration,
+                    summary,
+                    queued_at_secs: stored.queued_at_secs,
+                }),
+                QueueOp::CloseIssue => None,
+            })
+        })?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    out.sort_by_key(|p| std::cmp::Reverse(p.queued_at_secs));
+    Ok(out)
+}
+
 async fn worker(
-    gitlab: Arc<GitlabClient>,
+    gitlab: Arc<dyn GitlabApi>,
     store: KvStore<u64, StoredTask>,
     mut rx: mpsc::Receiver<QueuedTask>,
 ) {
@@ -339,4 +344,327 @@ fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Result as TrackrResult;
+    use crate::gitlab::{FetchedTimelog, IssueWithLabels};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    // The 7-day MAX_LIFETIME cutoff and exponential backoff are not exercised
+    // here. Both depend on `SystemTime::now()` rather than tokio's mock clock,
+    // so deterministically driving them would require a clock-injection
+    // abstraction that isn't warranted for the gain.
+
+    // ── QueueOp::kind ───────────────────────────────────────────────────────
+
+    #[test]
+    fn queue_op_kind() {
+        assert_eq!(QueueOp::CloseIssue.kind(), "CloseIssue");
+        assert_eq!(
+            QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            }
+            .kind(),
+            "PostTime"
+        );
+    }
+
+    // ── snapshot_pending ────────────────────────────────────────────────────
+
+    fn store() -> (KvStore<u64, StoredTask>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.redb");
+        (KvStore::open(&path, QUEUE_TABLE).unwrap(), dir)
+    }
+
+    fn post_task(id: i64, queued_at: u64) -> StoredTask {
+        StoredTask {
+            project_id: id,
+            issue_iid: id,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            },
+            queued_at_secs: queued_at,
+        }
+    }
+
+    fn close_task(id: i64, queued_at: u64) -> StoredTask {
+        StoredTask {
+            project_id: id,
+            issue_iid: id,
+            op: QueueOp::CloseIssue,
+            queued_at_secs: queued_at,
+        }
+    }
+
+    #[test]
+    fn snapshot_pending_filters_close_issue_and_sorts_newest_first() {
+        let (s, _td) = store();
+        s.put(1, post_task(1, 100)).unwrap();
+        s.put(2, close_task(2, 150)).unwrap();
+        s.put(3, post_task(3, 200)).unwrap();
+        s.put(4, post_task(4, 50)).unwrap();
+
+        let snap = snapshot_pending(&s).unwrap();
+        let project_ids: Vec<i64> = snap.iter().map(|p| p.project_id).collect();
+        assert_eq!(
+            project_ids,
+            vec![3, 1, 4],
+            "PostTime only, sorted by queued_at desc"
+        );
+    }
+
+    #[test]
+    fn snapshot_pending_empty_store() {
+        let (s, _td) = store();
+        assert!(snapshot_pending(&s).unwrap().is_empty());
+    }
+
+    // ── Worker behavior with a fake GitLab ──────────────────────────────────
+
+    /// Pre-cans responses for the three methods the worker calls and counts
+    /// invocations. Other `GitlabApi` methods panic so unexpected use is loud.
+    #[derive(Default)]
+    struct FakeGitlab {
+        add_spent_time: Mutex<VecDeque<TrackrResult<()>>>,
+        create_timelog: Mutex<VecDeque<TrackrResult<()>>>,
+        close_issue: Mutex<VecDeque<TrackrResult<()>>>,
+        add_spent_time_calls: AtomicUsize,
+        create_timelog_calls: AtomicUsize,
+        close_issue_calls: AtomicUsize,
+    }
+
+    impl FakeGitlab {
+        fn push_add_spent_time(&self, r: TrackrResult<()>) {
+            self.add_spent_time.lock().unwrap().push_back(r);
+        }
+        fn push_close_issue(&self, r: TrackrResult<()>) {
+            self.close_issue.lock().unwrap().push_back(r);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GitlabApi for FakeGitlab {
+        async fn fetch_assigned_issues(
+            &self,
+            _g: Option<String>,
+        ) -> TrackrResult<Vec<IssueWithLabels>> {
+            unimplemented!()
+        }
+        async fn fetch_group_issues(
+            &self,
+            _g: Vec<String>,
+        ) -> TrackrResult<Vec<IssueWithLabels>> {
+            unimplemented!()
+        }
+        async fn add_spent_time(
+            &self,
+            _p: i64,
+            _i: i64,
+            _d: &str,
+            _s: Option<&str>,
+        ) -> TrackrResult<()> {
+            self.add_spent_time_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.add_spent_time
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeGitlab: no canned add_spent_time response")
+        }
+        async fn create_timelog(
+            &self,
+            _id: i64,
+            _d: &str,
+            _s: &str,
+            _at: chrono::DateTime<chrono::Utc>,
+        ) -> TrackrResult<()> {
+            self.create_timelog_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.create_timelog
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeGitlab: no canned create_timelog response")
+        }
+        async fn fetch_my_timelogs(
+            &self,
+            _since: chrono::DateTime<chrono::Utc>,
+        ) -> TrackrResult<Vec<FetchedTimelog>> {
+            unimplemented!()
+        }
+        async fn close_issue(&self, _p: i64, _i: i64) -> TrackrResult<()> {
+            self.close_issue_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.close_issue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeGitlab: no canned close_issue response")
+        }
+        async fn fetch_board_list_labels(&self, _p: i64) -> TrackrResult<Vec<String>> {
+            unimplemented!()
+        }
+    }
+
+    /// Spawn the worker with one task on the channel, close the sender so the
+    /// worker exits after draining, and await its completion.
+    async fn run_worker_one_task(
+        gitlab: Arc<dyn GitlabApi>,
+        store: KvStore<u64, StoredTask>,
+        task: QueuedTask,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(worker(gitlab, store, rx));
+        tx.send(task).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_removes_task_on_success() {
+        let (s, _td) = store();
+        let stored = post_task(7, 100);
+        s.put(1, stored).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Ok(()));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            },
+            queued_at_secs: 100,
+        };
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            snapshot_pending(&s).unwrap().is_empty(),
+            "task removed after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_routes_post_time_with_issue_id_to_create_timelog() {
+        let (s, _td) = store();
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: Some("note".into()),
+                issue_id: Some(999),
+            },
+            queued_at_secs: 100,
+        };
+        s.put(
+            1,
+            StoredTask {
+                project_id: 7,
+                issue_iid: 7,
+                op: task.op.clone(),
+                queued_at_secs: 100,
+            },
+        )
+        .unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.create_timelog.lock().unwrap().push_back(Ok(()));
+
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .create_timelog_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "issue_id present → GraphQL timelogCreate"
+        );
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_drops_task_on_permanent_error() {
+        let (s, _td) = store();
+        s.put(1, post_task(7, 100)).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Err(Error::Gitlab("403".into())));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            },
+            queued_at_secs: 100,
+        };
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no retry on permanent error"
+        );
+        assert!(
+            snapshot_pending(&s).unwrap().is_empty(),
+            "task dropped after permanent rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_close_issue_success() {
+        let (s, _td) = store();
+        s.put(1, close_task(7, 100)).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_close_issue(Ok(()));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::CloseIssue,
+            queued_at_secs: 100,
+        };
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .close_issue_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
 }
