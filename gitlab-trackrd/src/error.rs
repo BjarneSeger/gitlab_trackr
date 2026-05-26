@@ -13,28 +13,22 @@ pub enum Error {
     Transient(String),
 
     #[error(transparent)]
-    CacheDatabase(#[from] redb::DatabaseError),
+    DbOpen(#[from] redb::DatabaseError),
 
     #[error(transparent)]
-    CacheTransaction(#[from] redb::TransactionError),
+    DbTransaction(#[from] redb::TransactionError),
 
     #[error(transparent)]
-    CacheTable(#[from] redb::TableError),
+    DbTable(#[from] redb::TableError),
 
     #[error(transparent)]
-    CacheStorage(#[from] redb::StorageError),
+    DbStorage(#[from] redb::StorageError),
 
     #[error(transparent)]
-    CacheCommit(#[from] redb::CommitError),
+    DbCommit(#[from] redb::CommitError),
 
-    // `PoisonError` is generic over the guard's lifetime, which makes `#[from]`
-    // awkward; the poison payload also carries no useful info, so we collapse
-    // it to a payload-free variant at the lock site.
-    #[error("cache lock poisoned")]
-    CachePoisoned,
-
-    #[error("cache: {0}")]
-    Cache(&'static str),
+    #[error("db: {0}")]
+    Db(&'static str),
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),

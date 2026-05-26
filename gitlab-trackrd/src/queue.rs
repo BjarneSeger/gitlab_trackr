@@ -1,30 +1,33 @@
 //! Background retry queue for outgoing write operations.
 //!
-//! Tasks are persisted to a redb database before being processed, so they
-//! survive daemon restarts. A background tokio task works through the queue
-//! with exponential backoff (1 s base, 30 min cap). Network errors trigger
+//! Tasks are persisted via `KvStore` before being processed, so they survive
+//! daemon restarts.  A background tokio task works through the queue with
+//! exponential backoff (1 s base, 30 min cap).  Network errors trigger
 //! retries for up to 7 days; GitLab rejections drop the task immediately.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::db::KvStore;
 use crate::error::{Error, Result};
+use crate::impl_redb_json_value;
 use crate::gitlab::GitlabClient;
 
-const QUEUE_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("post_time_queue");
+const QUEUE_TABLE: TableDefinition<u64, StoredTask> =
+    TableDefinition::new("post_time_queue");
 
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
 const MAX_LIFETIME: Duration = Duration::from_hours(168);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct StoredTask {
     project_id: i64,
     issue_iid: i64,
@@ -33,6 +36,8 @@ struct StoredTask {
     /// UNIX timestamp (seconds) when the task was first enqueued.
     queued_at_secs: u64,
 }
+
+impl_redb_json_value!(StoredTask, "StoredTask");
 
 struct QueuedTask {
     id: u64,
@@ -45,7 +50,7 @@ struct QueuedTask {
 
 pub struct RetryQueue {
     sender: mpsc::Sender<QueuedTask>,
-    db: Arc<Database>,
+    store: KvStore<u64, StoredTask>,
     next_id: AtomicU64,
 }
 
@@ -53,39 +58,20 @@ impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
     pub fn new(gitlab: Arc<GitlabClient>, db_path: &Path) -> Result<Self> {
-        let parent = db_path
-            .parent()
-            .ok_or(Error::Cache("queue db path has no parent directory"))?;
-        std::fs::create_dir_all(parent)?;
+        let store = KvStore::open(db_path, QUEUE_TABLE)?;
 
-        let db = Database::create(db_path)?;
-        {
-            let txn = db.begin_write()?;
-            txn.open_table(QUEUE_TABLE)?;
-            txn.commit()?;
-        }
+        let initial_tasks = store.scan(|id, stored| {
+            Ok(QueuedTask {
+                id,
+                project_id: stored.project_id,
+                issue_iid: stored.issue_iid,
+                duration: stored.duration,
+                summary: stored.summary,
+                queued_at_secs: stored.queued_at_secs,
+            })
+        })?;
 
-        // Load tasks that survived a previous daemon run.
-        let mut initial_tasks: Vec<QueuedTask> = Vec::new();
-        let mut max_id = 0u64;
-        {
-            let txn = db.begin_read()?;
-            let table = txn.open_table(QUEUE_TABLE)?;
-            for result in table.iter()? {
-                let (k, v) = result?;
-                let id = k.value();
-                let stored: StoredTask = serde_json::from_slice(v.value())?;
-                max_id = max_id.max(id);
-                initial_tasks.push(QueuedTask {
-                    id,
-                    project_id: stored.project_id,
-                    issue_iid: stored.issue_iid,
-                    duration: stored.duration,
-                    summary: stored.summary,
-                    queued_at_secs: stored.queued_at_secs,
-                });
-            }
-        }
+        let max_id = initial_tasks.iter().map(|t| t.id).max().unwrap_or(0);
 
         if !initial_tasks.is_empty() {
             info!(
@@ -94,10 +80,8 @@ impl RetryQueue {
             );
         }
 
-        let db = Arc::new(db);
         let (tx, rx) = mpsc::channel(256);
 
-        // Feed reloaded tasks into the channel before the worker starts consuming.
         if !initial_tasks.is_empty() {
             let tx_init = tx.clone();
             tokio::spawn(async move {
@@ -109,11 +93,11 @@ impl RetryQueue {
             });
         }
 
-        tokio::spawn(worker(gitlab, Arc::clone(&db), rx));
+        tokio::spawn(worker(gitlab, store.clone(), rx));
 
         Ok(Self {
             sender: tx,
-            db,
+            store,
             next_id: AtomicU64::new(max_id + 1),
         })
     }
@@ -137,7 +121,7 @@ impl RetryQueue {
             summary: summary.clone(),
             queued_at_secs,
         };
-        if let Err(e) = self.persist(id, &stored) {
+        if let Err(e) = self.store.put(id, stored) {
             warn!(
                 error = %e,
                 "failed to persist PostTime task to queue db; it will not survive a restart"
@@ -156,20 +140,13 @@ impl RetryQueue {
             error!("retry queue channel closed; dropping PostTime task");
         }
     }
-
-    fn persist(&self, id: u64, stored: &StoredTask) -> Result<()> {
-        let bytes = serde_json::to_vec(stored)?;
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(QUEUE_TABLE)?;
-            table.insert(id, bytes.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(())
-    }
 }
 
-async fn worker(gitlab: Arc<GitlabClient>, db: Arc<Database>, mut rx: mpsc::Receiver<QueuedTask>) {
+async fn worker(
+    gitlab: Arc<GitlabClient>,
+    store: KvStore<u64, StoredTask>,
+    mut rx: mpsc::Receiver<QueuedTask>,
+) {
     while let Some(task) = rx.recv().await {
         let mut delay = BASE_DELAY;
         let mut attempt = 0u32;
@@ -234,7 +211,7 @@ async fn worker(gitlab: Arc<GitlabClient>, db: Arc<Database>, mut rx: mpsc::Rece
             }
         }
 
-        if let Err(e) = remove_task(&db, task.id) {
+        if let Err(e) = store.remove(task.id) {
             warn!(
                 error = %e,
                 task_id = task.id,
@@ -242,16 +219,6 @@ async fn worker(gitlab: Arc<GitlabClient>, db: Arc<Database>, mut rx: mpsc::Rece
             );
         }
     }
-}
-
-fn remove_task(db: &Database, id: u64) -> Result<()> {
-    let txn = db.begin_write()?;
-    {
-        let mut table = txn.open_table(QUEUE_TABLE)?;
-        table.remove(id)?;
-    }
-    txn.commit()?;
-    Ok(())
 }
 
 fn now_secs() -> u64 {

@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod cache;
 mod config;
+mod db;
 mod error;
 mod gitlab;
 mod handlers;
