@@ -26,6 +26,7 @@ varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
 dirs = "6"
 http = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Local storage
 redb = "4.1"

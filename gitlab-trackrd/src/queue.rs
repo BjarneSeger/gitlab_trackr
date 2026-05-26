@@ -22,7 +22,7 @@ use crate::impl_redb_json_value;
 
 // Table name bumped from `post_time_queue` so older `StoredTask` records that
 // don't carry the new `op` field don't crash deserialization on startup.
-const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v2");
+const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v3");
 
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
@@ -33,6 +33,12 @@ enum QueueOp {
     PostTime {
         duration: String,
         summary: Option<String>,
+        /// Global numeric issue ID, resolved from the issue cache at enqueue
+        /// time. When present, the worker uses GraphQL `timelogCreate` so it
+        /// can submit the original `queued_at_secs` as `spentAt`. `None` means
+        /// the cache didn't know the issue (or the entry survived a daemon
+        /// upgrade), and the worker falls back to REST without `spent_at`.
+        issue_id: Option<i64>,
     },
     CloseIssue,
 }
@@ -46,7 +52,7 @@ struct StoredTask {
     queued_at_secs: u64,
 }
 
-impl_redb_json_value!(StoredTask, "StoredTaskV2");
+impl_redb_json_value!(StoredTask, "StoredTaskV3");
 
 struct QueuedTask {
     id: u64,
@@ -111,17 +117,28 @@ impl RetryQueue {
 
     /// Persist a `PostTime` task to disk and hand it to the background worker.
     /// Returns immediately; the caller does not wait for the network operation.
+    ///
+    /// `issue_id` is the global numeric ID (the one GraphQL embeds in
+    /// `gid://gitlab/Issue/<id>`). When `Some`, the worker uses GraphQL
+    /// `timelogCreate` and submits the original `queued_at` as `spentAt`, so a
+    /// task held for hours/days still shows up in GitLab at the time it was
+    /// actually logged. When `None`, it falls back to REST without `spent_at`.
     pub async fn post_time(
         &self,
         project_id: i64,
         issue_iid: i64,
         duration: String,
         summary: Option<String>,
+        issue_id: Option<i64>,
     ) {
         self.enqueue(
             project_id,
             issue_iid,
-            QueueOp::PostTime { duration, summary },
+            QueueOp::PostTime {
+                duration,
+                summary,
+                issue_id,
+            },
         )
         .await
     }
@@ -175,16 +192,37 @@ async fn worker(
         'retry: loop {
             attempt += 1;
             let outcome = match &task.op {
-                QueueOp::PostTime { duration, summary } => {
-                    gitlab
-                        .add_spent_time(
-                            task.project_id,
-                            task.issue_iid,
-                            duration,
-                            summary.as_deref(),
+                QueueOp::PostTime {
+                    duration,
+                    summary,
+                    issue_id,
+                } => match issue_id {
+                    Some(id) => {
+                        let spent_at = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                            task.queued_at_secs as i64,
+                            0,
                         )
-                        .await
-                }
+                        .unwrap_or_else(chrono::Utc::now);
+                        gitlab
+                            .create_timelog(
+                                *id,
+                                duration,
+                                summary.as_deref().unwrap_or(""),
+                                spent_at,
+                            )
+                            .await
+                    }
+                    None => {
+                        gitlab
+                            .add_spent_time(
+                                task.project_id,
+                                task.issue_iid,
+                                duration,
+                                summary.as_deref(),
+                            )
+                            .await
+                    }
+                },
                 QueueOp::CloseIssue => gitlab.close_issue(task.project_id, task.issue_iid).await,
             };
 

@@ -8,7 +8,7 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use gitlab::api::AsyncQuery;
+use gitlab::api::{AsyncQuery, UrlBase};
 use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
@@ -113,6 +113,41 @@ impl GitlabClient {
         .query_async(&self.inner)
         .await
         .map_err(classify)?;
+        Ok(())
+    }
+
+    /// Record time spent on a GitLab issue via the GraphQL `timelogCreate` mutation,
+    /// stamping it at `spent_at` instead of "now". Used by the retry queue so a
+    /// task that was queued during an outage appears in GitLab at the time the
+    /// user actually logged it, not the time we reconnected.
+    #[instrument(skip(self))]
+    pub async fn create_timelog(
+        &self,
+        issue_id: i64,
+        duration: &str,
+        summary: &str,
+        spent_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let endpoint = TimelogCreate {
+            issuable_id: format!("gid://gitlab/Issue/{issue_id}"),
+            time_spent: duration,
+            summary,
+            spent_at: spent_at.to_rfc3339(),
+        };
+
+        let raw: serde_json::Value = endpoint.query_async(&self.inner).await.map_err(classify)?;
+
+        if let Some(errs) = raw["data"]["timelogCreate"]["errors"].as_array()
+            && !errs.is_empty()
+        {
+            let msg = errs
+                .iter()
+                .filter_map(|e| e.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Gitlab(format!("timelogCreate: {msg}")));
+        }
+
         Ok(())
     }
 
@@ -240,6 +275,49 @@ impl gitlab::api::Endpoint for AddSpentTime<'_> {
         if let Some(summary) = self.summary {
             body["summary"] = serde_json::Value::String(summary.to_owned());
         }
+        Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// `POST /api/graphql` for `Mutation.timelogCreate`.
+///
+/// Hits the GraphQL endpoint instead of the REST `add_spent_time` because the
+/// latter has no `spent_at` parameter — GitLab stamps it as "now" on receipt,
+/// which is wrong for tasks the retry queue has been sitting on.
+struct TimelogCreate<'a> {
+    issuable_id: String,
+    time_spent: &'a str,
+    summary: &'a str,
+    spent_at: String,
+}
+
+impl gitlab::api::Endpoint for TimelogCreate<'_> {
+    fn method(&self) -> http::Method {
+        http::Method::POST
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "api/graphql".into()
+    }
+
+    fn url_base(&self) -> UrlBase {
+        UrlBase::Instance
+    }
+
+    fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
+        let body = serde_json::json!({
+            "query": "mutation($id: IssuableID!, $time: String!, $summary: String!, $spent: Time) {\
+                timelogCreate(input: { issuableId: $id, timeSpent: $time, summary: $summary, spentAt: $spent }) {\
+                    errors\
+                }\
+            }",
+            "variables": {
+                "id": self.issuable_id,
+                "time": self.time_spent,
+                "summary": self.summary,
+                "spent": self.spent_at,
+            },
+        });
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
     }
 }

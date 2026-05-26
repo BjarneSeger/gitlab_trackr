@@ -154,8 +154,14 @@ impl VarlinkInterface for Handlers {
             }
             Err(Error::Transient(ref e)) => {
                 warn!(error = %e, project_id, issue_iid, "PostTime network error, queuing for retry");
+                let issue_id = self.cache.get().ok().flatten().and_then(|issues| {
+                    issues
+                        .into_iter()
+                        .find(|i| i.project_id == project_id && i.iid == issue_iid)
+                        .map(|i| i.id)
+                });
                 self.queue
-                    .post_time(project_id, issue_iid, duration, summary)
+                    .post_time(project_id, issue_iid, duration, summary, issue_id)
                     .await;
                 call.reply()
             }

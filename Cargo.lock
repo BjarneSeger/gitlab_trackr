@@ -753,6 +753,7 @@ name = "gitlab-trackrd"
 version = "0.3.1"
 dependencies = [
  "async-trait",
+ "chrono",
  "dirs",
  "gitlab",
  "gitlab-trackr-api",
