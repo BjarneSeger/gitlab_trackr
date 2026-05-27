@@ -31,6 +31,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # Local storage
 redb = "4.1"
 security-framework = "3.7"
+security-framework-sys = "2.17"
 oo7 = { version = "0.6", features = ["tracing"] }
 
 # CLI

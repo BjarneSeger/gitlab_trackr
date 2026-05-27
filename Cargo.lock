@@ -978,6 +978,7 @@ dependencies = [
  "oo7",
  "redb",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tempfile",
