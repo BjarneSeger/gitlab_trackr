@@ -12,3 +12,43 @@ gitlab-trackrd as an abstraction over the gitlab api with caching. Now you can g
 and use the `tt` command, which is part of `gitlab-trackr-utils`, or script the api
 (or `tt` itself) or build your own application on top of `gitlab_trackr_api`, which
 provides the varlink definition.
+
+## Setting up the daemon
+To use the daemon, you need to start it first:
+
+```sh
+systemctl enable --now gitlab-trackrd.service
+```
+
+Then, you will need to authenticate. For this, you can use `tt` like this:
+
+```sh
+tt login --host gitlab.com
+```
+
+This will take you to creating a PAT for gitlab-trackr with the appropriate scopes.
+Paste it back to the prompt and now you are logged in, with the token stored
+securely in your platforms keystore (keyring on Linux, keychain on macOS).
+
+## Setting up the cli
+To get the regular tick for reminding you to track your time, use:
+
+```sh
+tt hook YOUR_SHELL >> YOUR_SHELL_RC
+```
+
+which fires a prompt asking you to what you were working on, with a list of assigned
+issues at regular intervals.
+
+### Config
+The config file will by default be located at
+
+```sh
+tt config path
+```
+
+And you can get a default one by running
+
+```sh
+tt config template
+```
