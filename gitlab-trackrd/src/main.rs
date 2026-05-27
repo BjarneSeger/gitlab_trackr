@@ -31,13 +31,12 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("GITLAB_TRACKR")
-                .unwrap_or_else(|_| EnvFilter::new("gitlab-trackrd=info")),
+                .unwrap_or_else(|_| EnvFilter::new("gitlab_trackrd=info")),
         )
         .init();
 
     let cfg = Config::from_env()?;
-    let gitlab: Arc<dyn GitlabApi> =
-        Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
+    let gitlab: Arc<dyn GitlabApi> = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
     let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
     let boards_db_path = cfg.db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);
