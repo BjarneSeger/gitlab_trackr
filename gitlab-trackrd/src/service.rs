@@ -10,9 +10,10 @@ use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    AsyncCall, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory,
-    Call_PostTime, CloseIssue_Args, GetAssignedIssues_Args, PostTime_Args,
-    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_CloseIssue,
+    Call_GetAssignedIssues, Call_GetHistory, Call_PostTime, Call_UnassignSelf, CloseIssue_Args,
+    GetAssignedIssues_Args, PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
+    VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -190,6 +191,50 @@ async fn handle_trackrd(
             handlers
                 .close_issue(
                     &mut call as &mut dyn Call_CloseIssue,
+                    args.project_id,
+                    args.issue_iid,
+                )
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.AssignSelf" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: AssignSelf_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .assign_self(
+                    &mut call as &mut dyn Call_AssignSelf,
+                    args.project_id,
+                    args.issue_iid,
+                )
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.UnassignSelf" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: UnassignSelf_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .unassign_self(
+                    &mut call as &mut dyn Call_UnassignSelf,
                     args.project_id,
                     args.issue_iid,
                 )
