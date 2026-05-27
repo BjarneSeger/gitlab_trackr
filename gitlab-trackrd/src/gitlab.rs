@@ -96,41 +96,23 @@ impl GitlabApi for GitlabClient {
         &self,
         group: Option<String>,
     ) -> Result<Vec<IssueWithLabels>> {
-        use gitlab::api::issues::{GroupIssues, IssueScope, IssueState};
+        use gitlab::api::issues::{GroupIssues, IssueScope, IssueState, Issues};
 
-        let query = if let Some(group) = group {
-            GroupIssues::builder()
+        if let Some(group) = group {
+            let query = GroupIssues::builder()
                 .scope(IssueScope::AssignedToMe)
                 .state(IssueState::Opened)
                 .group(group)
                 .build()
-                .map_err(|e| Error::Gitlab(e.to_string()))?
+                .map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_issues_query(&self.inner, query).await
         } else {
-            GroupIssues::builder()
+            let query = Issues::builder()
                 .scope(IssueScope::AssignedToMe)
                 .state(IssueState::Opened)
                 .build()
-                .map_err(|e| Error::Gitlab(e.to_string()))?
-        };
-
-        let mut delay = Duration::from_secs(1);
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match query.query_async(&self.inner).await.map_err(classify) {
-                Ok(raw) => {
-                    let raw: Vec<serde_json::Value> = raw;
-                    let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
-                    info!(count = issues.len(), "fetched issues from GitLab");
-                    return Ok(issues);
-                }
-                Err(e @ Error::Transient(_)) if attempt < 4 => {
-                    warn!(attempt, error = %e, delay_secs = delay.as_secs(), "fetch failed, retrying");
-                    tokio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(4));
-                }
-                Err(e) => return Err(e),
-            }
+                .map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_issues_query(&self.inner, query).await
         }
     }
 
@@ -304,6 +286,35 @@ impl GitlabApi for GitlabClient {
             }
         }
         Ok(labels)
+    }
+}
+
+/// Run `query` against `client`, retrying up to three times on transient errors
+/// with exponential back-off (1 s → 2 s → 4 s).
+async fn run_issues_query<Q>(
+    client: &gitlab::AsyncGitlab,
+    query: Q,
+) -> Result<Vec<IssueWithLabels>>
+where
+    Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
+{
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match query.query_async(client).await.map_err(classify) {
+            Ok(raw) => {
+                let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
+                info!(count = issues.len(), "fetched issues from GitLab");
+                return Ok(issues);
+            }
+            Err(e @ Error::Transient(_)) if attempt < 4 => {
+                warn!(attempt, error = %e, delay_secs = delay.as_secs(), "fetch failed, retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(4));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
