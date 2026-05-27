@@ -1,7 +1,8 @@
 //! `gitlab-trackrd` — GitLab time-tracking varlink daemon.
 
 use std::sync::Arc;
-use tracing::info;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod boards;
@@ -13,6 +14,7 @@ mod gitlab;
 mod handlers;
 mod history;
 mod queue;
+mod secrets;
 mod server;
 mod service;
 
@@ -20,8 +22,8 @@ use boards::BoardCache;
 use cache::IssueCache;
 use config::Config;
 use error::Result;
-use gitlab::{GitlabApi, GitlabClient};
-use handlers::Handlers;
+use gitlab::GitlabClient;
+use handlers::{Handlers, Session, SessionSlot};
 use history::HistoryCache;
 use queue::RetryQueue;
 use service::ServiceHandler;
@@ -36,16 +38,42 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Config::from_env()?;
-    let gitlab: Arc<dyn GitlabApi> = Arc::new(GitlabClient::connect(&cfg.host, &cfg.token).await?);
+
+    let session: SessionSlot = Arc::new(RwLock::new(None));
+
+    // Resolve initial credentials: env vars win, otherwise the OS keychain.
+    let initial = match cfg.env_creds.clone() {
+        Some(c) => Some(c),
+        None => match secrets::load().await {
+            Ok(opt) => opt,
+            Err(e) => {
+                warn!(error = %e, "keychain read failed; starting dormant");
+                None
+            }
+        },
+    };
+    if let Some(c) = initial {
+        match GitlabClient::connect(&c.host, &c.token).await {
+            Ok(client) => {
+                let s = Session::from_client(client);
+                info!(host = %s.host, user_id = s.user_id, "initial GitLab connection ready");
+                *session.write().await = Some(s);
+            }
+            Err(e) => warn!(error = %e, host = %c.host, "initial GitLab connection failed; daemon starting dormant"),
+        }
+    } else {
+        info!("no credentials available; daemon starting dormant (run `tt login`)");
+    }
+
     let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
     let boards_db_path = cfg.db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);
     let history_db_path = cfg.db_path.with_file_name("history.redb");
     let history = Arc::new(HistoryCache::open(&history_db_path)?);
     let queue_db_path = cfg.db_path.with_file_name("queue.redb");
-    let queue = RetryQueue::new(Arc::clone(&gitlab), &queue_db_path)?;
+    let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path)?;
     let handlers = Arc::new(Handlers {
-        gitlab,
+        session,
         cache,
         boards,
         history,

@@ -16,10 +16,23 @@ use gitlab_trackr_api::Issue;
 
 pub struct GitlabClient {
     inner: gitlab::AsyncGitlab,
+    /// GitLab host (e.g. `"gitlab.com"`) used to build `inner`. Exposed so
+    /// `WhoAmI` can return it.
+    host: String,
     /// Numeric ID of the authenticated user, fetched once at `connect()`.
     /// Required so `assign_self`/`unassign_self` can mutate the issue's
     /// `assignee_ids` list without an extra round-trip per call.
     current_user_id: i64,
+}
+
+impl GitlabClient {
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn current_user_id(&self) -> i64 {
+        self.current_user_id
+    }
 }
 
 /// Issue plus the raw data we still need after the GitLab fetch — labels for
@@ -140,6 +153,7 @@ impl GitlabClient {
 
         Ok(Self {
             inner,
+            host: host.to_string(),
             current_user_id,
         })
     }

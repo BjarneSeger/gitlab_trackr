@@ -1,15 +1,20 @@
-//! Daemon configuration sourced entirely from environment variables.
+//! Daemon configuration sourced from environment variables plus the OS
+//! keychain (read at startup by `main`, not here).
 
 use std::path::PathBuf;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
+use crate::secrets::Credentials;
 
 /// Default interval in seconds between background cache refreshes.
 const DEFAULT_REFRESH_INTERVAL: u64 = 300;
 
 pub struct Config {
-    pub token: String,
-    pub host: String,
+    /// Credentials sourced from environment variables (`GITLAB_TOKEN` +
+    /// optional `GITLAB_HOST`). When set, these win over anything in the OS
+    /// keychain — useful for CI and existing setups. `None` means the daemon
+    /// should try the keychain.
+    pub env_creds: Option<Credentials>,
     pub socket: String,
     pub db_path: PathBuf,
     pub refresh_interval: u64,
@@ -17,8 +22,14 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let token = std::env::var("GITLAB_TOKEN").map_err(|_| Error::Env("GITLAB_TOKEN"))?;
-        let host = std::env::var("GITLAB_HOST").unwrap_or_else(|_| "gitlab.com".to_string());
+        let env_creds = match std::env::var("GITLAB_TOKEN") {
+            Ok(token) if !token.is_empty() => {
+                let host =
+                    std::env::var("GITLAB_HOST").unwrap_or_else(|_| "gitlab.com".to_string());
+                Some(Credentials { host, token })
+            }
+            _ => None,
+        };
         let socket = std::env::var("GITLAB_TRACKRD_SOCKET").unwrap_or_else(|_| {
             std::env::var("XDG_RUNTIME_DIR")
                 .map(|d| format!("{d}/gitlab-trackrd.socket"))
@@ -34,8 +45,7 @@ impl Config {
             .unwrap_or(DEFAULT_REFRESH_INTERVAL);
 
         Ok(Self {
-            token,
-            host,
+            env_creds,
             socket,
             db_path,
             refresh_interval,

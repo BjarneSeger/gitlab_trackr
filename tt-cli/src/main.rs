@@ -50,5 +50,7 @@ async fn main() -> Result<()> {
             cmd::config::run(action);
             Ok(())
         }
+        Command::Login { host } => cmd::login::run(host).await,
+        Command::Logout => cmd::logout::run().await,
     }
 }

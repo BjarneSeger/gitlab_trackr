@@ -25,6 +25,8 @@ type HistoryEvent (
 
 error GitlabError (message: string)
 
+error NotAuthenticated ()
+
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
 method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
@@ -38,3 +40,9 @@ method UnassignSelf(project_id: int, issue_iid: int) -> ()
 method ClearCache() -> ()
 
 method GetHistory() -> (events: []HistoryEvent)
+
+method Login(host: string, token: string) -> ()
+
+method Logout() -> ()
+
+method WhoAmI() -> (host: string, user_id: int)

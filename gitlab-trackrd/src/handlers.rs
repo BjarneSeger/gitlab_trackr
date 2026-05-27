@@ -8,22 +8,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use gitlab_trackr_api::{
     Call_AssignSelf, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory,
-    Call_PostTime, Call_UnassignSelf, HistoryEvent, Issue, VarlinkInterface,
+    Call_Login, Call_Logout, Call_PostTime, Call_UnassignSelf, Call_WhoAmI, HistoryEvent, Issue,
+    VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
-use crate::error::Error;
-use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+use crate::error::{Error, Result};
+use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
 use crate::history::{HISTORY_WINDOW, HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
+use crate::secrets::{self, Credentials};
+
+/// Live GitLab connection. Carries enough state for `WhoAmI` to answer without
+/// a round-trip.
+#[derive(Clone)]
+pub struct Session {
+    pub gitlab: Arc<dyn GitlabApi>,
+    pub host: String,
+    pub user_id: i64,
+}
+
+impl Session {
+    pub fn from_client(client: GitlabClient) -> Self {
+        let host = client.host().to_string();
+        let user_id = client.current_user_id();
+        Self {
+            gitlab: Arc::new(client),
+            host,
+            user_id,
+        }
+    }
+}
+
+/// Slot the daemon shares between the handlers, the retry queue, and the
+/// background refresh task. `None` ⇒ dormant (no GitLab connection yet).
+pub type SessionSlot = Arc<RwLock<Option<Session>>>;
 
 pub struct Handlers {
-    pub gitlab: Arc<dyn GitlabApi>,
+    pub session: SessionSlot,
     pub cache: Arc<IssueCache>,
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
@@ -31,12 +59,41 @@ pub struct Handlers {
 }
 
 impl Handlers {
+    /// Resolve the live GitLab client or return `NotAuthenticated`.
+    async fn gitlab(&self) -> Result<Arc<dyn GitlabApi>> {
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .map(|s| s.gitlab.clone())
+            .ok_or(Error::NotAuthenticated)
+    }
+
+    /// Resolve the full session or return `NotAuthenticated`.
+    async fn current_session(&self) -> Result<Session> {
+        self.session
+            .read()
+            .await
+            .clone()
+            .ok_or(Error::NotAuthenticated)
+    }
+}
+
+impl Handlers {
     /// Unconditionally fetch issues and boards from GitLab and update both caches.
     /// Called by the background refresh task; errors are logged and not propagated.
     pub async fn refresh_cache(&self) {
-        match self.gitlab.fetch_assigned_issues(None).await {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => {
+                debug!("dormant; skipping background cache refresh");
+                return;
+            }
+        };
+
+        match gitlab.fetch_assigned_issues(None).await {
             Ok(raw) => {
-                let issues = enrich_graph_status(&*self.gitlab, &self.boards, raw).await;
+                let issues = enrich_graph_status(&*gitlab, &self.boards, raw).await;
                 if let Err(e) = self.cache.put(&issues) {
                     warn!(error = %e, "background cache write failed");
                 } else {
@@ -48,19 +105,19 @@ impl Handlers {
             }
         }
 
-        self.refresh_history().await;
+        self.refresh_history(&gitlab).await;
     }
 
     /// Pull the user's recent GitLab timelogs, enrich with cached issue data,
     /// store, and prune anything past the 7-day window. Best-effort — each
     /// step's failure is logged and swallowed.
-    async fn refresh_history(&self) {
+    async fn refresh_history(&self, gitlab: &Arc<dyn GitlabApi>) {
         let now = now_secs();
         let cutoff = now.saturating_sub(HISTORY_WINDOW.as_secs());
         let since = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff as i64, 0)
             .unwrap_or_else(chrono::Utc::now);
 
-        let fetched = match self.gitlab.fetch_my_timelogs(since).await {
+        let fetched = match gitlab.fetch_my_timelogs(since).await {
             Ok(f) => f,
             Err(e) => {
                 warn!(error = %e, "background timelog refresh: GitLab fetch failed");
@@ -166,15 +223,20 @@ impl VarlinkInterface for Handlers {
             Err(e) => warn!("cache read failed, treating as miss: {e}"),
         }
 
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => return call.reply_not_authenticated(),
+        };
+
         let fetched = if let Some(groups) = groups {
-            self.gitlab.fetch_group_issues(groups).await
+            gitlab.fetch_group_issues(groups).await
         } else {
-            self.gitlab.fetch_assigned_issues(None).await
+            gitlab.fetch_assigned_issues(None).await
         };
 
         match fetched {
             Ok(raw) => {
-                let issues = enrich_graph_status(&*self.gitlab, &self.boards, raw).await;
+                let issues = enrich_graph_status(&*gitlab, &self.boards, raw).await;
                 if let Err(e) = self.cache.put(&issues) {
                     warn!(error = %e, "cache write failed");
                 }
@@ -211,8 +273,11 @@ impl VarlinkInterface for Handlers {
         duration: String,
         summary: Option<String>,
     ) -> varlink::Result<()> {
-        match self
-            .gitlab
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => return call.reply_not_authenticated(),
+        };
+        match gitlab
             .add_spent_time(project_id, issue_iid, &duration, summary.as_deref())
             .await
         {
@@ -300,7 +365,11 @@ impl VarlinkInterface for Handlers {
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
-        match self.gitlab.close_issue(project_id, issue_iid).await {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => return call.reply_not_authenticated(),
+        };
+        match gitlab.close_issue(project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "closed issue");
                 call.reply()
@@ -324,7 +393,11 @@ impl VarlinkInterface for Handlers {
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
-        match self.gitlab.assign_self(project_id, issue_iid).await {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => return call.reply_not_authenticated(),
+        };
+        match gitlab.assign_self(project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "assigned self");
                 call.reply()
@@ -348,7 +421,11 @@ impl VarlinkInterface for Handlers {
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
-        match self.gitlab.unassign_self(project_id, issue_iid).await {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => return call.reply_not_authenticated(),
+        };
+        match gitlab.unassign_self(project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "unassigned self");
                 call.reply()
@@ -362,6 +439,53 @@ impl VarlinkInterface for Handlers {
                 warn!(error = %e, "UnassignSelf rejected by GitLab");
                 call.reply_gitlab_error(e.to_string())
             }
+        }
+    }
+
+    #[instrument(skip(self, call, token))]
+    async fn login(
+        &self,
+        call: &mut dyn Call_Login,
+        host: String,
+        token: String,
+    ) -> varlink::Result<()> {
+        let client = match GitlabClient::connect(&host, &token).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, host, "Login: GitLab rejected the token");
+                return call.reply_gitlab_error(e.to_string());
+            }
+        };
+        let creds = Credentials {
+            host: host.clone(),
+            token,
+        };
+        if let Err(e) = secrets::store(&creds).await {
+            warn!(error = %e, "Login: keychain write failed");
+            return call.reply_gitlab_error(format!("keychain write failed: {e}"));
+        }
+        let session = Session::from_client(client);
+        info!(host, user_id = session.user_id, "logged in");
+        *self.session.write().await = Some(session);
+        call.reply()
+    }
+
+    #[instrument(skip(self, call))]
+    async fn logout(&self, call: &mut dyn Call_Logout) -> varlink::Result<()> {
+        *self.session.write().await = None;
+        if let Err(e) = secrets::delete().await {
+            warn!(error = %e, "Logout: keychain delete failed");
+            return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
+        }
+        info!("logged out");
+        call.reply()
+    }
+
+    #[instrument(skip(self, call))]
+    async fn who_am_i(&self, call: &mut dyn Call_WhoAmI) -> varlink::Result<()> {
+        match self.current_session().await {
+            Ok(s) => call.reply(s.host, s.user_id),
+            Err(_) => call.reply_not_authenticated(),
         }
     }
 }

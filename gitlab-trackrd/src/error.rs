@@ -12,6 +12,14 @@ pub enum Error {
     #[error("network error: {0}")]
     Transient(String),
 
+    /// No credentials available — the daemon is running but not connected to
+    /// GitLab. The CLI surfaces this as "run `tt login`".
+    #[error("not authenticated")]
+    NotAuthenticated,
+
+    #[error("secret store: {0}")]
+    Secrets(String),
+
     #[error(transparent)]
     DbOpen(#[from] redb::DatabaseError),
 
@@ -35,9 +43,6 @@ pub enum Error {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("Environment variable '{0}' is not set")]
-    Env(&'static str),
 
     #[error("Varlink error: {0}")]
     Varlink(#[from] varlink::Error),

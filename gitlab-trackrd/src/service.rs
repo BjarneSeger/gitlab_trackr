@@ -11,9 +11,9 @@ use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_CloseIssue,
-    Call_GetAssignedIssues, Call_GetHistory, Call_PostTime, Call_UnassignSelf, CloseIssue_Args,
-    GetAssignedIssues_Args, PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
-    VarlinkInterface as _,
+    Call_GetAssignedIssues, Call_GetHistory, Call_Login, Call_Logout, Call_PostTime,
+    Call_UnassignSelf, Call_WhoAmI, CloseIssue_Args, GetAssignedIssues_Args, Login_Args,
+    PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -239,6 +239,30 @@ async fn handle_trackrd(
                     args.issue_iid,
                 )
                 .await?;
+        }
+        "org.thehoster.gitlab.trackrd.Login" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: Login_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .login(&mut call as &mut dyn Call_Login, args.host, args.token)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.Logout" => {
+            handlers.logout(&mut call as &mut dyn Call_Logout).await?;
+        }
+        "org.thehoster.gitlab.trackrd.WhoAmI" => {
+            handlers.who_am_i(&mut call as &mut dyn Call_WhoAmI).await?;
         }
         _ => {
             warn!(method, "unknown trackrd method");

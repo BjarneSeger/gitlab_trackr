@@ -6,7 +6,6 @@
 //! retries for up to 7 days; GitLab rejections drop the task immediately.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::db::KvStore;
 use crate::error::{Error, Result};
-use crate::gitlab::GitlabApi;
+use crate::handlers::SessionSlot;
 use crate::impl_redb_json_value;
 
 // Table name bumped from `post_time_queue` so older `StoredTask` records that
@@ -27,6 +26,8 @@ const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retr
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
 const MAX_LIFETIME: Duration = Duration::from_hours(168);
+/// How long the worker sleeps when there's no active session before retrying.
+const SESSION_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum QueueOp {
@@ -82,7 +83,7 @@ pub struct PendingPostTime {
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
-    pub fn new(gitlab: Arc<dyn GitlabApi>, db_path: &Path) -> Result<Self> {
+    pub fn new(session: SessionSlot, db_path: &Path) -> Result<Self> {
         let store = KvStore::open(db_path, QUEUE_TABLE)?;
 
         let initial_tasks = store.scan(|id, stored| {
@@ -117,7 +118,7 @@ impl RetryQueue {
             });
         }
 
-        tokio::spawn(worker(gitlab, store.clone(), rx));
+        tokio::spawn(worker(session, store.clone(), rx));
 
         Ok(Self {
             sender: tx,
@@ -238,7 +239,7 @@ fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingPostT
 }
 
 async fn worker(
-    gitlab: Arc<dyn GitlabApi>,
+    session: SessionSlot,
     store: KvStore<u64, StoredTask>,
     mut rx: mpsc::Receiver<QueuedTask>,
 ) {
@@ -248,6 +249,20 @@ async fn worker(
 
         'retry: loop {
             attempt += 1;
+            let gitlab = match session.read().await.as_ref().map(|s| s.gitlab.clone()) {
+                Some(g) => g,
+                None => {
+                    warn!(
+                        attempt,
+                        project_id = task.project_id,
+                        issue_iid = task.issue_iid,
+                        op = task.op.kind(),
+                        "no active session; deferring task"
+                    );
+                    tokio::time::sleep(SESSION_WAIT).await;
+                    continue 'retry;
+                }
+            };
             let outcome = match &task.op {
                 QueueOp::PostTime {
                     duration,
@@ -370,8 +385,10 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::error::Result as TrackrResult;
-    use crate::gitlab::{FetchedTimelog, IssueWithLabels};
+    use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+    use crate::handlers::Session;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
@@ -568,8 +585,13 @@ mod tests {
         store: KvStore<u64, StoredTask>,
         task: QueuedTask,
     ) {
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(Some(Session {
+            gitlab,
+            host: "test".to_string(),
+            user_id: 0,
+        })));
         let (tx, rx) = mpsc::channel(8);
-        let handle = tokio::spawn(worker(gitlab, store, rx));
+        let handle = tokio::spawn(worker(session, store, rx));
         tx.send(task).await.unwrap();
         drop(tx);
         handle.await.unwrap();

@@ -41,6 +41,15 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Interactively authenticate against GitLab and store the token in the OS
+    /// keychain (Keychain on macOS, secret-service on Linux).
+    Login {
+        /// GitLab host (e.g. `gitlab.com` or `gitlab.mycorp.com`).
+        #[arg(long, default_value = "gitlab.com")]
+        host: String,
+    },
+    /// Clear the stored credentials and disconnect the daemon from GitLab.
+    Logout,
 }
 
 #[derive(Subcommand)]

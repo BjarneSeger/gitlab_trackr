@@ -5,6 +5,8 @@ pub mod config;
 pub mod hook;
 pub mod list;
 pub mod log;
+pub mod login;
+pub mod logout;
 pub mod prompt;
 pub mod refresh;
 pub mod tick;
