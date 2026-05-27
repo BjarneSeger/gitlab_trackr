@@ -172,6 +172,17 @@ impl GitlabApi for GitlabClient {
 
         let raw: serde_json::Value = endpoint.query_async(&self.inner).await.map_err(classify)?;
 
+        if let Some(errs) = raw["errors"].as_array()
+            && !errs.is_empty()
+        {
+            let msg = errs
+                .iter()
+                .filter_map(|e| e["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Gitlab(format!("timelogCreate: {msg}")));
+        }
+
         if let Some(errs) = raw["data"]["timelogCreate"]["errors"].as_array()
             && !errs.is_empty()
         {
@@ -204,10 +215,25 @@ impl GitlabApi for GitlabClient {
 
         let raw: serde_json::Value = endpoint.query_async(&self.inner).await.map_err(classify)?;
 
+        if let Some(errs) = raw["errors"].as_array()
+            && !errs.is_empty()
+        {
+            let msg = errs
+                .iter()
+                .filter_map(|e| e["message"].as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(Error::Gitlab(format!("currentUser.timelogs: {msg}")));
+        }
+
         let nodes = raw["data"]["currentUser"]["timelogs"]["nodes"]
             .as_array()
             .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                Error::Gitlab(format!(
+                    "currentUser.timelogs returned unexpected shape: {raw}"
+                ))
+            })?;
 
         let mut out = Vec::with_capacity(nodes.len());
         for n in &nodes {
