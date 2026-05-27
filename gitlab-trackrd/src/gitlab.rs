@@ -450,11 +450,13 @@ impl gitlab::api::Endpoint for TimelogCreate<'_> {
 
     fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
         let body = serde_json::json!({
-            "query": "mutation($id: IssuableID!, $time: String!, $summary: String!, $spent: Time) {\
-                timelogCreate(input: { issuableId: $id, timeSpent: $time, summary: $summary, spentAt: $spent }) {\
-                    errors\
-                }\
-            }",
+            "query": r#"
+                mutation($id: IssuableID!, $time: String!, $summary: String!, $spent: Time) {
+                    timelogCreate(input: { issuableId: $id, timeSpent: $time, summary: $summary, spentAt: $spent }) {
+                        errors
+                    }
+                }
+            "#,
             "variables": {
                 "id": self.issuable_id,
                 "time": self.time_spent,
@@ -526,19 +528,21 @@ impl gitlab::api::Endpoint for MyTimelogs {
 
     fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
         let body = serde_json::json!({
-            "query": "query($start: Time!) {\
-                currentUser {\
-                    timelogs(startTime: $start) {\
-                        nodes {\
-                            id\
-                            timeSpent\
-                            spentAt\
-                            summary\
-                            issue { iid title webUrl }\
-                        }\
-                    }\
-                }\
-            }",
+            "query": r#"
+                query($start: Time!) {
+                    currentUser {
+                        timelogs(startTime: $start) {
+                            nodes {
+                                id
+                                timeSpent
+                                spentAt
+                                summary
+                                issue { iid title webUrl }
+                            }
+                        }
+                    }
+                }
+            "#,
             "variables": { "start": self.start_time },
         });
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
