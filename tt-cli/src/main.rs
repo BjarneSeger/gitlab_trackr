@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
             summary,
         } => cmd::log::run(iid, duration, project_id, summary).await,
         Command::Prompt => cmd::prompt::run().await,
-        Command::Tick => cmd::tick::run().await,
+        Command::Tick { mode } => cmd::tick::run(mode).await,
         Command::Hook { shell } => {
             cmd::hook::run(shell);
             Ok(())

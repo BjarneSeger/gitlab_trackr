@@ -22,12 +22,25 @@ pub struct State {
     /// Most recently logged-against issue, used by `tt log <iid>` to skip the
     /// `--project-id` flag when the user re-logs against the same issue.
     pub last_issue: Option<LastIssue>,
+    /// "Owe-a-prompt" marker for the nushell two-phase hook. `tt tick --mode
+    /// defer` sets this when the interval has elapsed; `tt tick --mode
+    /// redeem` clears it and runs the interactive prompt. See `hooks/nu.txt`.
+    pub pending_prompt: Option<PendingPrompt>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LastIssue {
     pub project_id: i64,
     pub issue_iid: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PendingPrompt {
+    /// Pre-computed duration suggestion (`"30m"`, `"1h15m"`) captured at the
+    /// moment `--mode defer` decided a prompt was owed. `None` is reserved
+    /// for the first-ever tick so the redeem step doesn't bias the user
+    /// with a giant elapsed-since-epoch suggestion.
+    pub suggested: Option<String>,
 }
 
 /// Current unix time in seconds. Clock skew before the epoch (negative

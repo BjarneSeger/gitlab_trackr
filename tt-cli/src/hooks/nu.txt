@@ -1,5 +1,17 @@
 # Install: append to ~/.config/nushell/config.nu (or `tt hook nu | save -a $nu.config-path`).
 # Verified against Nushell 0.90+ — older versions had a different hooks schema.
+#
+# Two-phase setup. `pre_execution` only decides whether a prompt is owed and
+# stores a marker in the state file. `pre_prompt` consumes the marker and
+# runs the interactive prompt. This dodges two known nushell quirks:
+# - Running inquire from `pre_execution` would collide with TUIs the user
+#   just launched (vim, hx, less, fzf, …) — they'd both fight over the TTY.
+# - `pre_prompt` re-fires during inquire's redraws, so running inquire
+#   directly from it stacks prompts on top of each other. The marker is
+#   cleared before inquire opens, so re-fires become no-ops.
 $env.config = ($env.config | upsert hooks.pre_execution (
-    ($env.config.hooks?.pre_execution? | default []) ++ [{|| tt tick }]
+    ($env.config.hooks?.pre_execution? | default []) ++ [{|| tt tick --mode defer }]
+))
+$env.config = ($env.config | upsert hooks.pre_prompt (
+    ($env.config.hooks?.pre_prompt? | default []) ++ [{|| tt tick --mode redeem }]
 ))

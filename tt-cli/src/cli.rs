@@ -25,6 +25,29 @@ pub enum OutputFormat {
     Json,
 }
 
+/// `tt tick` operating mode. Default `inline` is the single-shot path used by
+/// bash/fish/zsh. The two-phase `defer` + `redeem` pair exists for nushell,
+/// where `pre_execution` would collide with the next command's TUI and
+/// `pre_prompt` re-fires during inquire redraws.
+#[derive(Clone, Copy, Default, ValueEnum)]
+pub enum TickMode {
+    /// Check the interval and, if elapsed, run the interactive prompt
+    /// directly. Used by bash's PROMPT_COMMAND, fish's fish_postexec, and
+    /// zsh's precmd.
+    #[default]
+    Inline,
+    /// Check the interval and, if elapsed, write a "prompt owed" marker into
+    /// the state file. Never runs inquire. Used by nushell's `pre_execution`
+    /// hook so the prompt doesn't collide with the command the user just
+    /// launched.
+    Defer,
+    /// If a "prompt owed" marker exists, clear it and run the interactive
+    /// prompt. Otherwise exit silently. Used by nushell's `pre_prompt` hook;
+    /// the clear-before-prompt order means re-fires during inquire redraws
+    /// are no-ops.
+    Redeem,
+}
+
 #[derive(Subcommand)]
 pub enum Command {
     /// List issues assigned to you.
@@ -50,8 +73,13 @@ pub enum Command {
     },
     /// Interactively pick an issue and log time.
     Prompt,
-    /// Hook entry: if enough time has elapsed, run the interactive prompt; otherwise exit silently.
-    Tick,
+    /// Hook entry: if enough time has elapsed, run the interactive prompt;
+    /// otherwise exit silently. Most shell hooks use the default `inline`
+    /// mode; the nushell hook splits the work in two — see `tt hook nu`.
+    Tick {
+        #[arg(long, value_enum, default_value_t = TickMode::Inline)]
+        mode: TickMode,
+    },
     /// Print a shell snippet that wires `tt tick` into the pre-prompt hook.
     Hook {
         #[arg(value_enum)]
