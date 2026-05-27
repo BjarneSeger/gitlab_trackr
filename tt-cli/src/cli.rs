@@ -3,14 +3,37 @@ use clap::{Parser, Subcommand, ValueEnum};
 #[derive(Parser)]
 #[command(name = "tt", about = "GitLab time-tracking CLI", version)]
 pub struct Cli {
+    /// Output format for data-returning commands (`list`, `history`, `whoami`).
+    /// Mutation commands accept the flag but keep their plain status messages.
+    #[arg(
+        long = "output",
+        short = 'o',
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        global = true,
+    )]
+    pub output: OutputFormat,
+
     #[command(subcommand)]
     pub command: Command,
+}
+
+#[derive(Clone, Copy, Default, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
 pub enum Command {
     /// List issues assigned to you.
-    List,
+    List {
+        /// Restrict to issues in the given GitLab group. Repeat the flag to
+        /// query several groups; the daemon merges their results.
+        #[arg(long = "group", value_name = "GROUP")]
+        groups: Vec<String>,
+    },
     /// Log time on an issue non-interactively.
     Log {
         /// Issue IID (per-project number, shown as `#42` in the GitLab UI).
@@ -50,6 +73,34 @@ pub enum Command {
     },
     /// Clear the stored credentials and disconnect the daemon from GitLab.
     Logout,
+    /// Print the authenticated user (host + numeric user ID).
+    Whoami,
+    /// Close an issue.
+    Close {
+        /// Issue IID.
+        iid: i64,
+        /// Project ID. If omitted, resolved like `tt log`.
+        #[arg(short = 'p', long)]
+        project_id: Option<i64>,
+    },
+    /// Assign yourself to an issue (without removing existing assignees).
+    Assign {
+        /// Issue IID.
+        iid: i64,
+        /// Project ID. If omitted, resolved like `tt log`.
+        #[arg(short = 'p', long)]
+        project_id: Option<i64>,
+    },
+    /// Remove yourself from an issue's assignee list.
+    Unassign {
+        /// Issue IID.
+        iid: i64,
+        /// Project ID. If omitted, resolved like `tt log`.
+        #[arg(short = 'p', long)]
+        project_id: Option<i64>,
+    },
+    /// Show recent time-tracking history (last 7 days).
+    History,
 }
 
 #[derive(Subcommand)]

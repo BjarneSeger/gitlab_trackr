@@ -2855,6 +2855,7 @@ version = "0.4.2"
 dependencies = [
  "anyhow",
  "carapace_spec_clap",
+ "chrono",
  "clap",
  "clap_complete",
  "confique",

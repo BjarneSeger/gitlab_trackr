@@ -15,8 +15,8 @@ use clap::Parser;
 /// GitLab terminology note: every issue has both a global `id` and a
 /// per-project `iid` (the `#42` shown in the UI). The varlink API needs both
 /// `project_id` and `issue_iid` to address an issue; users almost always know
-/// the `iid` but rarely the `project_id`, so [`cli::Command::Log`] accepts
-/// `iid` positionally and resolves the project lazily (see [`cmd::log`]).
+/// the `iid` but rarely the `project_id`, so the issue-acting commands accept
+/// `iid` positionally and resolve the project lazily (see [`cmd::project`]).
 mod cli;
 mod client;
 mod cmd;
@@ -31,8 +31,9 @@ use cli::{Cli, Command};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Cli::parse();
+    let output = args.output;
     match args.command {
-        Command::List => cmd::list::run().await,
+        Command::List { groups } => cmd::list::run(groups, output).await,
         Command::Log {
             iid,
             duration,
@@ -52,5 +53,10 @@ async fn main() -> Result<()> {
         }
         Command::Login { host } => cmd::login::run(host).await,
         Command::Logout => cmd::logout::run().await,
+        Command::Whoami => cmd::whoami::run(output).await,
+        Command::Close { iid, project_id } => cmd::close::run(iid, project_id).await,
+        Command::Assign { iid, project_id } => cmd::assign::run(iid, project_id).await,
+        Command::Unassign { iid, project_id } => cmd::unassign::run(iid, project_id).await,
+        Command::History => cmd::history::run(output).await,
     }
 }
