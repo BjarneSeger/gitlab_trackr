@@ -1,7 +1,12 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "tt", about = "GitLab time-tracking CLI", version)]
+#[command(
+    name = "tt",
+    about = "GitLab time-tracking CLI",
+    version,
+    max_term_width = 100,
+)]
 pub struct Cli {
     /// Output format for data-returning commands (`list`, `history`, `whoami`).
     /// Mutation commands accept the flag but keep their plain status messages.
