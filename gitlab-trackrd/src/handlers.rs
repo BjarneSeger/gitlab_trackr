@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, instrument, warn};
 
 use gitlab_trackr_api::{
-    Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory, Call_PostTime,
-    HistoryEvent, Issue, VarlinkInterface,
+    Call_AssignSelf, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory,
+    Call_PostTime, Call_UnassignSelf, HistoryEvent, Issue, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
@@ -91,7 +91,6 @@ impl Handlers {
             Err(e) => warn!(error = %e, "history prune failed"),
         }
     }
-
 }
 
 /// Fill `graph_status` on each issue using cached or freshly-fetched board
@@ -313,6 +312,54 @@ impl VarlinkInterface for Handlers {
             }
             Err(e) => {
                 warn!(error = %e, "CloseIssue rejected by GitLab");
+                call.reply_gitlab_error(e.to_string())
+            }
+        }
+    }
+
+    #[instrument(skip(self, call))]
+    async fn assign_self(
+        &self,
+        call: &mut dyn Call_AssignSelf,
+        project_id: i64,
+        issue_iid: i64,
+    ) -> varlink::Result<()> {
+        match self.gitlab.assign_self(project_id, issue_iid).await {
+            Ok(()) => {
+                info!(project_id, issue_iid, "assigned self");
+                call.reply()
+            }
+            Err(Error::Transient(ref e)) => {
+                warn!(error = %e, project_id, issue_iid, "AssignSelf network error, queuing for retry");
+                self.queue.assign_self(project_id, issue_iid).await;
+                call.reply()
+            }
+            Err(e) => {
+                warn!(error = %e, "AssignSelf rejected by GitLab");
+                call.reply_gitlab_error(e.to_string())
+            }
+        }
+    }
+
+    #[instrument(skip(self, call))]
+    async fn unassign_self(
+        &self,
+        call: &mut dyn Call_UnassignSelf,
+        project_id: i64,
+        issue_iid: i64,
+    ) -> varlink::Result<()> {
+        match self.gitlab.unassign_self(project_id, issue_iid).await {
+            Ok(()) => {
+                info!(project_id, issue_iid, "unassigned self");
+                call.reply()
+            }
+            Err(Error::Transient(ref e)) => {
+                warn!(error = %e, project_id, issue_iid, "UnassignSelf network error, queuing for retry");
+                self.queue.unassign_self(project_id, issue_iid).await;
+                call.reply()
+            }
+            Err(e) => {
+                warn!(error = %e, "UnassignSelf rejected by GitLab");
                 call.reply_gitlab_error(e.to_string())
             }
         }
@@ -542,6 +589,12 @@ mod tests {
         async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
             unimplemented!()
         }
+        async fn assign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+            unimplemented!()
+        }
+        async fn unassign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+            unimplemented!()
+        }
         async fn fetch_board_list_labels(&self, project_id: i64) -> TrackrResult<Vec<String>> {
             self.board_calls.fetch_add(1, Ordering::SeqCst);
             match self.board_labels.lock().unwrap().remove(&project_id) {
@@ -581,8 +634,8 @@ mod tests {
         boards.put(7, vec!["Doing".into(), "Done".into()]).unwrap();
         let gitlab = FakeGitlab::default();
 
-        let out = enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["bug", "Doing"])])
-            .await;
+        let out =
+            enrich_graph_status(&gitlab, &boards, vec![iwl(7, "opened", &["bug", "Doing"])]).await;
 
         assert_eq!(out[0].graph_status, "Doing");
         assert_eq!(gitlab.board_calls(), 0, "cache hit must skip the API call");

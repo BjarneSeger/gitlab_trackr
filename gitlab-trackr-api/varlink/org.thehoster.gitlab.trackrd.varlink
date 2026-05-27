@@ -31,6 +31,10 @@ method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?str
 
 method CloseIssue(project_id: int, issue_iid: int) -> ()
 
+method AssignSelf(project_id: int, issue_iid: int) -> ()
+
+method UnassignSelf(project_id: int, issue_iid: int) -> ()
+
 method ClearCache() -> ()
 
 method GetHistory() -> (events: []HistoryEvent)

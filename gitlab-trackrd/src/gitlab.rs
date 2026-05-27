@@ -16,6 +16,10 @@ use gitlab_trackr_api::Issue;
 
 pub struct GitlabClient {
     inner: gitlab::AsyncGitlab,
+    /// Numeric ID of the authenticated user, fetched once at `connect()`.
+    /// Required so `assign_self`/`unassign_self` can mutate the issue's
+    /// `assignee_ids` list without an extra round-trip per call.
+    current_user_id: i64,
 }
 
 /// Issue plus the raw data we still need after the GitLab fetch — labels for
@@ -73,16 +77,71 @@ pub trait GitlabApi: Send + Sync {
 
     async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()>;
 
+    async fn assign_self(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+
+    async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+
     async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>>;
 }
 
 impl GitlabClient {
+    /// Read the issue's current `assignee_ids`, apply the add/remove, and PUT
+    /// the new list back. Skips the PUT when the issue is already in the
+    /// target state (`add && already assigned` or `!add && not assigned`).
+    async fn mutate_self_assignment(
+        &self,
+        project_id: i64,
+        issue_iid: i64,
+        add: bool,
+    ) -> Result<()> {
+        let raw: serde_json::Value = GetIssueEndpoint {
+            project_id,
+            issue_iid,
+        }
+        .query_async(&self.inner)
+        .await
+        .map_err(classify)?;
+
+        let current: Vec<i64> = raw["assignees"]
+            .as_array()
+            .map(|arr| arr.iter().filter_map(|a| a["id"].as_i64()).collect())
+            .unwrap_or_default();
+
+        let Some(new_ids) = compute_new_assignees(&current, self.current_user_id, add) else {
+            return Ok(());
+        };
+
+        use gitlab::api::ignore;
+        ignore(UpdateAssigneesEndpoint {
+            project_id,
+            issue_iid,
+            assignee_ids: new_ids,
+        })
+        .query_async(&self.inner)
+        .await
+        .map_err(classify)?;
+        Ok(())
+    }
+
     pub async fn connect(host: &str, token: &str) -> Result<Self> {
         let inner = gitlab::GitlabBuilder::new(host.to_string(), token.to_string())
             .build_async()
             .await
             .map_err(|e| Error::Gitlab(e.to_string()))?;
-        Ok(Self { inner })
+
+        let user: serde_json::Value = CurrentUserEndpoint
+            .query_async(&inner)
+            .await
+            .map_err(classify)?;
+        let current_user_id = user["id"].as_i64().ok_or_else(|| {
+            Error::Gitlab(format!("GET /user response missing numeric id: {user}"))
+        })?;
+        info!(current_user_id, "resolved authenticated GitLab user");
+
+        Ok(Self {
+            inner,
+            current_user_id,
+        })
     }
 }
 
@@ -281,6 +340,18 @@ impl GitlabApi for GitlabClient {
         Ok(())
     }
 
+    /// Add the authenticated user to the issue's `assignee_ids` list.
+    #[instrument(skip(self))]
+    async fn assign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
+        self.mutate_self_assignment(project_id, issue_iid, true).await
+    }
+
+    /// Remove the authenticated user from the issue's `assignee_ids` list.
+    #[instrument(skip(self))]
+    async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
+        self.mutate_self_assignment(project_id, issue_iid, false).await
+    }
+
     /// Collect the label names of every list across every board in `project_id`.
     ///
     /// Used to drive `Issue::graph_status` — an issue's `graph_status` is set
@@ -465,6 +536,75 @@ impl gitlab::api::Endpoint for TimelogCreate<'_> {
             },
         });
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// `GET /user` — returns the authenticated user's profile. Only `id` is used.
+struct CurrentUserEndpoint;
+
+impl gitlab::api::Endpoint for CurrentUserEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "user".into()
+    }
+}
+
+/// `GET /projects/:project_id/issues/:issue_iid`. Used to read the existing
+/// assignee list before mutating it.
+struct GetIssueEndpoint {
+    project_id: i64,
+    issue_iid: i64,
+}
+
+impl gitlab::api::Endpoint for GetIssueEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        format!("projects/{}/issues/{}", self.project_id, self.issue_iid).into()
+    }
+}
+
+/// `PUT /projects/:project_id/issues/:issue_iid` with `assignee_ids=[...]`.
+struct UpdateAssigneesEndpoint {
+    project_id: i64,
+    issue_iid: i64,
+    assignee_ids: Vec<i64>,
+}
+
+impl gitlab::api::Endpoint for UpdateAssigneesEndpoint {
+    fn method(&self) -> http::Method {
+        http::Method::PUT
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        format!("projects/{}/issues/{}", self.project_id, self.issue_iid).into()
+    }
+
+    fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
+        let body = serde_json::json!({"assignee_ids": self.assignee_ids});
+        Ok(Some(("application/json", serde_json::to_vec(&body)?)))
+    }
+}
+
+/// Compute the new assignee list when adding (`add=true`) or removing
+/// (`add=false`) `self_id`. Returns `None` when no change is needed — the
+/// caller can skip the PUT entirely.
+fn compute_new_assignees(current: &[i64], self_id: i64, add: bool) -> Option<Vec<i64>> {
+    let already = current.contains(&self_id);
+    if add == already {
+        return None;
+    }
+    if add {
+        let mut out = current.to_vec();
+        out.push(self_id);
+        Some(out)
+    } else {
+        Some(current.iter().copied().filter(|id| *id != self_id).collect())
     }
 }
 
@@ -703,6 +843,42 @@ mod tests {
         assert!(r.issue.parent.is_empty());
         assert!(r.issue.total_time.is_empty());
         assert!(r.labels.is_empty());
+    }
+
+    #[test]
+    fn compute_new_assignees_add_when_absent() {
+        assert_eq!(
+            compute_new_assignees(&[1, 2], 5, true),
+            Some(vec![1, 2, 5])
+        );
+    }
+
+    #[test]
+    fn compute_new_assignees_add_when_already_present_is_noop() {
+        assert_eq!(compute_new_assignees(&[1, 5, 2], 5, true), None);
+    }
+
+    #[test]
+    fn compute_new_assignees_remove_when_present() {
+        assert_eq!(
+            compute_new_assignees(&[1, 5, 2], 5, false),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn compute_new_assignees_remove_when_absent_is_noop() {
+        assert_eq!(compute_new_assignees(&[1, 2], 5, false), None);
+    }
+
+    #[test]
+    fn compute_new_assignees_remove_from_empty_is_noop() {
+        assert_eq!(compute_new_assignees(&[], 5, false), None);
+    }
+
+    #[test]
+    fn compute_new_assignees_add_to_empty() {
+        assert_eq!(compute_new_assignees(&[], 5, true), Some(vec![5]));
     }
 
     #[test]

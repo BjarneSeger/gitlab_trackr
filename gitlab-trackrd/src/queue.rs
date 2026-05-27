@@ -22,7 +22,7 @@ use crate::impl_redb_json_value;
 
 // Table name bumped from `post_time_queue` so older `StoredTask` records that
 // don't carry the new `op` field don't crash deserialization on startup.
-const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v3");
+const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v4");
 
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
@@ -41,6 +41,8 @@ enum QueueOp {
         issue_id: Option<i64>,
     },
     CloseIssue,
+    AssignSelf,
+    UnassignSelf,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -52,7 +54,7 @@ struct StoredTask {
     queued_at_secs: u64,
 }
 
-impl_redb_json_value!(StoredTask, "StoredTaskV3");
+impl_redb_json_value!(StoredTask, "StoredTaskV4");
 
 struct QueuedTask {
     id: u64,
@@ -159,6 +161,18 @@ impl RetryQueue {
             .await
     }
 
+    /// Persist an `AssignSelf` task to disk and hand it to the background worker.
+    pub async fn assign_self(&self, project_id: i64, issue_iid: i64) {
+        self.enqueue(project_id, issue_iid, QueueOp::AssignSelf)
+            .await
+    }
+
+    /// Persist an `UnassignSelf` task to disk and hand it to the background worker.
+    pub async fn unassign_self(&self, project_id: i64, issue_iid: i64) {
+        self.enqueue(project_id, issue_iid, QueueOp::UnassignSelf)
+            .await
+    }
+
     /// Snapshot of PostTime tasks currently sitting in the queue.
     ///
     /// Used by the history view to prepend not-yet-flushed entries so the
@@ -212,7 +226,7 @@ fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingPostT
                     summary,
                     queued_at_secs: stored.queued_at_secs,
                 }),
-                QueueOp::CloseIssue => None,
+                QueueOp::CloseIssue | QueueOp::AssignSelf | QueueOp::UnassignSelf => None,
             })
         })?
         .into_iter()
@@ -267,6 +281,10 @@ async fn worker(
                     }
                 },
                 QueueOp::CloseIssue => gitlab.close_issue(task.project_id, task.issue_iid).await,
+                QueueOp::AssignSelf => gitlab.assign_self(task.project_id, task.issue_iid).await,
+                QueueOp::UnassignSelf => {
+                    gitlab.unassign_self(task.project_id, task.issue_iid).await
+                }
             };
 
             match outcome {
@@ -336,6 +354,8 @@ impl QueueOp {
         match self {
             QueueOp::PostTime { .. } => "PostTime",
             QueueOp::CloseIssue => "CloseIssue",
+            QueueOp::AssignSelf => "AssignSelf",
+            QueueOp::UnassignSelf => "UnassignSelf",
         }
     }
 }
@@ -438,9 +458,13 @@ mod tests {
         add_spent_time: Mutex<VecDeque<TrackrResult<()>>>,
         create_timelog: Mutex<VecDeque<TrackrResult<()>>>,
         close_issue: Mutex<VecDeque<TrackrResult<()>>>,
+        assign_self: Mutex<VecDeque<TrackrResult<()>>>,
+        unassign_self: Mutex<VecDeque<TrackrResult<()>>>,
         add_spent_time_calls: AtomicUsize,
         create_timelog_calls: AtomicUsize,
         close_issue_calls: AtomicUsize,
+        assign_self_calls: AtomicUsize,
+        unassign_self_calls: AtomicUsize,
     }
 
     impl FakeGitlab {
@@ -449,6 +473,9 @@ mod tests {
         }
         fn push_close_issue(&self, r: TrackrResult<()>) {
             self.close_issue.lock().unwrap().push_back(r);
+        }
+        fn push_assign_self(&self, r: TrackrResult<()>) {
+            self.assign_self.lock().unwrap().push_back(r);
         }
     }
 
@@ -510,6 +537,24 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .expect("FakeGitlab: no canned close_issue response")
+        }
+        async fn assign_self(&self, _p: i64, _i: i64) -> TrackrResult<()> {
+            self.assign_self_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.assign_self
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeGitlab: no canned assign_self response")
+        }
+        async fn unassign_self(&self, _p: i64, _i: i64) -> TrackrResult<()> {
+            self.unassign_self_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.unassign_self
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("FakeGitlab: no canned unassign_self response")
         }
         async fn fetch_board_list_labels(&self, _p: i64) -> TrackrResult<Vec<String>> {
             unimplemented!()
@@ -665,6 +710,41 @@ mod tests {
                 .close_issue_calls
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_assign_self_success() {
+        let (s, _td) = store();
+        let stored = StoredTask {
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::AssignSelf,
+            queued_at_secs: 100,
+        };
+        s.put(1, stored).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_assign_self(Ok(()));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::AssignSelf,
+            queued_at_secs: 100,
+        };
+        run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert_eq!(
+            gitlab
+                .assign_self_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            snapshot_pending(&s).unwrap().is_empty(),
+            "assign_self is not a PostTime; snapshot ignores it"
         );
     }
 }
