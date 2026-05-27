@@ -132,19 +132,19 @@ async fn handle_trackrd(
                 .await?;
         }
         "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {
-            let Some(args_val) = params else {
-                return Ok(Some(Reply::error(
-                    "org.varlink.service.InvalidParameter",
-                    Some(serde_json::json!({"parameter": "parameters"})),
-                )));
+            // Every field of `GetAssignedIssues_Args` is optional, so an
+            // omitted `parameters` block is a valid call (e.g.
+            // `varlinkctl call ... {}`). Default the args when missing.
+            let args: GetAssignedIssues_Args = match params {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    varlink::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?,
+                None => GetAssignedIssues_Args { groups: None },
             };
-            let args: GetAssignedIssues_Args = serde_json::from_value(args_val).map_err(|e| {
-                varlink::Error(
-                    varlink::ErrorKind::InvalidParameter(e.to_string()),
-                    None,
-                    None,
-                )
-            })?;
 
             handlers
                 .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, args.groups)
