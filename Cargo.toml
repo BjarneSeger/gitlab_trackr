@@ -4,7 +4,7 @@ members = ["gitlab-trackr-api","gitlab-trackrd","tt-cli"]
 
 [workspace.package]
 edition = "2024"
-version = "0.4.1"
+version = "0.4.2"
 license = "GPL-3.0-only"
 
 [workspace.dependencies]
