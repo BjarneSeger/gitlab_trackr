@@ -25,11 +25,14 @@ pub async fn run(host: String) -> Result<()> {
         eprintln!("Open the URL above manually.");
     }
 
-    let token = Password::new("Paste the personal access token:")
-        .without_confirmation()
-        .with_display_mode(inquire::PasswordDisplayMode::Masked)
-        .prompt()
-        .context("reading token from stdin")?;
+    let token = tokio::task::spawn_blocking(|| {
+        Password::new("Paste the personal access token:")
+            .without_confirmation()
+            .with_display_mode(inquire::PasswordDisplayMode::Masked)
+            .prompt()
+            .context("reading token from stdin")
+    })
+    .await??;
     let token = token.trim().to_string();
     if token.is_empty() {
         anyhow::bail!("no token entered; aborting");

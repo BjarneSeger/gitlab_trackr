@@ -26,6 +26,12 @@ impl fmt::Display for IssueChoice {
     }
 }
 
+struct PromptAnswers {
+    issue: Issue,
+    duration: String,
+    summary: Option<String>,
+}
+
 pub async fn run() -> Result<()> {
     run_with_default_duration(None).await
 }
@@ -48,35 +54,47 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         return Ok(());
     }
 
-    let choices: Vec<IssueChoice> = reply.issues.into_iter().map(IssueChoice).collect();
-    let picked = match Select::new("What are you working on?", choices).prompt() {
-        Ok(p) => p,
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-            println!("(skipped)");
-            return Ok(());
-        }
-        Err(e) => return Err(e).context("issue picker"),
-    };
-    let issue = picked.0;
-
+    let issues = reply.issues;
     let suggested = suggested_duration.unwrap_or(cfg.default_duration);
-    let duration = match Text::new("Duration:")
-        .with_initial_value(&suggested)
-        .prompt()
-    {
-        Ok(d) => d,
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-            println!("(skipped)");
-            return Ok(());
-        }
-        Err(e) => return Err(e).context("duration prompt"),
-    };
 
-    let summary = match Text::new("Summary (optional):").prompt() {
-        Ok(s) if s.trim().is_empty() => None,
-        Ok(s) => Some(s),
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => None,
-        Err(e) => return Err(e).context("summary prompt"),
+    // Run all inquire prompts in a dedicated blocking thread. Calling
+    // blocking terminal I/O directly on the tokio executor thread causes
+    // crossterm's raw-mode cleanup to race with the async runtime, leaving
+    // the terminal in raw mode after the process exits.
+    let answers = tokio::task::spawn_blocking(move || -> Result<Option<PromptAnswers>> {
+        let choices: Vec<IssueChoice> = issues.into_iter().map(IssueChoice).collect();
+
+        let picked = match Select::new("What are you working on?", choices).prompt() {
+            Ok(p) => p,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                println!("(skipped)");
+                return Ok(None);
+            }
+            Err(e) => return Err(e).context("issue picker"),
+        };
+
+        let duration = match Text::new("Duration:").with_initial_value(&suggested).prompt() {
+            Ok(d) => d,
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+                println!("(skipped)");
+                return Ok(None);
+            }
+            Err(e) => return Err(e).context("duration prompt"),
+        };
+
+        let summary = match Text::new("Summary (optional):").prompt() {
+            Ok(s) if s.trim().is_empty() => None,
+            Ok(s) => Some(s),
+            Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => None,
+            Err(e) => return Err(e).context("summary prompt"),
+        };
+
+        Ok(Some(PromptAnswers { issue: picked.0, duration, summary }))
+    })
+    .await??;
+
+    let Some(PromptAnswers { issue, duration, summary }) = answers else {
+        return Ok(());
     };
 
     client
