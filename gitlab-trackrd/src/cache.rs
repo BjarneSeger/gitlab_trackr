@@ -58,6 +58,23 @@ impl IssueCache {
     pub fn clear(&self) -> Result<()> {
         self.store.remove("assigned")
     }
+
+    /// Drop the issue identified by `(project_id, issue_iid)` from the cached
+    /// list, if present. Returns whether an entry was actually removed. Lets a
+    /// close/unassign disappear from `tt list` immediately instead of waiting
+    /// for the next refresh.
+    pub fn remove_issue(&self, project_id: i64, issue_iid: i64) -> Result<bool> {
+        let Some(mut issues) = self.get()? else {
+            return Ok(false);
+        };
+        let before = issues.len();
+        issues.retain(|i| !(i.project_id == project_id && i.iid == issue_iid));
+        if issues.len() == before {
+            return Ok(false);
+        }
+        self.put(&issues)?;
+        Ok(true)
+    }
 }
 
 /// Current unix time in seconds; clock skew before the epoch collapses to 0.
@@ -125,6 +142,37 @@ mod tests {
         c.put(&[make_issue(1, "a")]).unwrap();
         c.clear().unwrap();
         assert!(c.get().unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_issue_drops_only_the_match() {
+        let (c, _td) = cache();
+        // make_issue uses project_id = 1 for every issue.
+        c.put(&[make_issue(1, "a"), make_issue(2, "b"), make_issue(3, "c")])
+            .unwrap();
+
+        assert!(c.remove_issue(1, 2).unwrap(), "iid 2 was present");
+        let got = c.get().unwrap().unwrap();
+        let iids: Vec<i64> = got.iter().map(|i| i.iid).collect();
+        assert_eq!(iids, vec![1, 3], "only iid 2 removed");
+    }
+
+    #[test]
+    fn remove_issue_is_noop_when_absent() {
+        let (c, _td) = cache();
+        c.put(&[make_issue(1, "a")]).unwrap();
+        assert!(!c.remove_issue(1, 99).unwrap(), "no matching iid");
+        assert!(
+            !c.remove_issue(7, 1).unwrap(),
+            "iid matches but project_id does not"
+        );
+        assert_eq!(c.get().unwrap().unwrap().len(), 1, "list unchanged");
+    }
+
+    #[test]
+    fn remove_issue_on_empty_cache_returns_false() {
+        let (c, _td) = cache();
+        assert!(!c.remove_issue(1, 1).unwrap());
     }
 
     #[test]

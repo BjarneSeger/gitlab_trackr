@@ -188,6 +188,17 @@ impl Handlers {
             Err(e) => warn!(error = %e, "history prune failed"),
         }
     }
+
+    /// Drop an issue from the assigned-issues cache so a close/unassign is
+    /// reflected in `tt list` immediately. Best-effort — a failure is logged
+    /// and swallowed (the next refresh will reconcile the list anyway).
+    fn forget_cached_issue(&self, project_id: i64, issue_iid: i64) {
+        match self.cache.remove_issue(project_id, issue_iid) {
+            Ok(true) => debug!(project_id, issue_iid, "removed issue from cache"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, project_id, issue_iid, "cache issue removal failed"),
+        }
+    }
 }
 
 /// Fill `graph_status` on each issue using cached or freshly-fetched board
@@ -475,11 +486,13 @@ impl VarlinkInterface for Handlers {
         match gitlab.close_issue(project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "closed issue");
+                self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
             Err(Error::Transient(ref e)) => {
                 warn!(error = %e, project_id, issue_iid, "CloseIssue network error, queuing for retry");
                 self.queue.close_issue(project_id, issue_iid).await;
+                self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
             Err(e) => {
@@ -531,11 +544,13 @@ impl VarlinkInterface for Handlers {
         match gitlab.unassign_self(project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "unassigned self");
+                self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
             Err(Error::Transient(ref e)) => {
                 warn!(error = %e, project_id, issue_iid, "UnassignSelf network error, queuing for retry");
                 self.queue.unassign_self(project_id, issue_iid).await;
+                self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
             Err(e) => {
