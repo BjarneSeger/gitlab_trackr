@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
@@ -21,7 +21,7 @@ use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::error::{Error, Result};
 use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
-use crate::history::{HISTORY_WINDOW, HistoryCache, StoredTimelog};
+use crate::history::{ACTIVE_WINDOW, HistoryCache, SEMI_WINDOW, STALE_WINDOW, StoredTimelog};
 use crate::queue::RetryQueue;
 use crate::secrets::{self, Credentials};
 
@@ -105,22 +105,53 @@ impl Handlers {
             }
         }
 
-        self.refresh_history(&gitlab).await;
+        self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
     }
 
-    /// Pull the user's recent GitLab timelogs, enrich with cached issue data,
-    /// store, and prune anything past the 7-day window. Best-effort — each
-    /// step's failure is logged and swallowed.
-    async fn refresh_history(&self, gitlab: &Arc<dyn GitlabApi>) {
+    /// Daily refresh of the semi-active tier (24h–30d) followed by a prune of
+    /// anything past the stale window. Acquires the session itself; no-op when
+    /// dormant. Called by the daily background loop.
+    pub async fn refresh_history_daily(&self) {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => {
+                debug!("dormant; skipping daily history refresh");
+                return;
+            }
+        };
+        self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+        self.prune_history();
+    }
+
+    /// One-time backfill of the full stale window (up to 90d) so the older,
+    /// never-refreshed bands are populated. Acquires the session itself; no-op
+    /// when dormant. Called once at startup and after a full cache clear.
+    pub async fn backfill_history(&self) {
+        let gitlab = match self.gitlab().await {
+            Ok(g) => g,
+            Err(_) => {
+                debug!("dormant; skipping history backfill");
+                return;
+            }
+        };
+        self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+        self.prune_history();
+    }
+
+    /// Pull the user's GitLab timelogs spanning `window` back from now, enrich
+    /// with cached issue data, and store. Best-effort — each step's failure is
+    /// logged and swallowed. Pruning is a separate step (see [`Self::prune_history`])
+    /// so the frequent active refresh doesn't scan the whole table every time.
+    async fn refresh_history_window(&self, gitlab: &Arc<dyn GitlabApi>, window: Duration) {
         let now = now_secs();
-        let cutoff = now.saturating_sub(HISTORY_WINDOW.as_secs());
+        let cutoff = now.saturating_sub(window.as_secs());
         let since = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff as i64, 0)
             .unwrap_or_else(chrono::Utc::now);
 
         let fetched = match gitlab.fetch_my_timelogs(since).await {
             Ok(f) => f,
             Err(e) => {
-                warn!(error = %e, "background timelog refresh: GitLab fetch failed");
+                warn!(error = %e, "timelog refresh: GitLab fetch failed");
                 return;
             }
         };
@@ -140,8 +171,17 @@ impl Handlers {
         if let Err(e) = self.history.upsert(&stored) {
             warn!(error = %e, "history upsert failed");
         } else {
-            info!(count = stored.len(), "history refresh complete");
+            info!(
+                count = stored.len(),
+                window_secs = window.as_secs(),
+                "history refresh complete"
+            );
         }
+    }
+
+    /// Drop history entries that have aged past the stale window.
+    fn prune_history(&self) {
+        let cutoff = now_secs().saturating_sub(STALE_WINDOW.as_secs());
         match self.history.prune(cutoff) {
             Ok(0) => {}
             Ok(n) => info!(removed = n, "pruned stale history entries"),
@@ -250,17 +290,75 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
-    async fn clear_cache(&self, call: &mut dyn Call_ClearCache) -> varlink::Result<()> {
-        if let Err(e) = self.cache.clear() {
-            warn!("issue cache clear failed: {e}");
-        } else {
-            info!("issue cache cleared");
+    async fn clear_cache(
+        &self,
+        call: &mut dyn Call_ClearCache,
+        scope: Option<Vec<String>>,
+    ) -> varlink::Result<()> {
+        // An empty / absent scope means "clear everything".
+        let scopes = scope.unwrap_or_default();
+        let all = scopes.is_empty();
+        let want = |s: &str| all || scopes.iter().any(|x| x == s);
+
+        if want("issues") {
+            if let Err(e) = self.cache.clear() {
+                warn!("issue cache clear failed: {e}");
+            } else {
+                info!("issue cache cleared");
+            }
+            if let Err(e) = self.boards.clear() {
+                warn!("board cache clear failed: {e}");
+            } else {
+                info!("board cache cleared");
+            }
         }
-        if let Err(e) = self.boards.clear() {
-            warn!("board cache clear failed: {e}");
+
+        // History tiers. `all` wipes the whole store in one shot; individual
+        // flags clear just their `spent_at` band (active is open-ended on top,
+        // the bands abut at the active/semi window boundaries).
+        let now = now_secs();
+        let active_start = now.saturating_sub(ACTIVE_WINDOW.as_secs());
+        let semi_start = now.saturating_sub(SEMI_WINDOW.as_secs());
+
+        if all {
+            if let Err(e) = self.history.clear() {
+                warn!("history clear failed: {e}");
+            } else {
+                info!("history cleared");
+            }
         } else {
-            info!("board cache cleared");
+            if want("active") {
+                clear_band(&self.history, active_start, u64::MAX, "active");
+            }
+            if want("semi") {
+                clear_band(&self.history, semi_start, active_start, "semi");
+            }
+            if want("stale") {
+                clear_band(&self.history, 0, semi_start, "stale");
+            }
         }
+
+        // Re-fetch what we cleared so it repopulates immediately rather than
+        // waiting for the next scheduled refresh (which, for the stale tier,
+        // only happens at startup). Skipped when dormant.
+        if let Ok(gitlab) = self.gitlab().await {
+            if all {
+                // Full wipe: warm issues/boards first (history enrichment reads
+                // project IDs from the issue cache), then backfill every tier —
+                // exactly the startup sequence.
+                self.refresh_cache().await;
+                self.backfill_history().await;
+            } else if want("stale") {
+                // `stale`'s window subsumes the narrower tiers.
+                self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+                self.prune_history();
+            } else if want("semi") {
+                self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+            } else if want("active") {
+                self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
+            }
+        }
+
         call.reply()
     }
 
@@ -306,9 +404,14 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
-    async fn get_history(&self, call: &mut dyn Call_GetHistory) -> varlink::Result<()> {
+    async fn get_history(
+        &self,
+        call: &mut dyn Call_GetHistory,
+        days: Option<i64>,
+    ) -> varlink::Result<()> {
         let now = now_secs();
-        let cutoff = now.saturating_sub(HISTORY_WINDOW.as_secs());
+        let days = days.unwrap_or(7).max(0) as u64;
+        let cutoff = now.saturating_sub(days.saturating_mul(86_400));
 
         let cached_issues = self.cache.get().ok().flatten().unwrap_or_default();
         let by_key: HashMap<(i64, i64), &Issue> = cached_issues
@@ -529,6 +632,14 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Clear one history tier's `spent_at` band, logging the outcome.
+fn clear_band(history: &HistoryCache, min_secs: u64, max_secs: u64, tier: &str) {
+    match history.clear_between(min_secs, max_secs) {
+        Ok(n) => info!(removed = n, tier, "history tier cleared"),
+        Err(e) => warn!(error = %e, tier, "history tier clear failed"),
+    }
 }
 
 #[cfg(test)]
@@ -842,5 +953,90 @@ mod tests {
 
         assert_eq!(out.len(), 3);
         assert_eq!(gitlab.board_calls(), 1, "single fetch per project");
+    }
+
+    // ── clear_cache scoping ────────────────────────────────────────────────
+
+    /// Build `Handlers` with a dormant session (no GitLab), so `clear_cache`
+    /// clears without the follow-up re-fetch — letting us assert the bands.
+    fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |name: &str| dir.path().join(name);
+        let session: SessionSlot = Arc::new(RwLock::new(None));
+        let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
+        let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
+        let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
+        let queue = RetryQueue::new(Arc::clone(&session), &p("queue.redb")).unwrap();
+        (
+            Handlers {
+                session,
+                cache,
+                boards,
+                history,
+                queue,
+            },
+            dir,
+        )
+    }
+
+    fn stored(timelog_id: u64, spent_at_secs: u64) -> StoredTimelog {
+        StoredTimelog {
+            timelog_id,
+            spent_at_secs,
+            project_id: 1,
+            issue_iid: 1,
+            issue_title: "t".into(),
+            web_url: "u".into(),
+            duration: "1h".into(),
+            summary: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_cache_active_scope_only_clears_last_24h() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        let now = now_secs();
+        h.history
+            .upsert(&[
+                stored(1, now - 3_600),       // within 24h → active
+                stored(2, now - 3 * 86_400),  // 3 days → semi
+                stored(3, now - 45 * 86_400), // 45 days → stale
+            ])
+            .unwrap();
+
+        let mut call = AsyncCall::default();
+        h.clear_cache(
+            &mut call as &mut dyn Call_ClearCache,
+            Some(vec!["active".to_string()]),
+        )
+        .await
+        .unwrap();
+
+        let remaining: Vec<u64> = h
+            .history
+            .all_since(0)
+            .unwrap()
+            .iter()
+            .map(|e| e.timelog_id)
+            .collect();
+        assert_eq!(remaining, vec![2, 3], "only the active-band entry is removed");
+    }
+
+    #[tokio::test]
+    async fn clear_cache_no_scope_clears_all_history() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        let now = now_secs();
+        h.history
+            .upsert(&[stored(1, now - 3_600), stored(2, now - 45 * 86_400)])
+            .unwrap();
+
+        let mut call = AsyncCall::default();
+        h.clear_cache(&mut call as &mut dyn Call_ClearCache, None)
+            .await
+            .unwrap();
+
+        assert!(h.history.all_since(0).unwrap().is_empty());
     }
 }

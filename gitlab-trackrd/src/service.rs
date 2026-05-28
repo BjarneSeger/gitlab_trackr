@@ -12,8 +12,9 @@ use varlink::sansio::ServerEvent;
 use gitlab_trackr_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_CloseIssue,
     Call_GetAssignedIssues, Call_GetHistory, Call_Login, Call_Logout, Call_PostTime,
-    Call_UnassignSelf, Call_WhoAmI, CloseIssue_Args, GetAssignedIssues_Args, Login_Args,
-    PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, CloseIssue_Args, GetAssignedIssues_Args,
+    GetHistory_Args, Login_Args, PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
+    VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -122,13 +123,37 @@ async fn handle_trackrd(
     let mut call = AsyncCall::default();
     match method {
         "org.thehoster.gitlab.trackrd.ClearCache" => {
+            // `scope` is optional, so an omitted `parameters` block is valid
+            // and means "clear everything".
+            let args: ClearCache_Args = match params {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    varlink::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?,
+                None => ClearCache_Args { scope: None },
+            };
             handlers
-                .clear_cache(&mut call as &mut dyn Call_ClearCache)
+                .clear_cache(&mut call as &mut dyn Call_ClearCache, args.scope)
                 .await?;
         }
         "org.thehoster.gitlab.trackrd.GetHistory" => {
+            // `days` is optional; an omitted `parameters` block falls back to
+            // the default window in the handler.
+            let args: GetHistory_Args = match params {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    varlink::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?,
+                None => GetHistory_Args { days: None },
+            };
             handlers
-                .get_history(&mut call as &mut dyn Call_GetHistory)
+                .get_history(&mut call as &mut dyn Call_GetHistory, args.days)
                 .await?;
         }
         "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {

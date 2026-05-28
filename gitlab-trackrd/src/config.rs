@@ -6,8 +6,11 @@ use std::path::PathBuf;
 use crate::error::Result;
 use crate::secrets::Credentials;
 
-/// Default interval in seconds between background cache refreshes.
+/// Default interval in seconds between background cache refreshes (the active
+/// history tier plus issues and boards).
 const DEFAULT_REFRESH_INTERVAL: u64 = 300;
+/// Default interval in seconds between semi-active history refreshes (once a day).
+const DEFAULT_SEMI_REFRESH_INTERVAL: u64 = 86_400;
 
 pub struct Config {
     /// Credentials sourced from environment variables (`GITLAB_TOKEN` +
@@ -17,7 +20,10 @@ pub struct Config {
     pub env_creds: Option<Credentials>,
     pub socket: String,
     pub db_path: PathBuf,
+    /// How often the active tier (last 24h), issues, and boards are refreshed.
     pub refresh_interval: u64,
+    /// How often the semi-active tier (24h–30d) is refreshed.
+    pub semi_refresh_interval: u64,
 }
 
 impl Config {
@@ -44,11 +50,17 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_REFRESH_INTERVAL);
 
+        let semi_refresh_interval = std::env::var("GITLAB_TRACKRD_SEMI_REFRESH_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_SEMI_REFRESH_INTERVAL);
+
         Ok(Self {
             env_creds,
             socket,
             db_path,
             refresh_interval,
+            semi_refresh_interval,
         })
     }
 }

@@ -85,16 +85,33 @@ async fn main() -> Result<()> {
     if server::is_socket_activated() {
         info!(
             refresh_interval = cfg.refresh_interval,
+            semi_refresh_interval = cfg.semi_refresh_interval,
             "starting gitlab-trackrd from socket"
         );
     } else {
         info!(
             socket = cfg.socket,
             refresh_interval = cfg.refresh_interval,
+            semi_refresh_interval = cfg.semi_refresh_interval,
             "starting gitlab-trackrd"
         );
     }
 
+    // One-shot startup warm-up: refresh issues/boards/active first so the
+    // issue cache is populated, then backfill the full stale history window so
+    // the older, never-refreshed tiers are filled. Order matters — history
+    // enrichment reads project IDs from the issue cache.
+    {
+        let handlers_ref = Arc::clone(&handlers);
+        tokio::spawn(async move {
+            info!("startup cache warm-up triggered");
+            handlers_ref.refresh_cache().await;
+            handlers_ref.backfill_history().await;
+        });
+    }
+
+    // Active tier: refresh issues, boards, and the last-24h history every
+    // `refresh_interval`.
     {
         let handlers_ref = Arc::clone(&handlers);
         let interval_secs = cfg.refresh_interval;
@@ -104,6 +121,21 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(duration).await;
                 info!("background cache refresh triggered");
                 handlers_ref.refresh_cache().await;
+            }
+        });
+    }
+
+    // Semi-active tier: re-poll the 24h–30d history band once a day and prune
+    // anything past the stale window.
+    {
+        let handlers_ref = Arc::clone(&handlers);
+        let interval_secs = cfg.semi_refresh_interval;
+        tokio::spawn(async move {
+            let duration = std::time::Duration::from_secs(interval_secs);
+            loop {
+                tokio::time::sleep(duration).await;
+                info!("daily history refresh triggered");
+                handlers_ref.refresh_history_daily().await;
             }
         });
     }

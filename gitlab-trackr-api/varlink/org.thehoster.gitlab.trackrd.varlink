@@ -37,9 +37,9 @@ method AssignSelf(project_id: int, issue_iid: int) -> ()
 
 method UnassignSelf(project_id: int, issue_iid: int) -> ()
 
-method ClearCache() -> ()
+method ClearCache(scope: ?[]string) -> ()
 
-method GetHistory() -> (events: []HistoryEvent)
+method GetHistory(days: ?int) -> (events: []HistoryEvent)
 
 method Login(host: string, token: string) -> ()
 

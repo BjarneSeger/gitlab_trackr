@@ -90,8 +90,23 @@ pub enum Command {
         #[arg(value_enum)]
         shell: Shell,
     },
-    /// Tell the daemon to drop its cached issue list.
-    Refresh,
+    /// Drop the daemon's caches and re-fetch. With no flags it clears
+    /// everything (issues, boards, and all history tiers); pass tier flags to
+    /// target only those. Cleared history tiers are re-fetched immediately.
+    Refresh {
+        /// Clear the active history tier (the last 24h).
+        #[arg(long)]
+        active: bool,
+        /// Clear the semi-active history tier (24h–30d).
+        #[arg(long)]
+        semi: bool,
+        /// Clear the stale history tier (30d–90d).
+        #[arg(long)]
+        stale: bool,
+        /// Clear the assigned-issue and board caches.
+        #[arg(long)]
+        issues: bool,
+    },
     /// Inspect or scaffold the user configuration file.
     Config {
         #[command(subcommand)]
@@ -132,8 +147,13 @@ pub enum Command {
         #[arg(short = 'p', long)]
         project_id: Option<i64>,
     },
-    /// Show recent time-tracking history (last 7 days).
-    History,
+    /// Show recent time-tracking history. Defaults to the last 7 days; widen
+    /// up to the 90-day retention with `--days`.
+    History {
+        /// How many days back to show (the daemon retains up to 90).
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+    },
 }
 
 #[derive(Subcommand)]

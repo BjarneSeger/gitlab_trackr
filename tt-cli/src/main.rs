@@ -46,7 +46,12 @@ async fn main() -> Result<()> {
             cmd::hook::run(shell);
             Ok(())
         }
-        Command::Refresh => cmd::refresh::run().await,
+        Command::Refresh {
+            active,
+            semi,
+            stale,
+            issues,
+        } => cmd::refresh::run(active, semi, stale, issues).await,
         Command::Config { action } => {
             cmd::config::run(action);
             Ok(())
@@ -57,6 +62,6 @@ async fn main() -> Result<()> {
         Command::Close { iid, project_id } => cmd::close::run(iid, project_id).await,
         Command::Assign { iid, project_id } => cmd::assign::run(iid, project_id).await,
         Command::Unassign { iid, project_id } => cmd::unassign::run(iid, project_id).await,
-        Command::History => cmd::history::run(output).await,
+        Command::History { days } => cmd::history::run(output, days).await,
     }
 }
