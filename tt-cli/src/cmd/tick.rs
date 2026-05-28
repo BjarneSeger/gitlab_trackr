@@ -12,9 +12,10 @@
 //! `redeem` from `pre_prompt`); see `hooks/nu.txt` for the rationale.
 
 use anyhow::{Context, Result};
+use gitlab_trackr_api::VarlinkClientInterface;
 
 use crate::cli::TickMode;
-use crate::{cmd::prompt, config, state};
+use crate::{client, cmd::prompt, config, state};
 
 pub async fn run(mode: TickMode) -> Result<()> {
     match mode {
@@ -34,6 +35,8 @@ async fn run_inline() -> Result<()> {
     if elapsed_secs < interval_secs {
         return Ok(());
     }
+
+    notify_new_failures(&mut st).await;
 
     let suggested = suggestion_for(&st, elapsed_secs);
 
@@ -85,6 +88,10 @@ async fn run_redeem() -> Result<()> {
         return Ok(());
     }
 
+    notify_new_failures(&mut st).await;
+    // Persist the failure high-water mark (best-effort; harmless if it fails).
+    let _ = state::save(&st);
+
     let outcome = prompt::run_with_default_duration(pending.suggested).await;
 
     // Reload so we don't clobber a `last_issue` that `tt prompt` just wrote.
@@ -95,6 +102,41 @@ async fn run_redeem() -> Result<()> {
     }
 
     outcome
+}
+
+/// Print a one-line notice for queued actions that have failed since the user
+/// last saw one, and advance the high-water mark in `st` (the caller persists
+/// it). Best-effort: a missing/unreachable daemon is swallowed silently so a
+/// downed daemon never blocks or breaks the prompt. Gated behind the interval
+/// check by its call sites, so the cheap no-network fast path is untouched.
+async fn notify_new_failures(st: &mut state::State) {
+    let Ok(cfg) = config::load() else { return };
+    let socket = cfg.socket.unwrap_or_else(client::default_socket);
+    let Ok(client) = client::connect(&socket).await else {
+        return;
+    };
+    let Ok(reply) = client.get_failures().call().await else {
+        return;
+    };
+
+    let mut high_water = st.last_seen_failure_id;
+    for f in &reply.failures {
+        let id = f.id.max(0) as u64;
+        if id <= st.last_seen_failure_id {
+            continue;
+        }
+        let detail = if f.detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", f.detail)
+        };
+        eprintln!(
+            "⚠ tt: queued {} #{}{} failed — {}",
+            f.op, f.issue_iid, detail, f.error
+        );
+        high_water = high_water.max(id);
+    }
+    st.last_seen_failure_id = high_water;
 }
 
 fn suggestion_for(st: &state::State, elapsed_secs: u64) -> Option<String> {

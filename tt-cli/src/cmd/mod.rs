@@ -12,6 +12,7 @@ pub mod login;
 pub mod logout;
 pub mod project;
 pub mod prompt;
+pub mod queue;
 pub mod refresh;
 pub mod tick;
 pub mod unassign;

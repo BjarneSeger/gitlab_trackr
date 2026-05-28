@@ -26,6 +26,10 @@ pub struct State {
     /// defer` sets this when the interval has elapsed; `tt tick --mode
     /// redeem` clears it and runs the interactive prompt. See `hooks/nu.txt`.
     pub pending_prompt: Option<PendingPrompt>,
+    /// Highest dead-letter failure id already surfaced via the `tt tick`
+    /// notice, so each queued-action failure is reported at most once. See
+    /// [`crate::cmd::tick`].
+    pub last_seen_failure_id: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

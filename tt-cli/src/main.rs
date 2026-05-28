@@ -63,5 +63,6 @@ async fn main() -> Result<()> {
         Command::Assign { iid, project_id } => cmd::assign::run(iid, project_id).await,
         Command::Unassign { iid, project_id } => cmd::unassign::run(iid, project_id).await,
         Command::History { days } => cmd::history::run(output, days).await,
+        Command::Queue { action } => cmd::queue::run(action, output).await,
     }
 }

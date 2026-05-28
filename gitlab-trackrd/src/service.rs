@@ -10,11 +10,12 @@ use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_CloseIssue,
-    Call_GetAssignedIssues, Call_GetHistory, Call_Login, Call_Logout, Call_PostTime,
-    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, CloseIssue_Args, GetAssignedIssues_Args,
-    GetHistory_Args, Login_Args, PostTime_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION,
-    VarlinkInterface as _,
+    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures,
+    Call_CloseIssue, Call_DismissFailure, Call_GetAssignedIssues, Call_GetFailures,
+    Call_GetHistory, Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_UnassignSelf,
+    Call_WhoAmI, ClearCache_Args, CloseIssue_Args, DismissFailure_Args, GetAssignedIssues_Args,
+    GetHistory_Args, Login_Args, PostTime_Args, RetryFailure_Args, UnassignSelf_Args,
+    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -154,6 +155,52 @@ async fn handle_trackrd(
             };
             handlers
                 .get_history(&mut call as &mut dyn Call_GetHistory, args.days)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.GetFailures" => {
+            handlers
+                .get_failures(&mut call as &mut dyn Call_GetFailures)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.RetryFailure" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: RetryFailure_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .retry_failure(&mut call as &mut dyn Call_RetryFailure, args.id)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.DismissFailure" => {
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: DismissFailure_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .dismiss_failure(&mut call as &mut dyn Call_DismissFailure, args.id)
+                .await?;
+        }
+        "org.thehoster.gitlab.trackrd.ClearFailures" => {
+            handlers
+                .clear_failures(&mut call as &mut dyn Call_ClearFailures)
                 .await?;
         }
         "org.thehoster.gitlab.trackrd.GetAssignedIssues" => {

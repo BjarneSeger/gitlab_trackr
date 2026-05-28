@@ -12,9 +12,10 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use gitlab_trackr_api::{
-    Call_AssignSelf, Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_GetHistory,
-    Call_Login, Call_Logout, Call_PostTime, Call_UnassignSelf, Call_WhoAmI, HistoryEvent, Issue,
-    VarlinkInterface,
+    Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_CloseIssue, Call_DismissFailure,
+    Call_GetAssignedIssues, Call_GetFailures, Call_GetHistory, Call_Login, Call_Logout,
+    Call_PostTime, Call_RetryFailure, Call_UnassignSelf, Call_WhoAmI, FailedTask, HistoryEvent,
+    Issue, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
@@ -382,6 +383,12 @@ impl VarlinkInterface for Handlers {
         duration: String,
         summary: Option<String>,
     ) -> varlink::Result<()> {
+        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+            return call.reply_gitlab_error(msg);
+        }
+        if !looks_like_duration(&duration) {
+            return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => return call.reply_not_authenticated(),
@@ -473,12 +480,88 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
+    async fn get_failures(&self, call: &mut dyn Call_GetFailures) -> varlink::Result<()> {
+        let failures = match self.queue.failures() {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(error = %e, "dead-letter read failed; returning empty");
+                Vec::new()
+            }
+        };
+        let out = failures
+            .into_iter()
+            .map(|f| FailedTask {
+                id: f.id as i64,
+                op: f.op_kind.to_string(),
+                project_id: f.project_id,
+                issue_iid: f.issue_iid,
+                detail: f.detail,
+                error: f.error,
+                queued_at: f.queued_at_secs as i64,
+                failed_at: f.failed_at_secs as i64,
+            })
+            .collect();
+        call.reply(out)
+    }
+
+    #[instrument(skip(self, call))]
+    async fn retry_failure(
+        &self,
+        call: &mut dyn Call_RetryFailure,
+        id: i64,
+    ) -> varlink::Result<()> {
+        match self.queue.retry_failure(id as u64).await {
+            Ok(true) => {
+                info!(id, "re-enqueued dead-letter task");
+                call.reply()
+            }
+            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Err(e) => {
+                warn!(error = %e, id, "retry_failure failed");
+                call.reply_gitlab_error(e.to_string())
+            }
+        }
+    }
+
+    #[instrument(skip(self, call))]
+    async fn dismiss_failure(
+        &self,
+        call: &mut dyn Call_DismissFailure,
+        id: i64,
+    ) -> varlink::Result<()> {
+        match self.queue.dismiss_failure(id as u64) {
+            Ok(true) => {
+                info!(id, "dismissed dead-letter task");
+                call.reply()
+            }
+            Ok(false) => call.reply_gitlab_error(format!("no failed task with id {id}")),
+            Err(e) => {
+                warn!(error = %e, id, "dismiss_failure failed");
+                call.reply_gitlab_error(e.to_string())
+            }
+        }
+    }
+
+    #[instrument(skip(self, call))]
+    async fn clear_failures(&self, call: &mut dyn Call_ClearFailures) -> varlink::Result<()> {
+        if let Err(e) = self.queue.clear_failures() {
+            warn!(error = %e, "clear_failures failed");
+            return call.reply_gitlab_error(e.to_string());
+        }
+        info!("cleared dead-letter queue");
+        call.reply()
+    }
+
+    #[instrument(skip(self, call))]
     async fn close_issue(
         &self,
         call: &mut dyn Call_CloseIssue,
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
+        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+            return call.reply_gitlab_error(msg);
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => return call.reply_not_authenticated(),
@@ -509,6 +592,9 @@ impl VarlinkInterface for Handlers {
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
+        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+            return call.reply_gitlab_error(msg);
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => return call.reply_not_authenticated(),
@@ -537,6 +623,9 @@ impl VarlinkInterface for Handlers {
         project_id: i64,
         issue_iid: i64,
     ) -> varlink::Result<()> {
+        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+            return call.reply_gitlab_error(msg);
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => return call.reply_not_authenticated(),
@@ -655,6 +744,37 @@ fn clear_band(history: &HistoryCache, min_secs: u64, max_secs: u64, tier: &str) 
         Ok(n) => info!(removed = n, tier, "history tier cleared"),
         Err(e) => warn!(error = %e, tier, "history tier clear failed"),
     }
+}
+
+/// Reject obviously-malformed issue references up front (eager pre-check), so a
+/// doomed request is never attempted or queued. Returns the error message when
+/// invalid.
+fn issue_ref_error(project_id: i64, issue_iid: i64) -> Option<String> {
+    (project_id <= 0 || issue_iid <= 0)
+        .then(|| format!("invalid issue reference (project {project_id}, iid {issue_iid})"))
+}
+
+/// Permissive sanity check for a GitLab time-tracking duration (`30m`,
+/// `1h30m`, `1.5h`, `2d`). Rejects empties and obvious typos (`abc`, `1x`)
+/// without trying to be a full GitLab-compatible parser — valid syntax is never
+/// refused, so the only false negatives would need a unit GitLab doesn't use.
+fn looks_like_duration(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let mut has_digit = false;
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            has_digit = true;
+        } else if c != '.'
+            && !c.is_whitespace()
+            && !matches!(c.to_ascii_lowercase(), 's' | 'm' | 'h' | 'd' | 'w' | 'o')
+        {
+            return false;
+        }
+    }
+    has_digit
 }
 
 #[cfg(test)]
@@ -1053,5 +1173,53 @@ mod tests {
             .unwrap();
 
         assert!(h.history.all_since(0).unwrap().is_empty());
+    }
+
+    // ── eager pre-checks ───────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_duration_accepts_valid_and_rejects_typos() {
+        for ok in ["1h", "30m", "1h30m", "1.5h", "2d", "1w", " 45m "] {
+            assert!(looks_like_duration(ok), "should accept {ok:?}");
+        }
+        for bad in ["", "   ", "abc", "1x", "30 min"] {
+            assert!(!looks_like_duration(bad), "should reject {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_time_rejects_bad_duration_without_queueing() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        let mut call = AsyncCall::default();
+        h.post_time(
+            &mut call as &mut dyn Call_PostTime,
+            7,
+            42,
+            "abc".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert!(reply.error.is_some(), "bad duration → error reply");
+        assert!(
+            h.queue.pending_post_time().unwrap().is_empty(),
+            "nothing enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_issue_rejects_bad_issue_ref() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        let mut call = AsyncCall::default();
+        h.close_issue(&mut call as &mut dyn Call_CloseIssue, 0, 42)
+            .await
+            .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert!(reply.error.is_some(), "project_id 0 → error reply");
     }
 }

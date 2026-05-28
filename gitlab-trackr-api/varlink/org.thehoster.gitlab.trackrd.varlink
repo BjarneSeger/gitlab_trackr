@@ -23,6 +23,17 @@ type HistoryEvent (
   summary: string
 )
 
+type FailedTask (
+  id: int,
+  op: string,
+  project_id: int,
+  issue_iid: int,
+  detail: string,
+  error: string,
+  queued_at: int,
+  failed_at: int
+)
+
 error GitlabError (message: string)
 
 error NotAuthenticated ()
@@ -40,6 +51,14 @@ method UnassignSelf(project_id: int, issue_iid: int) -> ()
 method ClearCache(scope: ?[]string) -> ()
 
 method GetHistory(days: ?int) -> (events: []HistoryEvent)
+
+method GetFailures() -> (failures: []FailedTask)
+
+method RetryFailure(id: int) -> ()
+
+method DismissFailure(id: int) -> ()
+
+method ClearFailures() -> ()
 
 method Login(host: string, token: string) -> ()
 

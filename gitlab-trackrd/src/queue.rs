@@ -3,7 +3,8 @@
 //! Tasks are persisted via `KvStore` before being processed, so they survive
 //! daemon restarts.  A background tokio task works through the queue with
 //! exponential backoff (1 s base, 30 min cap).  Network errors trigger
-//! retries for up to 7 days; GitLab rejections drop the task immediately.
+//! retries for up to 7 days; a GitLab rejection or an exhausted retry window
+//! moves the task to a persistent dead-letter store, surfaced via `tt queue`.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +23,8 @@ use crate::impl_redb_json_value;
 // Table name bumped from `post_time_queue` so older `StoredTask` records that
 // don't carry the new `op` field don't crash deserialization on startup.
 const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v4");
+const DEAD_LETTER_TABLE: TableDefinition<u64, StoredFailure> =
+    TableDefinition::new("dead_letter_v1");
 
 const BASE_DELAY: Duration = Duration::from_secs(1);
 const MAX_DELAY: Duration = Duration::from_mins(30);
@@ -57,6 +60,23 @@ struct StoredTask {
 
 impl_redb_json_value!(StoredTask, "StoredTaskV4");
 
+/// A task the worker gave up on — GitLab rejected it outright, or it exhausted
+/// the retry window. Persisted so the user can inspect, retry, or dismiss it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredFailure {
+    project_id: i64,
+    issue_iid: i64,
+    op: QueueOp,
+    /// When the task was originally enqueued.
+    queued_at_secs: u64,
+    /// When the worker gave up.
+    failed_at_secs: u64,
+    /// The GitLab error or retry-window-exhaustion message.
+    error: String,
+}
+
+impl_redb_json_value!(StoredFailure, "StoredFailureV1");
+
 struct QueuedTask {
     id: u64,
     project_id: i64,
@@ -68,6 +88,7 @@ struct QueuedTask {
 pub struct RetryQueue {
     sender: mpsc::Sender<QueuedTask>,
     store: KvStore<u64, StoredTask>,
+    dead_letter: KvStore<u64, StoredFailure>,
     next_id: AtomicU64,
 }
 
@@ -80,11 +101,30 @@ pub struct PendingPostTime {
     pub queued_at_secs: u64,
 }
 
+/// A dead-lettered task, projected for the `tt queue` view.
+pub struct FailedTaskView {
+    pub id: u64,
+    pub op_kind: &'static str,
+    pub project_id: i64,
+    pub issue_iid: i64,
+    /// Human-readable op detail (e.g. PostTime's duration + summary).
+    pub detail: String,
+    pub error: String,
+    pub queued_at_secs: u64,
+    pub failed_at_secs: u64,
+}
+
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
     pub fn new(session: SessionSlot, db_path: &Path) -> Result<Self> {
         let store = KvStore::open(db_path, QUEUE_TABLE)?;
+        // The dead-letter store lives in its own redb file beside the queue —
+        // redb takes an exclusive lock per file, so it can't share `db_path`.
+        let dead_letter = KvStore::open(
+            &db_path.with_file_name("dead_letter.redb"),
+            DEAD_LETTER_TABLE,
+        )?;
 
         let initial_tasks = store.scan(|id, stored| {
             Ok(QueuedTask {
@@ -96,7 +136,15 @@ impl RetryQueue {
             })
         })?;
 
-        let max_id = initial_tasks.iter().map(|t| t.id).max().unwrap_or(0);
+        // Seed `next_id` above the max key across *both* tables so dead-letter
+        // IDs stay monotonic across restarts (the `tt tick` notice dedupes by ID).
+        let queued_max = initial_tasks.iter().map(|t| t.id).max().unwrap_or(0);
+        let dead_max = dead_letter
+            .scan(|id, _| Ok(id))?
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+        let max_id = queued_max.max(dead_max);
 
         if !initial_tasks.is_empty() {
             info!(
@@ -118,11 +166,12 @@ impl RetryQueue {
             });
         }
 
-        tokio::spawn(worker(session, store.clone(), rx));
+        tokio::spawn(worker(session, store.clone(), dead_letter.clone(), rx));
 
         Ok(Self {
             sender: tx,
             store,
+            dead_letter,
             next_id: AtomicU64::new(max_id + 1),
         })
     }
@@ -185,14 +234,26 @@ impl RetryQueue {
     }
 
     async fn enqueue(&self, project_id: i64, issue_iid: i64, op: QueueOp) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let queued_at_secs = now_secs();
-
-        let stored = StoredTask {
+        self.enqueue_stored(StoredTask {
             project_id,
             issue_iid,
-            op: op.clone(),
-            queued_at_secs,
+            op,
+            queued_at_secs: now_secs(),
+        })
+        .await
+    }
+
+    /// Persist `stored` under a fresh ID and hand it to the worker, keeping its
+    /// `queued_at_secs` intact (so a retried PostTime keeps its original
+    /// spent-at). Used by both fresh enqueues and dead-letter retries.
+    async fn enqueue_stored(&self, stored: StoredTask) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let task = QueuedTask {
+            id,
+            project_id: stored.project_id,
+            issue_iid: stored.issue_iid,
+            op: stored.op.clone(),
+            queued_at_secs: stored.queued_at_secs,
         };
         if let Err(e) = self.store.put(id, stored) {
             warn!(
@@ -200,17 +261,61 @@ impl RetryQueue {
                 "failed to persist task to queue db; it will not survive a restart"
             );
         }
-
-        let task = QueuedTask {
-            id,
-            project_id,
-            issue_iid,
-            op,
-            queued_at_secs,
-        };
         if self.sender.send(task).await.is_err() {
             error!("retry queue channel closed; dropping task");
         }
+    }
+
+    /// Snapshot of dead-lettered tasks (failed permanently or timed out),
+    /// newest failure first.
+    pub fn failures(&self) -> Result<Vec<FailedTaskView>> {
+        let mut out = self.dead_letter.scan(|id, f| {
+            Ok(FailedTaskView {
+                id,
+                op_kind: f.op.kind(),
+                project_id: f.project_id,
+                issue_iid: f.issue_iid,
+                detail: f.op.detail(),
+                error: f.error,
+                queued_at_secs: f.queued_at_secs,
+                failed_at_secs: f.failed_at_secs,
+            })
+        })?;
+        out.sort_by_key(|f| std::cmp::Reverse(f.failed_at_secs));
+        Ok(out)
+    }
+
+    /// Re-enqueue a dead-lettered task (preserving its original enqueue time)
+    /// and drop it from the dead-letter store. Returns `false` if `id` is
+    /// unknown.
+    pub async fn retry_failure(&self, id: u64) -> Result<bool> {
+        let Some(failure) = self.dead_letter.get(id)? else {
+            return Ok(false);
+        };
+        self.enqueue_stored(StoredTask {
+            project_id: failure.project_id,
+            issue_iid: failure.issue_iid,
+            op: failure.op,
+            queued_at_secs: failure.queued_at_secs,
+        })
+        .await;
+        self.dead_letter.remove(id)?;
+        Ok(true)
+    }
+
+    /// Drop a single dead-lettered task without retrying. Returns `false` if
+    /// `id` is unknown.
+    pub fn dismiss_failure(&self, id: u64) -> Result<bool> {
+        if self.dead_letter.get(id)?.is_none() {
+            return Ok(false);
+        }
+        self.dead_letter.remove(id)?;
+        Ok(true)
+    }
+
+    /// Drop every dead-lettered task.
+    pub fn clear_failures(&self) -> Result<()> {
+        self.dead_letter.clear()
     }
 }
 
@@ -241,13 +346,15 @@ fn snapshot_pending(store: &KvStore<u64, StoredTask>) -> Result<Vec<PendingPostT
 async fn worker(
     session: SessionSlot,
     store: KvStore<u64, StoredTask>,
+    dead_letter: KvStore<u64, StoredFailure>,
     mut rx: mpsc::Receiver<QueuedTask>,
 ) {
     while let Some(task) = rx.recv().await {
         let mut delay = BASE_DELAY;
         let mut attempt = 0u32;
 
-        'retry: loop {
+        // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
+        let failure: Option<String> = 'retry: loop {
             attempt += 1;
             let gitlab = match session.read().await.as_ref().map(|s| s.gitlab.clone()) {
                 Some(g) => g,
@@ -313,7 +420,7 @@ async fn worker(
                             "task succeeded after retry"
                         );
                     }
-                    break 'retry;
+                    break 'retry None;
                 }
                 Err(e) if matches!(e, Error::Transient(_)) => {
                     let elapsed =
@@ -327,7 +434,9 @@ async fn worker(
                             op = task.op.kind(),
                             "dropping task after 7-day retry window"
                         );
-                        break 'retry;
+                        break 'retry Some(format!(
+                            "timed out after 7-day retry window: {e}"
+                        ));
                     }
                     let sleep = delay.min(MAX_LIFETIME.checked_sub(elapsed).unwrap());
                     warn!(
@@ -349,8 +458,29 @@ async fn worker(
                         op = task.op.kind(),
                         "task rejected by GitLab; dropping"
                     );
-                    break 'retry;
+                    break 'retry Some(e.to_string());
                 }
+            }
+        };
+
+        // The task left the live queue either way. If it failed permanently,
+        // record it in the dead-letter store (keyed by its id) so the user can
+        // see, retry, or dismiss it via `tt queue`.
+        if let Some(error) = failure {
+            let stored = StoredFailure {
+                project_id: task.project_id,
+                issue_iid: task.issue_iid,
+                op: task.op.clone(),
+                queued_at_secs: task.queued_at_secs,
+                failed_at_secs: now_secs(),
+                error,
+            };
+            if let Err(e) = dead_letter.put(task.id, stored) {
+                warn!(
+                    error = %e,
+                    task_id = task.id,
+                    "failed to record dead-letter entry"
+                );
             }
         }
 
@@ -371,6 +501,20 @@ impl QueueOp {
             QueueOp::CloseIssue => "CloseIssue",
             QueueOp::AssignSelf => "AssignSelf",
             QueueOp::UnassignSelf => "UnassignSelf",
+        }
+    }
+
+    /// Human-readable op detail for the `tt queue` view. PostTime shows its
+    /// duration (and summary, if any); the other ops carry no extra detail.
+    fn detail(&self) -> String {
+        match self {
+            QueueOp::PostTime {
+                duration, summary, ..
+            } => match summary {
+                Some(s) if !s.is_empty() => format!("{duration} – {s}"),
+                _ => duration.clone(),
+            },
+            QueueOp::CloseIssue | QueueOp::AssignSelf | QueueOp::UnassignSelf => String::new(),
         }
     }
 }
@@ -579,22 +723,43 @@ mod tests {
     }
 
     /// Spawn the worker with one task on the channel, close the sender so the
-    /// worker exits after draining, and await its completion.
+    /// worker exits after draining, and await its completion. Returns the
+    /// dead-letter entries it recorded (projected), newest failure first.
     async fn run_worker_one_task(
         gitlab: Arc<dyn GitlabApi>,
         store: KvStore<u64, StoredTask>,
         task: QueuedTask,
-    ) {
+    ) -> Vec<FailedTaskView> {
+        let dir = tempfile::tempdir().unwrap();
+        let dead_letter =
+            KvStore::open(&dir.path().join("dead_letter.redb"), DEAD_LETTER_TABLE).unwrap();
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(Some(Session {
             gitlab,
             host: "test".to_string(),
             user_id: 0,
         })));
         let (tx, rx) = mpsc::channel(8);
-        let handle = tokio::spawn(worker(session, store, rx));
+        let handle = tokio::spawn(worker(session, store, dead_letter.clone(), rx));
         tx.send(task).await.unwrap();
         drop(tx);
         handle.await.unwrap();
+
+        let mut out = dead_letter
+            .scan(|id, f| {
+                Ok(FailedTaskView {
+                    id,
+                    op_kind: f.op.kind(),
+                    project_id: f.project_id,
+                    issue_iid: f.issue_iid,
+                    detail: f.op.detail(),
+                    error: f.error,
+                    queued_at_secs: f.queued_at_secs,
+                    failed_at_secs: f.failed_at_secs,
+                })
+            })
+            .unwrap();
+        out.sort_by_key(|f| std::cmp::Reverse(f.failed_at_secs));
+        out
     }
 
     #[tokio::test]
@@ -767,6 +932,130 @@ mod tests {
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
             "assign_self is not a PostTime; snapshot ignores it"
+        );
+    }
+
+    // ── Dead-letter store ───────────────────────────────────────────────────
+
+    fn fail_entry(id: i64) -> StoredFailure {
+        StoredFailure {
+            project_id: id,
+            issue_iid: id,
+            op: QueueOp::CloseIssue,
+            queued_at_secs: 100,
+            failed_at_secs: 200,
+            error: "boom".into(),
+        }
+    }
+
+    fn retry_queue() -> (RetryQueue, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        // Dormant session: the worker defers every task (30s sleep) instead of
+        // processing it, so re-enqueued tasks stay put for assertions.
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
+        let q = RetryQueue::new(session, &dir.path().join("queue.redb")).unwrap();
+        (q, dir)
+    }
+
+    #[tokio::test]
+    async fn worker_dead_letters_on_permanent_error() {
+        let (s, _td) = store();
+        s.put(1, post_task(7, 100)).unwrap();
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Err(Error::Gitlab("403 Forbidden".into())));
+
+        let task = QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            },
+            queued_at_secs: 100,
+        };
+        let failures = run_worker_one_task(gitlab.clone(), s.clone(), task).await;
+
+        assert!(
+            snapshot_pending(&s).unwrap().is_empty(),
+            "task removed from the live queue"
+        );
+        assert_eq!(failures.len(), 1, "one dead-letter entry recorded");
+        assert_eq!(failures[0].id, 1);
+        assert_eq!(failures[0].op_kind, "PostTime");
+        assert!(
+            failures[0].error.contains("403"),
+            "error preserved: {}",
+            failures[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_failure_reenqueues_with_original_time_and_clears() {
+        let (q, _td) = retry_queue();
+        q.dead_letter
+            .put(
+                5,
+                StoredFailure {
+                    project_id: 7,
+                    issue_iid: 9,
+                    op: QueueOp::CloseIssue,
+                    queued_at_secs: 1_000,
+                    failed_at_secs: 2_000,
+                    error: "403".into(),
+                },
+            )
+            .unwrap();
+
+        assert!(q.retry_failure(5).await.unwrap(), "known id retried");
+        assert!(q.failures().unwrap().is_empty(), "dead-letter entry cleared");
+
+        let live: Vec<(i64, i64, u64)> = q
+            .store
+            .scan(|_, t| Ok((t.project_id, t.issue_iid, t.queued_at_secs)))
+            .unwrap();
+        assert_eq!(
+            live,
+            vec![(7, 9, 1_000)],
+            "re-enqueued, preserving original queued_at"
+        );
+
+        assert!(!q.retry_failure(999).await.unwrap(), "unknown id → false");
+    }
+
+    #[tokio::test]
+    async fn dismiss_and_clear_failures() {
+        let (q, _td) = retry_queue();
+        q.dead_letter.put(1, fail_entry(1)).unwrap();
+        q.dead_letter.put(2, fail_entry(2)).unwrap();
+
+        assert!(q.dismiss_failure(1).unwrap(), "known id dismissed");
+        assert!(!q.dismiss_failure(1).unwrap(), "already gone → false");
+        assert_eq!(q.failures().unwrap().len(), 1);
+
+        q.clear_failures().unwrap();
+        assert!(q.failures().unwrap().is_empty(), "all cleared");
+    }
+
+    #[tokio::test]
+    async fn new_seeds_next_id_above_both_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let qpath = dir.path().join("queue.redb");
+        {
+            let store = KvStore::open(&qpath, QUEUE_TABLE).unwrap();
+            store.put(3, post_task(1, 100)).unwrap();
+            let dl = KvStore::open(&qpath.with_file_name("dead_letter.redb"), DEAD_LETTER_TABLE)
+                .unwrap();
+            dl.put(10, fail_entry(10)).unwrap();
+        }
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
+        let q = RetryQueue::new(session, &qpath).unwrap();
+        assert_eq!(
+            q.next_id.load(std::sync::atomic::Ordering::Relaxed),
+            11,
+            "max(queue=3, dead-letter=10) + 1"
         );
     }
 }

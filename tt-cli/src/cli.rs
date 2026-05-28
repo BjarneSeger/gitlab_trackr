@@ -154,6 +154,30 @@ pub enum Command {
         #[arg(long, default_value_t = 7)]
         days: u32,
     },
+    /// Inspect and manage failed queued actions. A write op that hit a network
+    /// error is queued and retried in the background; if GitLab then rejects it
+    /// or the retry window expires, it lands here. With no subcommand, lists the
+    /// failures.
+    Queue {
+        #[command(subcommand)]
+        action: Option<QueueAction>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum QueueAction {
+    /// Re-enqueue a failed action for another attempt.
+    Retry {
+        /// The failed action's id (shown by `tt queue`).
+        id: u64,
+    },
+    /// Drop a failed action without retrying it.
+    Dismiss {
+        /// The failed action's id (shown by `tt queue`).
+        id: u64,
+    },
+    /// Drop every failed action.
+    Clear,
 }
 
 #[derive(Subcommand)]
