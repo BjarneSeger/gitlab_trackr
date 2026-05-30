@@ -1114,7 +1114,7 @@ mod tests {
         let queue = RetryQueue::new(
             Arc::clone(&session),
             &p("queue.redb"),
-            crate::queue::QueueConfig::default(),
+            crate::config::QueueConfig::default(),
         )
         .unwrap();
         (

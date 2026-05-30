@@ -3,7 +3,13 @@
 //! Layered with [`confique`]: the user file at
 //! `$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` wins, then the
 //! package-provided default at [`SYSTEM_CONFIG`], then the `#[config(default)]`
-//! values baked into [`Config`] below. Every field is optional in the file.
+//! values baked into the structs below. Every field is optional in the file.
+//!
+//! The config is grouped into nested sections, one per concern, so the TOML
+//! reads as `[server]` / `[refresh]` / `[history]` / `[queue]` tables instead
+//! of a flat list of keys. Each [`Config`] field is a sub-struct owned by the
+//! module that consumes it, alongside the helpers that turn raw values into the
+//! runtime types those modules expect.
 //!
 //! Credentials are deliberately **not** here — the GitLab host/token live in the
 //! OS keychain and are set through the varlink API (`tt login`), never via this
@@ -24,59 +30,37 @@ const SYSTEM_CONFIG: &str = "/usr/share/gitlab-trackrd/config.toml";
 
 /// `gitlab-trackrd` configuration.
 ///
-/// Missing keys fall back to the `#[config(default = ...)]` value on each field.
+/// Each section is a nested sub-struct; missing keys fall back to the
+/// `#[config(default = ...)]` value on the corresponding field.
 #[derive(Debug, ConfiqueConfig)]
 pub struct Config {
+    /// Varlink server / listening socket.
+    #[config(nested)]
+    pub server: ServerConfig,
+
+    /// Background refresh cadence for the cache tiers.
+    #[config(nested)]
+    pub refresh: RefreshConfig,
+
+    /// Timelog history retention tiers.
+    #[config(nested)]
+    pub history: HistoryConfig,
+
+    /// Retry-queue backoff and lifetime tuning.
+    #[config(nested)]
+    pub queue: QueueConfig,
+}
+
+/// Varlink server settings (see `server.rs`).
+#[derive(Debug, ConfiqueConfig)]
+pub struct ServerConfig {
     /// Unix socket the daemon listens on. If unset, defaults to
     /// `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (then `/tmp/...` as a last
     /// resort). Ignored under systemd socket activation.
     pub socket: Option<String>,
-
-    /// Seconds between active-tier refreshes (assigned issues, boards, and the
-    /// last-24h timelog history).
-    #[config(default = 300)]
-    pub refresh_interval: u64,
-
-    /// Seconds between semi-active history refreshes (the 24h–30d band). Once a
-    /// day by default.
-    #[config(default = 86400)]
-    pub semi_refresh_interval: u64,
-
-    /// Active history tier, in hours: the most volatile band, re-polled every
-    /// `refresh_interval`.
-    #[config(default = 24)]
-    pub active_window_hours: u64,
-
-    /// Semi-active history tier, in hours: re-polled every
-    /// `semi_refresh_interval`. (30 days by default.)
-    #[config(default = 720)]
-    pub semi_window_hours: u64,
-
-    /// Overall history retention, in hours: fetched once at startup; anything
-    /// older is pruned. (90 days by default.)
-    #[config(default = 2160)]
-    pub stale_window_hours: u64,
-
-    /// Retry-queue exponential backoff: initial delay, in seconds.
-    #[config(default = 1)]
-    pub queue_base_delay_secs: u64,
-
-    /// Retry-queue exponential backoff: maximum delay, in seconds. (30 min.)
-    #[config(default = 1800)]
-    pub queue_max_delay_secs: u64,
-
-    /// How long, in seconds, a queued task keeps retrying before it is
-    /// dead-lettered. (7 days by default.)
-    #[config(default = 604800)]
-    pub queue_max_lifetime_secs: u64,
-
-    /// How long, in seconds, the retry worker sleeps while the daemon is
-    /// dormant (no GitLab session) before checking again.
-    #[config(default = 30)]
-    pub queue_session_wait_secs: u64,
 }
 
-impl Config {
+impl ServerConfig {
     /// The configured socket, or the `$XDG_RUNTIME_DIR` -> `/tmp` fallback chain
     /// when unset.
     pub fn resolved_socket(&self) -> String {
@@ -87,7 +71,43 @@ impl Config {
             .map(|d| d.join("gitlab-trackrd.socket").to_string_lossy().into_owned())
             .unwrap_or_else(|| "/tmp/gitlab-trackrd.socket".to_string())
     }
+}
 
+/// How often the background loops re-poll each cache tier (driven from
+/// `main.rs`).
+#[derive(Debug, ConfiqueConfig)]
+pub struct RefreshConfig {
+    /// Seconds between active-tier refreshes (assigned issues, boards, and the
+    /// last-24h timelog history).
+    #[config(default = 300)]
+    pub active_secs: u64,
+
+    /// Seconds between semi-active history refreshes (the 24h–30d band). Once a
+    /// day by default.
+    #[config(default = 86400)]
+    pub semi_secs: u64,
+}
+
+/// Timelog history retention tiers, consumed by `history.rs` via `Handlers`.
+#[derive(Debug, ConfiqueConfig)]
+pub struct HistoryConfig {
+    /// Active history tier, in hours: the most volatile band, re-polled every
+    /// `refresh.active_secs`.
+    #[config(default = 24)]
+    pub active_window_hours: u64,
+
+    /// Semi-active history tier, in hours: re-polled every
+    /// `refresh.semi_secs`. (30 days by default.)
+    #[config(default = 720)]
+    pub semi_window_hours: u64,
+
+    /// Overall history retention, in hours: fetched once at startup; anything
+    /// older is pruned. (90 days by default.)
+    #[config(default = 2160)]
+    pub stale_window_hours: u64,
+}
+
+impl HistoryConfig {
     pub fn active_window(&self) -> Duration {
         Duration::from_secs(self.active_window_hours * 3600)
     }
@@ -98,6 +118,64 @@ impl Config {
 
     pub fn stale_window(&self) -> Duration {
         Duration::from_secs(self.stale_window_hours * 3600)
+    }
+}
+
+/// Retry-queue timing, consumed by `queue.rs`. The `*_secs` fields come from the
+/// TOML; the accessors hand `queue.rs` the [`Duration`]s its worker uses.
+#[derive(Debug, Clone, Copy, ConfiqueConfig)]
+pub struct QueueConfig {
+    /// Retry-queue exponential backoff: initial delay, in seconds.
+    #[config(default = 1)]
+    pub base_delay_secs: u64,
+
+    /// Retry-queue exponential backoff: maximum delay, in seconds. (30 min.)
+    #[config(default = 1800)]
+    pub max_delay_secs: u64,
+
+    /// How long, in seconds, a queued task keeps retrying before it is
+    /// dead-lettered. (7 days by default.)
+    #[config(default = 604800)]
+    pub max_lifetime_secs: u64,
+
+    /// How long, in seconds, the retry worker sleeps while the daemon is
+    /// dormant (no GitLab session) before checking again.
+    #[config(default = 30)]
+    pub session_wait_secs: u64,
+}
+
+impl QueueConfig {
+    /// Initial exponential-backoff delay.
+    pub fn base_delay(&self) -> Duration {
+        Duration::from_secs(self.base_delay_secs)
+    }
+
+    /// Exponential-backoff cap.
+    pub fn max_delay(&self) -> Duration {
+        Duration::from_secs(self.max_delay_secs)
+    }
+
+    /// How long a task keeps retrying before it is dead-lettered.
+    pub fn max_lifetime(&self) -> Duration {
+        Duration::from_secs(self.max_lifetime_secs)
+    }
+
+    /// How long the worker sleeps while dormant (no session) before retrying.
+    pub fn session_wait(&self) -> Duration {
+        Duration::from_secs(self.session_wait_secs)
+    }
+}
+
+impl Default for QueueConfig {
+    /// Mirrors the `#[config(default = ...)]` values above; used as the worker's
+    /// `OnceLock` fallback and by the queue tests.
+    fn default() -> Self {
+        Self {
+            base_delay_secs: 1,
+            max_delay_secs: 1800,
+            max_lifetime_secs: 604800,
+            session_wait_secs: 30,
+        }
     }
 }
 

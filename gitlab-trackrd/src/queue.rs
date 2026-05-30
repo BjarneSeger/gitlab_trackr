@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::config::QueueConfig;
 use crate::db::KvStore;
 use crate::error::{Error, Result};
 use crate::handlers::SessionSlot;
@@ -25,30 +26,6 @@ use crate::impl_redb_json_value;
 const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v4");
 const DEAD_LETTER_TABLE: TableDefinition<u64, StoredFailure> =
     TableDefinition::new("dead_letter_v1");
-
-/// Tunable retry-queue timing, sourced from the daemon config.
-#[derive(Clone, Copy)]
-pub struct QueueConfig {
-    /// Initial exponential-backoff delay.
-    pub base_delay: Duration,
-    /// Exponential-backoff cap.
-    pub max_delay: Duration,
-    /// How long a task keeps retrying before it is dead-lettered.
-    pub max_lifetime: Duration,
-    /// How long the worker sleeps while dormant (no session) before retrying.
-    pub session_wait: Duration,
-}
-
-impl Default for QueueConfig {
-    fn default() -> Self {
-        Self {
-            base_delay: Duration::from_secs(1),
-            max_delay: Duration::from_mins(30),
-            max_lifetime: Duration::from_hours(168),
-            session_wait: Duration::from_secs(30),
-        }
-    }
-}
 
 /// Set once by [`RetryQueue::new`]; read by the background worker. Falls back to
 /// [`QueueConfig::default`] if the worker ever runs before it is set.
@@ -377,7 +354,7 @@ async fn worker(
     mut rx: mpsc::Receiver<QueuedTask>,
 ) {
     while let Some(task) = rx.recv().await {
-        let mut delay = queue_cfg().base_delay;
+        let mut delay = queue_cfg().base_delay();
         let mut attempt = 0u32;
 
         // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
@@ -393,7 +370,7 @@ async fn worker(
                         op = task.op.kind(),
                         "no active session; deferring task"
                     );
-                    tokio::time::sleep(queue_cfg().session_wait).await;
+                    tokio::time::sleep(queue_cfg().session_wait()).await;
                     continue 'retry;
                 }
             };
@@ -452,7 +429,7 @@ async fn worker(
                 Err(e) if matches!(e, Error::Transient(_)) => {
                     let elapsed =
                         Duration::from_secs(now_secs().saturating_sub(task.queued_at_secs));
-                    let max_lifetime = queue_cfg().max_lifetime;
+                    let max_lifetime = queue_cfg().max_lifetime();
                     if elapsed >= max_lifetime {
                         error!(
                             attempt,
@@ -479,7 +456,7 @@ async fn worker(
                         "task network error, retrying"
                     );
                     tokio::time::sleep(sleep).await;
-                    delay = (delay * 2).min(queue_cfg().max_delay);
+                    delay = (delay * 2).min(queue_cfg().max_delay());
                 }
                 Err(e) => {
                     error!(
