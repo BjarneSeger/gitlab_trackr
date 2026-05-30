@@ -20,6 +20,9 @@ required; everything else has a sensible default.
 | `GITLAB_TRACKRD_REFRESH_INTERVAL` | no | `300` | Seconds between refreshes of issues, boards, and the active history tier (last 24h) |
 | `GITLAB_TRACKRD_SEMI_REFRESH_INTERVAL` | no | `86400` | Seconds between refreshes of the semi-active history tier (24h–30d). The stale tier (30d–90d) is fetched once at startup and never re-polled. |
 
+Logging can be set by changing the `GITLAB_TRACKRD_LOG` environment variable to
+`trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)
+
 ## Checking everything works
 ```sh
 varlinkctl call unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket org.thehoster.gitlab.trackrd.GetAssignedIssues {}

@@ -32,7 +32,7 @@ use service::ServiceHandler;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_env("GITLAB_TRACKR")
+            EnvFilter::try_from_env("GITLAB_TRACKRD_LOG")
                 .unwrap_or_else(|_| EnvFilter::new("gitlab_trackrd=info")),
         )
         .init();
