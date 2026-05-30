@@ -14,6 +14,7 @@ mod gitlab;
 mod handlers;
 mod history;
 mod queue;
+mod reload;
 mod secrets;
 mod server;
 mod service;
@@ -36,14 +37,14 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = match config::load() {
-        Ok(cfg) => cfg,
+    let config = match config::load_shared() {
+        Ok(config) => config,
         Err(e) => {
             error!(error = %e, "failed to load configuration");
             std::process::exit(1);
         }
     };
-    let socket = cfg.server.resolved_socket();
+    let socket = config.read().unwrap().server.resolved_socket();
     let db_path = dirs::data_local_dir()
         .unwrap_or_else(|| "~/.local/share".into())
         .join("gitlab-trackrd/cache.redb");
@@ -79,31 +80,35 @@ async fn main() -> Result<()> {
     let history_db_path = db_path.with_file_name("history.redb");
     let history = Arc::new(HistoryCache::open(&history_db_path)?);
     let queue_db_path = db_path.with_file_name("queue.redb");
-    let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path, cfg.queue)?;
+    let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path, Arc::clone(&config))?;
     let handlers = Arc::new(Handlers {
         session,
         cache,
         boards,
         history,
         queue,
-        active_window: cfg.history.active_window(),
-        semi_window: cfg.history.semi_window(),
-        stale_window: cfg.history.stale_window(),
+        config: Arc::clone(&config),
     });
+
+    reload::spawn(Arc::clone(&config));
 
     let listener = server::make_listener(&socket)?;
 
+    let (active_secs, semi_secs) = {
+        let c = config.read().unwrap();
+        (c.refresh.active_secs, c.refresh.semi_secs)
+    };
     if server::is_socket_activated() {
         info!(
-            refresh_interval = cfg.refresh.active_secs,
-            semi_refresh_interval = cfg.refresh.semi_secs,
+            refresh_interval = active_secs,
+            semi_refresh_interval = semi_secs,
             "starting gitlab-trackrd from socket"
         );
     } else {
         info!(
             socket = socket,
-            refresh_interval = cfg.refresh.active_secs,
-            semi_refresh_interval = cfg.refresh.semi_secs,
+            refresh_interval = active_secs,
+            semi_refresh_interval = semi_secs,
             "starting gitlab-trackrd"
         );
     }
@@ -122,14 +127,15 @@ async fn main() -> Result<()> {
     }
 
     // Active tier: refresh issues, boards, and the last-24h history every
-    // `refresh_interval`.
+    // `refresh.active_secs`. The interval is re-read each tick so a config
+    // reload takes effect after the current sleep.
     {
         let handlers_ref = Arc::clone(&handlers);
-        let interval_secs = cfg.refresh.active_secs;
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            let duration = std::time::Duration::from_secs(interval_secs);
             loop {
-                tokio::time::sleep(duration).await;
+                let secs = config.read().unwrap().refresh.active_secs;
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 info!("background cache refresh triggered");
                 handlers_ref.refresh_cache().await;
             }
@@ -140,11 +146,11 @@ async fn main() -> Result<()> {
     // anything past the stale window.
     {
         let handlers_ref = Arc::clone(&handlers);
-        let interval_secs = cfg.refresh.semi_secs;
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            let duration = std::time::Duration::from_secs(interval_secs);
             loop {
-                tokio::time::sleep(duration).await;
+                let secs = config.read().unwrap().refresh.semi_secs;
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 info!("daily history refresh triggered");
                 handlers_ref.refresh_history_daily().await;
             }

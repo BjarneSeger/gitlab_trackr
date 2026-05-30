@@ -29,6 +29,7 @@ http = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Local storage
+notify = "8"
 redb = "4.1"
 security-framework = "3.7"
 security-framework-sys = "2.17"

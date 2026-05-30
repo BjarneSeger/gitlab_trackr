@@ -20,9 +20,17 @@
 //! default config).
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use confique::Config as ConfiqueConfig;
+
+/// Shared, swappable config read by every consumer at the moment of use, so a
+/// hot reload (see `reload`) takes effect without a restart.
+///
+/// Reads must stay momentary — extract the `Copy` value you need in a single
+/// statement so the guard drops before any `.await`; never hold it across one.
+pub type SharedConfig = Arc<RwLock<Config>>;
 
 /// Default install path for the package-provided config, layered under the
 /// user's own file.
@@ -194,6 +202,30 @@ pub fn load() -> Result<Config, confique::Error> {
         .file(config_path())
         .file(Path::new(SYSTEM_CONFIG))
         .load()
+}
+
+/// Load once and wrap for sharing across the daemon's tasks. Used at startup; a
+/// parse error propagates so the caller can fail fast (no prior config exists).
+pub fn load_shared() -> Result<SharedConfig, confique::Error> {
+    Ok(Arc::new(RwLock::new(load()?)))
+}
+
+/// Re-run [`load`] and swap the contents in place.
+///
+/// On a parse error the existing config is left untouched and the error is
+/// returned, so a malformed mid-edit save never disturbs the running daemon —
+/// the caller logs and keeps serving the last-good values.
+pub fn reload(shared: &SharedConfig) -> Result<(), confique::Error> {
+    let fresh = load()?;
+    *shared.write().unwrap() = fresh;
+    Ok(())
+}
+
+/// A fully-defaulted config (no file layers), for tests that need a
+/// [`SharedConfig`] without touching the real XDG path.
+#[cfg(test)]
+pub fn defaults() -> Config {
+    Config::builder().load().expect("built-in defaults are valid")
 }
 
 /// Render an annotated TOML template (current defaults + doc comments inline).

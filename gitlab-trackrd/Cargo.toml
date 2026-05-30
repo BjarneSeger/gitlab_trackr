@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 gitlab.workspace = true
+notify.workspace = true
 redb.workspace = true
 varlink.workspace = true
 tokio.workspace = true
