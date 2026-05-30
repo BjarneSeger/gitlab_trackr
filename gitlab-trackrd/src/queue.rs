@@ -26,11 +26,37 @@ const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retr
 const DEAD_LETTER_TABLE: TableDefinition<u64, StoredFailure> =
     TableDefinition::new("dead_letter_v1");
 
-const BASE_DELAY: Duration = Duration::from_secs(1);
-const MAX_DELAY: Duration = Duration::from_mins(30);
-const MAX_LIFETIME: Duration = Duration::from_hours(168);
-/// How long the worker sleeps when there's no active session before retrying.
-const SESSION_WAIT: Duration = Duration::from_secs(30);
+/// Tunable retry-queue timing, sourced from the daemon config.
+#[derive(Clone, Copy)]
+pub struct QueueConfig {
+    /// Initial exponential-backoff delay.
+    pub base_delay: Duration,
+    /// Exponential-backoff cap.
+    pub max_delay: Duration,
+    /// How long a task keeps retrying before it is dead-lettered.
+    pub max_lifetime: Duration,
+    /// How long the worker sleeps while dormant (no session) before retrying.
+    pub session_wait: Duration,
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_mins(30),
+            max_lifetime: Duration::from_hours(168),
+            session_wait: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Set once by [`RetryQueue::new`]; read by the background worker. Falls back to
+/// [`QueueConfig::default`] if the worker ever runs before it is set.
+static QUEUE_CFG: std::sync::OnceLock<QueueConfig> = std::sync::OnceLock::new();
+
+fn queue_cfg() -> QueueConfig {
+    *QUEUE_CFG.get_or_init(QueueConfig::default)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum QueueOp {
@@ -117,7 +143,8 @@ pub struct FailedTaskView {
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
-    pub fn new(session: SessionSlot, db_path: &Path) -> Result<Self> {
+    pub fn new(session: SessionSlot, db_path: &Path, cfg: QueueConfig) -> Result<Self> {
+        let _ = QUEUE_CFG.set(cfg);
         let store = KvStore::open(db_path, QUEUE_TABLE)?;
         // The dead-letter store lives in its own redb file beside the queue —
         // redb takes an exclusive lock per file, so it can't share `db_path`.
@@ -350,7 +377,7 @@ async fn worker(
     mut rx: mpsc::Receiver<QueuedTask>,
 ) {
     while let Some(task) = rx.recv().await {
-        let mut delay = BASE_DELAY;
+        let mut delay = queue_cfg().base_delay;
         let mut attempt = 0u32;
 
         // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
@@ -366,7 +393,7 @@ async fn worker(
                         op = task.op.kind(),
                         "no active session; deferring task"
                     );
-                    tokio::time::sleep(SESSION_WAIT).await;
+                    tokio::time::sleep(queue_cfg().session_wait).await;
                     continue 'retry;
                 }
             };
@@ -425,20 +452,24 @@ async fn worker(
                 Err(e) if matches!(e, Error::Transient(_)) => {
                     let elapsed =
                         Duration::from_secs(now_secs().saturating_sub(task.queued_at_secs));
-                    if elapsed >= MAX_LIFETIME {
+                    let max_lifetime = queue_cfg().max_lifetime;
+                    if elapsed >= max_lifetime {
                         error!(
                             attempt,
                             error = %e,
                             project_id = task.project_id,
                             issue_iid = task.issue_iid,
                             op = task.op.kind(),
-                            "dropping task after 7-day retry window"
+                            retry_window = max_lifetime.as_secs(),
+                            "dropping task after retry window"
                         );
                         break 'retry Some(format!(
-                            "timed out after 7-day retry window: {e}"
+                            "timed out after {}, seconds retry window: {}",
+                            max_lifetime.as_secs(),
+                            e
                         ));
                     }
-                    let sleep = delay.min(MAX_LIFETIME.checked_sub(elapsed).unwrap());
+                    let sleep = delay.min(max_lifetime.checked_sub(elapsed).unwrap());
                     warn!(
                         attempt,
                         error = %e,
@@ -448,7 +479,7 @@ async fn worker(
                         "task network error, retrying"
                     );
                     tokio::time::sleep(sleep).await;
-                    delay = (delay * 2).min(MAX_DELAY);
+                    delay = (delay * 2).min(queue_cfg().max_delay);
                 }
                 Err(e) => {
                     error!(
@@ -536,7 +567,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    // The 7-day MAX_LIFETIME cutoff and exponential backoff are not exercised
+    // The max lifetime cutoff and exponential backoff are not exercised
     // here. Both depend on `SystemTime::now()` rather than tokio's mock clock,
     // so deterministically driving them would require a clock-injection
     // abstraction that isn't warranted for the gain.
@@ -648,10 +679,7 @@ mod tests {
         ) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!()
         }
-        async fn fetch_group_issues(
-            &self,
-            _g: Vec<String>,
-        ) -> TrackrResult<Vec<IssueWithLabels>> {
+        async fn fetch_group_issues(&self, _g: Vec<String>) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!()
         }
         async fn add_spent_time(
@@ -953,7 +981,12 @@ mod tests {
         // Dormant session: the worker defers every task (30s sleep) instead of
         // processing it, so re-enqueued tasks stay put for assertions.
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
-        let q = RetryQueue::new(session, &dir.path().join("queue.redb")).unwrap();
+        let q = RetryQueue::new(
+            session,
+            &dir.path().join("queue.redb"),
+            QueueConfig::default(),
+        )
+        .unwrap();
         (q, dir)
     }
 
@@ -1010,7 +1043,10 @@ mod tests {
             .unwrap();
 
         assert!(q.retry_failure(5).await.unwrap(), "known id retried");
-        assert!(q.failures().unwrap().is_empty(), "dead-letter entry cleared");
+        assert!(
+            q.failures().unwrap().is_empty(),
+            "dead-letter entry cleared"
+        );
 
         let live: Vec<(i64, i64, u64)> = q
             .store
@@ -1051,7 +1087,7 @@ mod tests {
             dl.put(10, fail_entry(10)).unwrap();
         }
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
-        let q = RetryQueue::new(session, &qpath).unwrap();
+        let q = RetryQueue::new(session, &qpath, QueueConfig::default()).unwrap();
         assert_eq!(
             q.next_id.load(std::sync::atomic::Ordering::Relaxed),
             11,

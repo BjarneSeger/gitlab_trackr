@@ -19,6 +19,7 @@ http.workspace = true
 async-trait.workspace = true
 gitlab-trackr-api.workspace = true
 chrono.workspace = true
+confique.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { workspace = true, features = ["OSX_10_15"] }

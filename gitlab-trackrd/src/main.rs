@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod boards;
@@ -20,7 +20,6 @@ mod service;
 
 use boards::BoardCache;
 use cache::IssueCache;
-use config::Config;
 use error::Result;
 use gitlab::GitlabClient;
 use handlers::{Handlers, Session, SessionSlot};
@@ -37,20 +36,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = Config::from_env()?;
+    let cfg = match config::load() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            error!(error = %e, "failed to load configuration");
+            std::process::exit(1);
+        }
+    };
+    let socket = cfg.resolved_socket();
+    let db_path = dirs::data_local_dir()
+        .unwrap_or_else(|| "~/.local/share".into())
+        .join("gitlab-trackrd/cache.redb");
 
     let session: SessionSlot = Arc::new(RwLock::new(None));
 
-    // Resolve initial credentials: env vars win, otherwise the OS keychain.
-    let initial = match cfg.env_creds.clone() {
-        Some(c) => Some(c),
-        None => match secrets::load().await {
-            Ok(opt) => opt,
-            Err(e) => {
-                warn!(error = %e, "keychain read failed; starting dormant");
-                None
-            }
-        },
+    // Credentials come only from the OS keychain (set via `tt login`).
+    let initial = match secrets::load().await {
+        Ok(opt) => opt,
+        Err(e) => {
+            warn!(error = %e, "keychain read failed; starting dormant");
+            None
+        }
     };
     if let Some(c) = initial {
         match GitlabClient::connect(&c.host, &c.token).await {
@@ -59,28 +65,42 @@ async fn main() -> Result<()> {
                 info!(host = %s.host, user_id = s.user_id, "initial GitLab connection ready");
                 *session.write().await = Some(s);
             }
-            Err(e) => warn!(error = %e, host = %c.host, "initial GitLab connection failed; daemon starting dormant"),
+            Err(e) => {
+                warn!(error = %e, host = %c.host, "initial GitLab connection failed; daemon starting dormant")
+            }
         }
     } else {
         info!("no credentials available; daemon starting dormant (run `tt login`)");
     }
 
-    let cache = Arc::new(IssueCache::open(&cfg.db_path)?);
-    let boards_db_path = cfg.db_path.with_file_name("boards.redb");
+    let cache = Arc::new(IssueCache::open(&db_path)?);
+    let boards_db_path = db_path.with_file_name("boards.redb");
     let boards = Arc::new(BoardCache::open(&boards_db_path)?);
-    let history_db_path = cfg.db_path.with_file_name("history.redb");
+    let history_db_path = db_path.with_file_name("history.redb");
     let history = Arc::new(HistoryCache::open(&history_db_path)?);
-    let queue_db_path = cfg.db_path.with_file_name("queue.redb");
-    let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path)?;
+    let queue_db_path = db_path.with_file_name("queue.redb");
+    let queue = RetryQueue::new(
+        Arc::clone(&session),
+        &queue_db_path,
+        queue::QueueConfig {
+            base_delay: std::time::Duration::from_secs(cfg.queue_base_delay_secs),
+            max_delay: std::time::Duration::from_secs(cfg.queue_max_delay_secs),
+            max_lifetime: std::time::Duration::from_secs(cfg.queue_max_lifetime_secs),
+            session_wait: std::time::Duration::from_secs(cfg.queue_session_wait_secs),
+        },
+    )?;
     let handlers = Arc::new(Handlers {
         session,
         cache,
         boards,
         history,
         queue,
+        active_window: cfg.active_window(),
+        semi_window: cfg.semi_window(),
+        stale_window: cfg.stale_window(),
     });
 
-    let listener = server::make_listener(&cfg.socket)?;
+    let listener = server::make_listener(&socket)?;
 
     if server::is_socket_activated() {
         info!(
@@ -90,7 +110,7 @@ async fn main() -> Result<()> {
         );
     } else {
         info!(
-            socket = cfg.socket,
+            socket = socket,
             refresh_interval = cfg.refresh_interval,
             semi_refresh_interval = cfg.semi_refresh_interval,
             "starting gitlab-trackrd"
@@ -152,7 +172,7 @@ async fn main() -> Result<()> {
     }
 
     if !server::is_socket_activated() {
-        let _ = std::fs::remove_file(&cfg.socket);
+        let _ = std::fs::remove_file(&socket);
     }
     Ok(())
 }

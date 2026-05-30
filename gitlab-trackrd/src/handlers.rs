@@ -22,7 +22,7 @@ use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::error::{Error, Result};
 use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
-use crate::history::{ACTIVE_WINDOW, HistoryCache, SEMI_WINDOW, STALE_WINDOW, StoredTimelog};
+use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
 use crate::secrets::{self, Credentials};
 
@@ -57,6 +57,12 @@ pub struct Handlers {
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
     pub queue: RetryQueue,
+    /// Active history tier — re-polled every `refresh_interval`.
+    pub active_window: Duration,
+    /// Semi-active history tier — re-polled every `semi_refresh_interval`.
+    pub semi_window: Duration,
+    /// Overall history retention — backfilled at startup, then aged out.
+    pub stale_window: Duration,
 }
 
 impl Handlers {
@@ -106,7 +112,8 @@ impl Handlers {
             }
         }
 
-        self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
+        self.refresh_history_window(&gitlab, self.active_window)
+            .await;
     }
 
     /// Daily refresh of the semi-active tier (24h–30d) followed by a prune of
@@ -120,7 +127,7 @@ impl Handlers {
                 return;
             }
         };
-        self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+        self.refresh_history_window(&gitlab, self.semi_window).await;
         self.prune_history();
     }
 
@@ -135,7 +142,8 @@ impl Handlers {
                 return;
             }
         };
-        self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+        self.refresh_history_window(&gitlab, self.stale_window)
+            .await;
         self.prune_history();
     }
 
@@ -182,7 +190,7 @@ impl Handlers {
 
     /// Drop history entries that have aged past the stale window.
     fn prune_history(&self) {
-        let cutoff = now_secs().saturating_sub(STALE_WINDOW.as_secs());
+        let cutoff = now_secs().saturating_sub(self.stale_window.as_secs());
         match self.history.prune(cutoff) {
             Ok(0) => {}
             Ok(n) => info!(removed = n, "pruned stale history entries"),
@@ -329,8 +337,8 @@ impl VarlinkInterface for Handlers {
         // flags clear just their `spent_at` band (active is open-ended on top,
         // the bands abut at the active/semi window boundaries).
         let now = now_secs();
-        let active_start = now.saturating_sub(ACTIVE_WINDOW.as_secs());
-        let semi_start = now.saturating_sub(SEMI_WINDOW.as_secs());
+        let active_start = now.saturating_sub(self.active_window.as_secs());
+        let semi_start = now.saturating_sub(self.semi_window.as_secs());
 
         if all {
             if let Err(e) = self.history.clear() {
@@ -362,12 +370,14 @@ impl VarlinkInterface for Handlers {
                 self.backfill_history().await;
             } else if want("stale") {
                 // `stale`'s window subsumes the narrower tiers.
-                self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+                self.refresh_history_window(&gitlab, self.stale_window)
+                    .await;
                 self.prune_history();
             } else if want("semi") {
-                self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+                self.refresh_history_window(&gitlab, self.semi_window).await;
             } else if want("active") {
-                self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
+                self.refresh_history_window(&gitlab, self.active_window)
+                    .await;
             }
         }
 
@@ -1101,7 +1111,12 @@ mod tests {
         let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
         let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
         let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
-        let queue = RetryQueue::new(Arc::clone(&session), &p("queue.redb")).unwrap();
+        let queue = RetryQueue::new(
+            Arc::clone(&session),
+            &p("queue.redb"),
+            crate::queue::QueueConfig::default(),
+        )
+        .unwrap();
         (
             Handlers {
                 session,
@@ -1109,6 +1124,9 @@ mod tests {
                 boards,
                 history,
                 queue,
+                active_window: std::time::Duration::from_hours(24),
+                semi_window: std::time::Duration::from_hours(30 * 24),
+                stale_window: std::time::Duration::from_hours(90 * 24),
             },
             dir,
         )
@@ -1155,7 +1173,11 @@ mod tests {
             .iter()
             .map(|e| e.timelog_id)
             .collect();
-        assert_eq!(remaining, vec![2, 3], "only the active-band entry is removed");
+        assert_eq!(
+            remaining,
+            vec![2, 3],
+            "only the active-band entry is removed"
+        );
     }
 
     #[tokio::test]
