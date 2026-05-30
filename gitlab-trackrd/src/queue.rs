@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::config::SharedConfig;
 use crate::db::KvStore;
 use crate::error::{Error, Result};
 use crate::handlers::SessionSlot;
@@ -25,12 +26,6 @@ use crate::impl_redb_json_value;
 const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v4");
 const DEAD_LETTER_TABLE: TableDefinition<u64, StoredFailure> =
     TableDefinition::new("dead_letter_v1");
-
-const BASE_DELAY: Duration = Duration::from_secs(1);
-const MAX_DELAY: Duration = Duration::from_mins(30);
-const MAX_LIFETIME: Duration = Duration::from_hours(168);
-/// How long the worker sleeps when there's no active session before retrying.
-const SESSION_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum QueueOp {
@@ -117,7 +112,7 @@ pub struct FailedTaskView {
 impl RetryQueue {
     /// Open (or create) the queue database at `db_path`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
-    pub fn new(session: SessionSlot, db_path: &Path) -> Result<Self> {
+    pub fn new(session: SessionSlot, db_path: &Path, config: SharedConfig) -> Result<Self> {
         let store = KvStore::open(db_path, QUEUE_TABLE)?;
         // The dead-letter store lives in its own redb file beside the queue —
         // redb takes an exclusive lock per file, so it can't share `db_path`.
@@ -166,7 +161,7 @@ impl RetryQueue {
             });
         }
 
-        tokio::spawn(worker(session, store.clone(), dead_letter.clone(), rx));
+        tokio::spawn(worker(session, store.clone(), dead_letter.clone(), rx, config));
 
         Ok(Self {
             sender: tx,
@@ -348,9 +343,10 @@ async fn worker(
     store: KvStore<u64, StoredTask>,
     dead_letter: KvStore<u64, StoredFailure>,
     mut rx: mpsc::Receiver<QueuedTask>,
+    config: SharedConfig,
 ) {
     while let Some(task) = rx.recv().await {
-        let mut delay = BASE_DELAY;
+        let mut delay = config.read().unwrap().queue.base_delay();
         let mut attempt = 0u32;
 
         // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
@@ -366,7 +362,8 @@ async fn worker(
                         op = task.op.kind(),
                         "no active session; deferring task"
                     );
-                    tokio::time::sleep(SESSION_WAIT).await;
+                    let session_wait = config.read().unwrap().queue.session_wait();
+                    tokio::time::sleep(session_wait).await;
                     continue 'retry;
                 }
             };
@@ -425,20 +422,24 @@ async fn worker(
                 Err(e) if matches!(e, Error::Transient(_)) => {
                     let elapsed =
                         Duration::from_secs(now_secs().saturating_sub(task.queued_at_secs));
-                    if elapsed >= MAX_LIFETIME {
+                    let max_lifetime = config.read().unwrap().queue.max_lifetime();
+                    if elapsed >= max_lifetime {
                         error!(
                             attempt,
                             error = %e,
                             project_id = task.project_id,
                             issue_iid = task.issue_iid,
                             op = task.op.kind(),
-                            "dropping task after 7-day retry window"
+                            retry_window = max_lifetime.as_secs(),
+                            "dropping task after retry window"
                         );
                         break 'retry Some(format!(
-                            "timed out after 7-day retry window: {e}"
+                            "timed out after {}, seconds retry window: {}",
+                            max_lifetime.as_secs(),
+                            e
                         ));
                     }
-                    let sleep = delay.min(MAX_LIFETIME.checked_sub(elapsed).unwrap());
+                    let sleep = delay.min(max_lifetime.checked_sub(elapsed).unwrap());
                     warn!(
                         attempt,
                         error = %e,
@@ -448,7 +449,7 @@ async fn worker(
                         "task network error, retrying"
                     );
                     tokio::time::sleep(sleep).await;
-                    delay = (delay * 2).min(MAX_DELAY);
+                    delay = (delay * 2).min(config.read().unwrap().queue.max_delay());
                 }
                 Err(e) => {
                     error!(
@@ -536,7 +537,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    // The 7-day MAX_LIFETIME cutoff and exponential backoff are not exercised
+    // The max lifetime cutoff and exponential backoff are not exercised
     // here. Both depend on `SystemTime::now()` rather than tokio's mock clock,
     // so deterministically driving them would require a clock-injection
     // abstraction that isn't warranted for the gain.
@@ -648,10 +649,7 @@ mod tests {
         ) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!()
         }
-        async fn fetch_group_issues(
-            &self,
-            _g: Vec<String>,
-        ) -> TrackrResult<Vec<IssueWithLabels>> {
+        async fn fetch_group_issues(&self, _g: Vec<String>) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!()
         }
         async fn add_spent_time(
@@ -739,7 +737,8 @@ mod tests {
             user_id: 0,
         })));
         let (tx, rx) = mpsc::channel(8);
-        let handle = tokio::spawn(worker(session, store, dead_letter.clone(), rx));
+        let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let handle = tokio::spawn(worker(session, store, dead_letter.clone(), rx, config));
         tx.send(task).await.unwrap();
         drop(tx);
         handle.await.unwrap();
@@ -953,7 +952,8 @@ mod tests {
         // Dormant session: the worker defers every task (30s sleep) instead of
         // processing it, so re-enqueued tasks stay put for assertions.
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
-        let q = RetryQueue::new(session, &dir.path().join("queue.redb")).unwrap();
+        let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let q = RetryQueue::new(session, &dir.path().join("queue.redb"), config).unwrap();
         (q, dir)
     }
 
@@ -1010,7 +1010,10 @@ mod tests {
             .unwrap();
 
         assert!(q.retry_failure(5).await.unwrap(), "known id retried");
-        assert!(q.failures().unwrap().is_empty(), "dead-letter entry cleared");
+        assert!(
+            q.failures().unwrap().is_empty(),
+            "dead-letter entry cleared"
+        );
 
         let live: Vec<(i64, i64, u64)> = q
             .store
@@ -1051,7 +1054,8 @@ mod tests {
             dl.put(10, fail_entry(10)).unwrap();
         }
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
-        let q = RetryQueue::new(session, &qpath).unwrap();
+        let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let q = RetryQueue::new(session, &qpath, config).unwrap();
         assert_eq!(
             q.next_id.load(std::sync::atomic::Ordering::Relaxed),
             11,

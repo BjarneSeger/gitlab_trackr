@@ -9,16 +9,34 @@ debian, rpm and arch. See the `releases`-tab.
 
 ## Configuration
 
-All configuration is done via environment variables. Only `GITLAB_TOKEN` is
-required; everything else has a sensible default.
+The daemon reads a TOML config file. Values are layered, highest priority first:
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `GITLAB_TOKEN` | **yes** | — | Personal access token |
-| `GITLAB_HOST` | no | `gitlab.com` | GitLab instance hostname (e.g. `gitlab.example.com`) |
-| `GITLAB_TRACKRD_SOCKET` | no | `unix:$XDG_RUNTIME_DIR/gitlab-trackrd.socket` | Varlink socket address.  Falls back to `unix:/tmp/gitlab-trackrd.socket` when `$XDG_RUNTIME_DIR` is unset. |
-| `GITLAB_TRACKRD_REFRESH_INTERVAL` | no | `300` | Seconds between refreshes of issues, boards, and the active history tier (last 24h) |
-| `GITLAB_TRACKRD_SEMI_REFRESH_INTERVAL` | no | `86400` | Seconds between refreshes of the semi-active history tier (24h–30d). The stale tier (30d–90d) is fetched once at startup and never re-polled. |
+1. `$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` — your overrides
+2. `/usr/share/gitlab-trackrd/config.toml` — the package-provided default
+3. the values baked into the daemon
+
+Every key is optional; a missing key falls back to the next layer. Print an
+annotated template with the current defaults:
+
+```sh
+cargo run -p gitlab-trackrd --bin gen-config-template
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `socket` | `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
+| `refresh_interval` | `300` | Seconds between refreshes of issues, boards, and the active history tier (last 24h). |
+| `semi_refresh_interval` | `86400` | Seconds between refreshes of the semi-active history tier (24h–30d). |
+| `active_window_hours` | `24` | Active history tier span. |
+| `semi_window_hours` | `720` | Semi-active history tier span (30 days). |
+| `stale_window_hours` | `2160` | Overall history retention (90 days); the stale band is fetched once at startup. |
+| `queue_base_delay_secs` | `1` | Retry-queue backoff initial delay. |
+| `queue_max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
+| `queue_max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
+| `queue_session_wait_secs` | `30` | Worker sleep while the daemon is dormant (no session). |
+
+Credentials are configured through the `org.thehoster.gitlab.trackrd.Login`
+interface or by just calling `tt login`.
 
 Logging can be set by changing the `GITLAB_TRACKRD_LOG` environment variable to
 `trace`, `debug`, `info`, `warn` or `error` (ordered from most to least verbose)

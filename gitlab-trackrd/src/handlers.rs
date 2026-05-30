@@ -20,9 +20,10 @@ use gitlab_trackr_api::{
 
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
+use crate::config::SharedConfig;
 use crate::error::{Error, Result};
 use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
-use crate::history::{ACTIVE_WINDOW, HistoryCache, SEMI_WINDOW, STALE_WINDOW, StoredTimelog};
+use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
 use crate::secrets::{self, Credentials};
 
@@ -57,6 +58,9 @@ pub struct Handlers {
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
     pub queue: RetryQueue,
+    /// Live daemon config; history windows are read from `config.history` at use
+    /// time so a hot reload takes effect without a restart.
+    pub config: SharedConfig,
 }
 
 impl Handlers {
@@ -106,7 +110,8 @@ impl Handlers {
             }
         }
 
-        self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
+        let active_window = self.config.read().unwrap().history.active_window();
+        self.refresh_history_window(&gitlab, active_window).await;
     }
 
     /// Daily refresh of the semi-active tier (24h–30d) followed by a prune of
@@ -120,7 +125,8 @@ impl Handlers {
                 return;
             }
         };
-        self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+        let semi_window = self.config.read().unwrap().history.semi_window();
+        self.refresh_history_window(&gitlab, semi_window).await;
         self.prune_history();
     }
 
@@ -135,7 +141,8 @@ impl Handlers {
                 return;
             }
         };
-        self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+        let stale_window = self.config.read().unwrap().history.stale_window();
+        self.refresh_history_window(&gitlab, stale_window).await;
         self.prune_history();
     }
 
@@ -182,7 +189,8 @@ impl Handlers {
 
     /// Drop history entries that have aged past the stale window.
     fn prune_history(&self) {
-        let cutoff = now_secs().saturating_sub(STALE_WINDOW.as_secs());
+        let stale_secs = self.config.read().unwrap().history.stale_window().as_secs();
+        let cutoff = now_secs().saturating_sub(stale_secs);
         match self.history.prune(cutoff) {
             Ok(0) => {}
             Ok(n) => info!(removed = n, "pruned stale history entries"),
@@ -329,8 +337,15 @@ impl VarlinkInterface for Handlers {
         // flags clear just their `spent_at` band (active is open-ended on top,
         // the bands abut at the active/semi window boundaries).
         let now = now_secs();
-        let active_start = now.saturating_sub(ACTIVE_WINDOW.as_secs());
-        let semi_start = now.saturating_sub(SEMI_WINDOW.as_secs());
+        let (active_secs, semi_secs) = {
+            let c = self.config.read().unwrap();
+            (
+                c.history.active_window().as_secs(),
+                c.history.semi_window().as_secs(),
+            )
+        };
+        let active_start = now.saturating_sub(active_secs);
+        let semi_start = now.saturating_sub(semi_secs);
 
         if all {
             if let Err(e) = self.history.clear() {
@@ -362,12 +377,15 @@ impl VarlinkInterface for Handlers {
                 self.backfill_history().await;
             } else if want("stale") {
                 // `stale`'s window subsumes the narrower tiers.
-                self.refresh_history_window(&gitlab, STALE_WINDOW).await;
+                let stale_window = self.config.read().unwrap().history.stale_window();
+                self.refresh_history_window(&gitlab, stale_window).await;
                 self.prune_history();
             } else if want("semi") {
-                self.refresh_history_window(&gitlab, SEMI_WINDOW).await;
+                let semi_window = self.config.read().unwrap().history.semi_window();
+                self.refresh_history_window(&gitlab, semi_window).await;
             } else if want("active") {
-                self.refresh_history_window(&gitlab, ACTIVE_WINDOW).await;
+                let active_window = self.config.read().unwrap().history.active_window();
+                self.refresh_history_window(&gitlab, active_window).await;
             }
         }
 
@@ -1101,7 +1119,13 @@ mod tests {
         let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
         let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
         let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
-        let queue = RetryQueue::new(Arc::clone(&session), &p("queue.redb")).unwrap();
+        let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
+        let queue = RetryQueue::new(
+            Arc::clone(&session),
+            &p("queue.redb"),
+            Arc::clone(&config),
+        )
+        .unwrap();
         (
             Handlers {
                 session,
@@ -1109,6 +1133,7 @@ mod tests {
                 boards,
                 history,
                 queue,
+                config,
             },
             dir,
         )
@@ -1155,7 +1180,11 @@ mod tests {
             .iter()
             .map(|e| e.timelog_id)
             .collect();
-        assert_eq!(remaining, vec![2, 3], "only the active-band entry is removed");
+        assert_eq!(
+            remaining,
+            vec![2, 3],
+            "only the active-band entry is removed"
+        );
     }
 
     #[tokio::test]

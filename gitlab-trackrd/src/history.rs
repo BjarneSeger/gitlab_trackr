@@ -1,14 +1,14 @@
 //! redb-backed store for the tiered timelog history.
 //!
 //! Keyed by the GitLab Timelog ID so repeated polls dedupe naturally. The store
-//! holds a single set of entries spanning up to [`STALE_WINDOW`]; the handler
-//! refresh cycle re-polls different `spent_at` bands at different cadences
-//! ([`ACTIVE_WINDOW`] every few minutes, [`SEMI_WINDOW`] once a day, the rest
-//! fetched once at startup). [`HistoryCache::upsert`] writes whatever a poll
+//! holds a single set of entries spanning up to the configured retention
+//! window; the handler refresh cycle re-polls different `spent_at` bands at
+//! different cadences (the active band every few minutes, the semi-active band
+//! once a day, the rest fetched once at startup, all sized from the daemon
+//! config). [`HistoryCache::upsert`] writes whatever a poll
 //! returned and [`HistoryCache::prune`] drops anything past the stale window.
 
 use std::path::Path;
-use std::time::Duration;
 
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
@@ -16,14 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::db::KvStore;
 use crate::error::Result;
 use crate::impl_redb_json_value;
-
-/// Active tier: the most volatile band, re-polled on the fast refresh interval.
-pub const ACTIVE_WINDOW: Duration = Duration::from_hours(24);
-/// Semi-active tier: re-polled once a day. Spans back to here from `now`.
-pub const SEMI_WINDOW: Duration = Duration::from_hours(24 * 30);
-/// Stale tier / overall retention: fetched once at startup, never re-polled.
-/// Entries older than this are pruned.
-pub const STALE_WINDOW: Duration = Duration::from_hours(24 * 90);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTimelog {
@@ -39,8 +31,7 @@ pub struct StoredTimelog {
 
 impl_redb_json_value!(StoredTimelog, "StoredTimelog");
 
-const HISTORY_TABLE: TableDefinition<u64, StoredTimelog> =
-    TableDefinition::new("timelog_history");
+const HISTORY_TABLE: TableDefinition<u64, StoredTimelog> = TableDefinition::new("timelog_history");
 
 pub struct HistoryCache {
     store: KvStore<u64, StoredTimelog>,
@@ -194,7 +185,12 @@ mod tests {
         let removed = h.clear_between(200, 300).unwrap();
         assert_eq!(removed, 2, "200 and 250 fall in [200, 300)");
 
-        let remaining: Vec<u64> = h.all_since(0).unwrap().iter().map(|e| e.timelog_id).collect();
+        let remaining: Vec<u64> = h
+            .all_since(0)
+            .unwrap()
+            .iter()
+            .map(|e| e.timelog_id)
+            .collect();
         assert_eq!(remaining, vec![5, 4, 1], "100, 300 and 400 survive");
     }
 

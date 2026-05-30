@@ -2,6 +2,12 @@ version: 2
 
 project_name: gitlab-trackr
 
+before:
+  hooks:
+    # Render the annotated default config shipped as the package-provided
+    # layer at /usr/share/gitlab-trackrd/config.toml (see nfpms contents).
+    - sh -c "cargo run --quiet --package gitlab-trackrd --bin gen-config-template > gitlab-trackrd/packaging/config.toml"
+
 builds:
   - id: gitlab-trackrd
     binary: gitlab-trackrd
@@ -60,5 +66,9 @@ nfpms:
           mode: 0644
       - src: gitlab-trackrd/packaging/gitlab-trackrd.socket
         dst: /usr/lib/systemd/user/gitlab-trackrd.socket
+        file_info:
+          mode: 0644
+      - src: gitlab-trackrd/packaging/config.toml
+        dst: /usr/share/gitlab-trackrd/config.toml
         file_info:
           mode: 0644

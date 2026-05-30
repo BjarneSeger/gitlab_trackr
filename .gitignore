@@ -1,2 +1,4 @@
 /target
 tt-cli/completions/
+# Rendered in CI by the goreleaser `before` hook (gen-config-template).
+gitlab-trackrd/packaging/config.toml
