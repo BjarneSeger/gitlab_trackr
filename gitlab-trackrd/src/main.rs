@@ -28,7 +28,7 @@ use history::HistoryCache;
 use queue::RetryQueue;
 use service::ServiceHandler;
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
