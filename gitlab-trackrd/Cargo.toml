@@ -3,6 +3,7 @@ name = "gitlab-trackrd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "gitlab-trackrd"
 
 [dependencies]
 gitlab.workspace = true
