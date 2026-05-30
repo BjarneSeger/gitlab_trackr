@@ -33,13 +33,23 @@ struct PromptAnswers {
 }
 
 pub async fn run() -> Result<()> {
-    run_with_default_duration(None).await
+    let suggested = state::load().unwrap_or_default().elapsed_suggestion();
+    if run_with_default_duration(suggested).await? {
+        // A successful log resets the interval — so nushell's `tt tick
+        // --mode remind` nudge stops and the next elapsed-time suggestion is
+        // measured from now.
+        let mut st = state::load().unwrap_or_default();
+        st.last_prompt = state::now_secs();
+        state::save(&st).context("saving state")?;
+    }
+    Ok(())
 }
 
 /// Run the interactive flow. `suggested_duration` pre-fills the duration
 /// input (so the user just hits Enter to accept the elapsed-time suggestion);
-/// `None` falls back to the configured `default_duration`.
-pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Result<()> {
+/// `None` falls back to the configured `default_duration`. Returns `true` if a
+/// time entry was logged, `false` if the user skipped or had no assigned issues.
+pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Result<bool> {
     let cfg = config::load()?;
     let socket = cfg.socket.clone().unwrap_or_else(client::default_socket);
     let client = client::connect(&socket).await?;
@@ -51,16 +61,15 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
 
     if reply.issues.is_empty() {
         println!("no assigned issues");
-        return Ok(());
+        return Ok(false);
     }
 
     let issues = reply.issues;
     let suggested = suggested_duration.unwrap_or(cfg.default_duration);
 
-    // Run all inquire prompts in a dedicated blocking thread. Calling
-    // blocking terminal I/O directly on the tokio executor thread causes
-    // crossterm's raw-mode cleanup to race with the async runtime, leaving
-    // the terminal in raw mode after the process exits.
+    // inquire's prompts are synchronous, blocking terminal I/O. Run them off
+    // the async executor thread so the single-threaded runtime isn't blocked
+    // for the (potentially long) duration of user input.
     let answers = tokio::task::spawn_blocking(move || -> Result<Option<PromptAnswers>> {
         let choices: Vec<IssueChoice> = issues.into_iter().map(IssueChoice).collect();
 
@@ -94,7 +103,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     .await??;
 
     let Some(PromptAnswers { issue, duration, summary }) = answers else {
-        return Ok(());
+        return Ok(false);
     };
 
     client
@@ -111,5 +120,5 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     state::save(&st).context("saving state")?;
 
     println!("logged {duration} on !{} ({})", issue.iid, issue.title);
-    Ok(())
+    Ok(true)
 }

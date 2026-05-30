@@ -22,10 +22,6 @@ pub struct State {
     /// Most recently logged-against issue, used by `tt log <iid>` to skip the
     /// `--project-id` flag when the user re-logs against the same issue.
     pub last_issue: Option<LastIssue>,
-    /// "Owe-a-prompt" marker for the nushell two-phase hook. `tt tick --mode
-    /// defer` sets this when the interval has elapsed; `tt tick --mode
-    /// redeem` clears it and runs the interactive prompt. See `hooks/nu.txt`.
-    pub pending_prompt: Option<PendingPrompt>,
     /// Highest dead-letter failure id already surfaced via the `tt tick`
     /// notice, so each queued-action failure is reported at most once. See
     /// [`crate::cmd::tick`].
@@ -38,13 +34,34 @@ pub struct LastIssue {
     pub issue_iid: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PendingPrompt {
-    /// Pre-computed duration suggestion (`"30m"`, `"1h15m"`) captured at the
-    /// moment `--mode defer` decided a prompt was owed. `None` is reserved
-    /// for the first-ever tick so the redeem step doesn't bias the user
-    /// with a giant elapsed-since-epoch suggestion.
-    pub suggested: Option<String>,
+impl State {
+    /// Elapsed-time-based duration suggestion (`"1h15m"`) that pre-fills the
+    /// interactive prompt, or `None` on the first-ever prompt (`last_prompt
+    /// == 0`), where a giant elapsed-since-epoch value would be meaningless.
+    pub fn elapsed_suggestion(&self) -> Option<String> {
+        if self.last_prompt == 0 {
+            return None;
+        }
+        Some(format_duration(now_secs().saturating_sub(self.last_prompt)))
+    }
+}
+
+/// Round seconds to whole minutes and render in GitLab time-tracking syntax
+/// (`30m`, `1h`, `1h15m`). At least `1m` so a sub-minute elapsed never produces
+/// a useless `0m` suggestion in the UI.
+pub(crate) fn format_duration(secs: u64) -> String {
+    let mins = (secs / 60).max(1);
+    if mins < 60 {
+        format!("{mins}m")
+    } else {
+        let h = mins / 60;
+        let m = mins % 60;
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
+    }
 }
 
 /// Current unix time in seconds. Clock skew before the epoch (negative

@@ -25,6 +25,9 @@ pub async fn run(host: String) -> Result<()> {
         eprintln!("Open the URL above manually.");
     }
 
+    // inquire's prompt is synchronous, blocking terminal I/O; run it off the
+    // single-threaded async executor so the runtime isn't blocked while the
+    // user pastes their token.
     let token = tokio::task::spawn_blocking(|| {
         Password::new("Paste the personal access token:")
             .without_confirmation()
