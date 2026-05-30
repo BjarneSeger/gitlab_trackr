@@ -6,16 +6,30 @@
 //! ignored — the daemon keeps serving the last-good config. The `server.socket`
 //! field can't change at runtime, so a change to it only warns.
 
+use std::path::Path;
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tracing::{info, warn};
 
 use crate::config::{self, SharedConfig};
 
-/// How long to wait for the event burst from a single save to settle before
-/// reloading.
+/// How long to wait after the first change before reloading, so an editor's
+/// multi-event save burst collapses into a single reload.
 const DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Whether `event` is a content change to the config file itself.
+///
+/// Filters out neighbouring editor noise in the same directory (vim's
+/// `.config.toml.swp` swap file, `config.toml~` backups, write-temp files) and
+/// `Access` events — including the read [`config::reload`] itself performs,
+/// which would otherwise re-trigger the watcher in a loop.
+fn is_config_change(event: &Event, path: &Path) -> bool {
+    matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) && event.paths.iter().any(|p| p == path)
+}
 
 /// Start watching the config file and reload `shared` whenever it changes.
 ///
@@ -54,11 +68,19 @@ pub fn spawn(shared: SharedConfig) {
         // Keep the watcher alive for as long as we're draining its events.
         let _watcher = watcher;
         while let Some(event) = rx.recv().await {
-            if !event.paths.contains(&path) {
+            // Editor noise in the same directory (swap/backup/temp files, bare
+            // reads) is filtered here so it can never start a reload.
+            if !is_config_change(&event, &path) {
                 continue;
             }
-            // Coalesce the rest of this save's event burst before reloading.
-            while tokio::time::timeout(DEBOUNCE, rx.recv()).await.is_ok() {}
+
+            // Fixed debounce from the first change: let the editor's write
+            // burst settle, then discard whatever queued up (the rest of the
+            // burst plus any neighbouring noise) so it all collapses into one
+            // reload. `reload()` re-reads the file, so a save that lands inside
+            // this window is still reflected.
+            tokio::time::sleep(DEBOUNCE).await;
+            while rx.try_recv().is_ok() {}
 
             let before = shared.read().unwrap().server.resolved_socket();
             match config::reload(&shared) {
