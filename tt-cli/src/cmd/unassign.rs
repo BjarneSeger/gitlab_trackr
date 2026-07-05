@@ -21,7 +21,7 @@ pub async fn run(iid: i64, project_id: Option<i64>) -> Result<()> {
         .unassign_self(project_id, iid)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("UnassignSelf failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("UnassignSelf", e))?;
 
     println!("unassigned from !{iid} (project {project_id})");
     Ok(())

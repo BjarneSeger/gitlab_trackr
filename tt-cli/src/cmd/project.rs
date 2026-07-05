@@ -29,7 +29,7 @@ pub async fn resolve(iid: i64, socket: &str) -> Result<i64> {
         .get_assigned_issues(None)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?;
     let matches: Vec<_> = reply.issues.iter().filter(|i| i.iid == iid).collect();
     match matches.as_slice() {
         [] => bail!("no assigned issue with iid {iid} — pass --project-id explicitly"),

@@ -18,7 +18,7 @@ pub async fn run(groups: Vec<String>, output: OutputFormat) -> Result<()> {
         .get_assigned_issues(filter)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?;
 
     match output {
         OutputFormat::Json => {

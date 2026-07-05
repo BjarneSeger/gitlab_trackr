@@ -29,7 +29,7 @@ pub async fn run(
         .post_time(project_id, iid, duration.clone(), summary.clone())
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("PostTime failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("PostTime", e))?;
 
     let mut st = state::load().unwrap_or_default();
     st.last_issue = Some(state::LastIssue {

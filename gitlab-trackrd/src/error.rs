@@ -12,10 +12,11 @@ pub enum Error {
     #[error("network error: {0}")]
     Transient(String),
 
-    /// No credentials available — the daemon is running but not connected to
-    /// GitLab. The CLI surfaces this as "run `tt login`".
-    #[error("not authenticated")]
-    NotAuthenticated,
+    /// The daemon is running but not connected to GitLab. Carries the reason
+    /// so the CLI can surface a specific, actionable message rather than a bare
+    /// "not authenticated" (see [`DormancyReason`]).
+    #[error("not authenticated ({})", .0.code())]
+    NotAuthenticated(DormancyReason),
 
     #[error("secret store: {0}")]
     Secrets(String),
@@ -49,3 +50,108 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Why the daemon has no live GitLab session. Attached to
+/// [`Error::NotAuthenticated`] so the reason the daemon already logs at startup
+/// can reach the CLI. The daemon owns the *cause* (a stable machine `code` plus
+/// optional free-text `detail`); the CLI owns the *phrasing*.
+#[derive(Debug, Clone)]
+pub enum DormancyReason {
+    /// No credentials are stored in the keychain (never logged in / logged out).
+    NoCredentials,
+    /// Reading the OS keychain failed.
+    KeychainError(String),
+    /// Credentials exist but GitLab was unreachable (network / transient error).
+    Unreachable { host: String, detail: String },
+    /// Credentials exist but GitLab rejected the token (auth failure).
+    TokenRejected { host: String, detail: String },
+    /// The user explicitly logged out.
+    LoggedOut,
+}
+
+impl DormancyReason {
+    /// Stable, machine-readable code sent over the wire. The CLI maps it to a
+    /// human message, so wording can change without a protocol change.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoCredentials => "no-credentials",
+            Self::KeychainError(_) => "keychain-error",
+            Self::Unreachable { .. } => "unreachable",
+            Self::TokenRejected { .. } => "token-rejected",
+            Self::LoggedOut => "logged-out",
+        }
+    }
+
+    /// Free-text detail (host + underlying error) for the codes that carry one.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            Self::NoCredentials | Self::LoggedOut => None,
+            Self::KeychainError(d) => Some(d.clone()),
+            Self::Unreachable { host, detail } | Self::TokenRejected { host, detail } => {
+                Some(format!("{host}: {detail}"))
+            }
+        }
+    }
+
+    /// Classify a failed initial `GitlabClient::connect`: a transient/network
+    /// error means GitLab was unreachable; anything else means the token was
+    /// rejected.
+    pub fn from_connect_error(host: &str, e: &Error) -> Self {
+        match e {
+            Error::Transient(detail) => Self::Unreachable {
+                host: host.to_string(),
+                detail: detail.clone(),
+            },
+            Error::Gitlab(detail) => Self::TokenRejected {
+                host: host.to_string(),
+                detail: detail.clone(),
+            },
+            other => Self::Unreachable {
+                host: host.to_string(),
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_connect_error_classifies_transient_as_unreachable() {
+        let r = DormancyReason::from_connect_error(
+            "gitlab.example.com",
+            &Error::Transient("connection refused".into()),
+        );
+        assert_eq!(r.code(), "unreachable");
+        assert_eq!(
+            r.detail().as_deref(),
+            Some("gitlab.example.com: connection refused")
+        );
+    }
+
+    #[test]
+    fn from_connect_error_classifies_gitlab_as_token_rejected() {
+        let r = DormancyReason::from_connect_error(
+            "gitlab.example.com",
+            &Error::Gitlab("401 Unauthorized".into()),
+        );
+        assert_eq!(r.code(), "token-rejected");
+        assert_eq!(
+            r.detail().as_deref(),
+            Some("gitlab.example.com: 401 Unauthorized")
+        );
+    }
+
+    #[test]
+    fn codes_and_details_for_reasons_without_a_host() {
+        assert_eq!(DormancyReason::NoCredentials.code(), "no-credentials");
+        assert_eq!(DormancyReason::NoCredentials.detail(), None);
+        assert_eq!(DormancyReason::LoggedOut.code(), "logged-out");
+        assert_eq!(DormancyReason::LoggedOut.detail(), None);
+        let k = DormancyReason::KeychainError("boom".into());
+        assert_eq!(k.code(), "keychain-error");
+        assert_eq!(k.detail().as_deref(), Some("boom"));
+    }
+}

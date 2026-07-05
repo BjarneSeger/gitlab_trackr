@@ -14,7 +14,7 @@ pub async fn run(output: OutputFormat) -> Result<()> {
         .who_am_i()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("WhoAmI failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("WhoAmI", e))?;
 
     match output {
         OutputFormat::Json => {

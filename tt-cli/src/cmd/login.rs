@@ -55,7 +55,7 @@ pub async fn run(host: String) -> Result<()> {
         .who_am_i()
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("WhoAmI failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("WhoAmI", e))?;
     println!("Logged in to {} as user #{}.", me.host, me.user_id);
     Ok(())
 }
