@@ -36,7 +36,9 @@ type FailedTask (
 
 error GitlabError (message: string)
 
-error NotAuthenticated (reason: ?string, detail: ?string)
+type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
+
+error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 

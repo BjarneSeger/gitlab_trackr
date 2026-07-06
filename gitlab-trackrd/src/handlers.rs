@@ -15,7 +15,7 @@ use gitlab_trackr_api::{
     Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_CloseIssue, Call_DismissFailure,
     Call_GetAssignedIssues, Call_GetFailures, Call_GetHistory, Call_Login, Call_Logout,
     Call_PostTime, Call_RetryFailure, Call_UnassignSelf, Call_WhoAmI, FailedTask, HistoryEvent,
-    Issue, VarlinkInterface,
+    Issue, NotAuthReason, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
@@ -106,8 +106,8 @@ impl Handlers {
 /// `reply_not_authenticated` sites don't each repeat the match. The error is
 /// always `NotAuthenticated` here (all `gitlab()`/`current_session()` yield);
 /// the fallback is purely defensive.
-fn dormant_args(reason: &DormancyReason) -> (Option<String>, Option<String>) {
-    (Some(reason.code().to_string()), reason.detail())
+fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
+    (Some(reason.reason()), reason.detail())
 }
 
 impl Handlers {

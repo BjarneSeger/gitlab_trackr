@@ -3,6 +3,8 @@
 //! Each `#[from]`-annotated variant lets `thiserror` derive the matching
 //! `From` impl, so call sites use `?` instead of `.map_err(...)` chains.
 
+use gitlab_trackr_api::NotAuthReason;
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("GitLab error: {0}")]
@@ -64,15 +66,16 @@ pub enum DormancyReason {
 }
 
 impl DormancyReason {
-    /// Stable, machine-readable code sent over the wire. The CLI maps it to a
-    /// human message, so wording can change without a protocol change.
-    pub fn code(&self) -> &'static str {
+    /// The wire enum sent to the CLI. The CLI maps it to a human message, so
+    /// wording can change without a protocol change; adding a variant is a
+    /// protocol change the CLI is forced to handle (exhaustive match).
+    pub fn reason(&self) -> NotAuthReason {
         match self {
-            Self::NoCredentials => "no-credentials",
-            Self::KeychainError(_) => "keychain-error",
-            Self::Unreachable { .. } => "unreachable",
-            Self::TokenRejected { .. } => "token-rejected",
-            Self::LoggedOut => "logged-out",
+            Self::NoCredentials => NotAuthReason::no_credentials,
+            Self::KeychainError(_) => NotAuthReason::keychain_error,
+            Self::Unreachable { .. } => NotAuthReason::unreachable,
+            Self::TokenRejected { .. } => NotAuthReason::token_rejected,
+            Self::LoggedOut => NotAuthReason::logged_out,
         }
     }
 
@@ -114,7 +117,7 @@ mod tests {
             "gitlab.example.com",
             &Error::Transient("connection refused".into()),
         );
-        assert_eq!(r.code(), "unreachable");
+        assert_eq!(r.reason(), NotAuthReason::unreachable);
         assert_eq!(
             r.detail().as_deref(),
             Some("gitlab.example.com: connection refused")
@@ -127,7 +130,7 @@ mod tests {
             "gitlab.example.com",
             &Error::Gitlab("401 Unauthorized".into()),
         );
-        assert_eq!(r.code(), "token-rejected");
+        assert_eq!(r.reason(), NotAuthReason::token_rejected);
         assert_eq!(
             r.detail().as_deref(),
             Some("gitlab.example.com: GitLab error: 401 Unauthorized")
@@ -136,12 +139,18 @@ mod tests {
 
     #[test]
     fn codes_and_details_for_reasons_without_a_host() {
-        assert_eq!(DormancyReason::NoCredentials.code(), "no-credentials");
+        assert_eq!(
+            DormancyReason::NoCredentials.reason(),
+            NotAuthReason::no_credentials
+        );
         assert_eq!(DormancyReason::NoCredentials.detail(), None);
-        assert_eq!(DormancyReason::LoggedOut.code(), "logged-out");
+        assert_eq!(
+            DormancyReason::LoggedOut.reason(),
+            NotAuthReason::logged_out
+        );
         assert_eq!(DormancyReason::LoggedOut.detail(), None);
         let k = DormancyReason::KeychainError("boom".into());
-        assert_eq!(k.code(), "keychain-error");
+        assert_eq!(k.reason(), NotAuthReason::keychain_error);
         assert_eq!(k.detail().as_deref(), Some("boom"));
     }
 }
