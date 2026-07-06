@@ -1,0 +1,37 @@
+name: Go binding
+
+# Guards the checked-in Go binding (clients/go) against drift from the varlink
+# interface it is generated from. Fails if someone edits the .varlink without
+# regenerating, or hand-edits the generated file.
+
+on:
+  push:
+    paths:
+      - "gitlab-trackr-api/varlink/**"
+      - "clients/go/**"
+      - ".github/workflows/go-binding.yml"
+  pull_request:
+    paths:
+      - "gitlab-trackr-api/varlink/**"
+      - "clients/go/**"
+      - ".github/workflows/go-binding.yml"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: Regenerate, build and vet
+        working-directory: clients/go
+        run: |
+          go generate ./...
+          go build ./...
+          go vet ./...
+
+      - name: Fail if the committed binding is stale
+        run: git diff --exit-code

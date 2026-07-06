@@ -5,6 +5,7 @@ it into you workflow? Then this is the repo for you! We have:
 
 - [A background daemon that handles auth and caching](gitlab-trackrd/README.md)
 - [A cli to communicate with it and to remind you to track](tt-cli/README.md)
+- [A ready-to-import Go binding for the daemon's varlink interface](clients/go/README.md)
 
 # Setup
 Install the `gitlab-trackr-utils` package (see the releases tab), which provides

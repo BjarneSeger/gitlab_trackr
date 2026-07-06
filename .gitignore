@@ -2,3 +2,6 @@
 tt-cli/completions/
 # Rendered in CI by the goreleaser `before` hook (gen-config-template).
 gitlab-trackrd/packaging/config.toml
+# Transient copy made by the Go binding's `go generate` step; the generated
+# binding itself (clients/go/orgthehostergitlabtrackrd.go) is intentionally committed.
+clients/go/interface.varlink
