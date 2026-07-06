@@ -62,8 +62,6 @@ pub struct FetchedTimelog {
 pub trait GitlabApi: Send + Sync {
     async fn fetch_assigned_issues(&self, group: Option<String>) -> Result<Vec<IssueWithLabels>>;
 
-    async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>>;
-
     async fn add_spent_time(
         &self,
         project_id: i64,
@@ -164,6 +162,7 @@ impl GitlabApi for GitlabClient {
     #[instrument(skip(self))]
     async fn fetch_assigned_issues(&self, group: Option<String>) -> Result<Vec<IssueWithLabels>> {
         use gitlab::api::issues::{GroupIssues, IssueScope, IssueState, Issues};
+        use gitlab::api::{Pagination, paged};
 
         if let Some(group) = group {
             let query = GroupIssues::builder()
@@ -172,27 +171,15 @@ impl GitlabApi for GitlabClient {
                 .group(group)
                 .build()
                 .map_err(|e| Error::Gitlab(e.to_string()))?;
-            run_issues_query(&self.inner, query).await
+            run_issues_query(&self.inner, paged(query, Pagination::All)).await
         } else {
             let query = Issues::builder()
                 .scope(IssueScope::AssignedToMe)
                 .state(IssueState::Opened)
                 .build()
                 .map_err(|e| Error::Gitlab(e.to_string()))?;
-            run_issues_query(&self.inner, query).await
+            run_issues_query(&self.inner, paged(query, Pagination::All)).await
         }
-    }
-
-    /// Fetch all assigned issues from the provided groups
-    #[instrument(skip(self))]
-    async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>> {
-        let mut issues = Vec::new();
-
-        for group in groups {
-            issues.extend(self.fetch_assigned_issues(Some(group)).await?);
-        }
-
-        Ok(issues)
     }
 
     /// Record time spent on a GitLab issue.

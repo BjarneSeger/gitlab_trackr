@@ -1,10 +1,16 @@
-//! redb-backed cache for the assigned-issues list.
+//! redb-backed cache for the assigned-issues list, keyed by group.
 //!
 //! Hides `KvStore` behind a small [`IssueCache`] interface; callers see plain
 //! `Result<Option<_>>` / `Result<()>` and never touch a transaction.
+//!
+//! The background refresh loop fetches every assigned issue and hands the whole
+//! list to [`IssueCache::put`], which buckets them by group (parsed from each
+//! issue's `web_url`). `tt list` reads every bucket; `tt list <group>` reads the
+//! buckets under that group. There is no TTL — the background loop owns freshness
+//! and readers always serve whatever was last synced.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
@@ -14,20 +20,22 @@ use crate::error::Result;
 use crate::impl_redb_json_value;
 use gitlab_trackr_api::Issue;
 
-/// On-disk representation of a cached issue list, stored as JSON in redb.
-#[derive(Debug, Serialize, Deserialize)]
-struct CachedData {
-    /// Unix timestamp (seconds) when this entry was written.
-    timestamp: u64,
-    issues: Vec<Issue>,
+/// On-disk cache: assigned issues bucketed by their group namespace.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IssueBuckets {
+    /// Group namespace path (e.g. `"team/backend"`) -> issues under it.
+    by_group: BTreeMap<String, Vec<Issue>>,
 }
 
-impl_redb_json_value!(CachedData, "CachedData");
+impl_redb_json_value!(IssueBuckets, "IssueBuckets");
 
-const ISSUES_TABLE: TableDefinition<&str, CachedData> = TableDefinition::new("issues_cache");
+const ISSUES_TABLE: TableDefinition<&str, IssueBuckets> =
+    TableDefinition::new("issues_cache_v2");
+
+const KEY: &str = "assigned";
 
 pub struct IssueCache {
-    store: KvStore<&'static str, CachedData>,
+    store: KvStore<&'static str, IssueBuckets>,
 }
 
 impl IssueCache {
@@ -38,64 +46,107 @@ impl IssueCache {
         })
     }
 
-    /// Return a fresh-enough cached issue list, or `None` if absent/stale.
+    /// Every cached issue across all groups, or `None` if nothing is cached.
     pub fn get(&self) -> Result<Option<Vec<Issue>>> {
-        Ok(self.store.get("assigned")?.map(|data| data.issues))
+        Ok(self
+            .buckets()?
+            .map(|b| b.by_group.into_values().flatten().collect()))
     }
 
-    /// Replace the cached issue list with `issues`, stamped at the current time.
+    /// Issues in `group` and its subgroups, matching GitLab's subgroup-inclusive
+    /// group filter. Empty when the cache is cold or the group has none.
+    pub fn get_group(&self, group: &str) -> Result<Vec<Issue>> {
+        let Some(b) = self.buckets()? else {
+            return Ok(Vec::new());
+        };
+        Ok(b.by_group
+            .into_iter()
+            .filter(|(ns, _)| in_group(ns, group))
+            .flat_map(|(_, issues)| issues)
+            .collect())
+    }
+
+    /// Replace the cache with `issues`, bucketed by group namespace.
     pub fn put(&self, issues: &[Issue]) -> Result<()> {
-        self.store.put(
-            "assigned",
-            CachedData {
-                timestamp: now_secs(),
-                issues: issues.to_vec(),
-            },
-        )
+        let mut by_group: BTreeMap<String, Vec<Issue>> = BTreeMap::new();
+        for issue in issues {
+            by_group
+                .entry(namespace_of(&issue.web_url))
+                .or_default()
+                .push(issue.clone());
+        }
+        self.store.put(KEY, IssueBuckets { by_group })
     }
 
     /// Drop the cached entry so the next `get` returns `None`.
     pub fn clear(&self) -> Result<()> {
-        self.store.remove("assigned")
+        self.store.remove(KEY)
     }
 
-    /// Drop the issue identified by `(project_id, issue_iid)` from the cached
-    /// list, if present. Returns whether an entry was actually removed. Lets a
-    /// close/unassign disappear from `tt list` immediately instead of waiting
-    /// for the next refresh.
+    /// Drop the issue identified by `(project_id, issue_iid)` from whichever
+    /// group bucket holds it, if present. Returns whether anything was removed.
+    /// Lets a close/unassign disappear from `tt list` immediately instead of
+    /// waiting for the next refresh.
     pub fn remove_issue(&self, project_id: i64, issue_iid: i64) -> Result<bool> {
-        let Some(mut issues) = self.get()? else {
+        let Some(mut b) = self.buckets()? else {
             return Ok(false);
         };
-        let before = issues.len();
-        issues.retain(|i| !(i.project_id == project_id && i.iid == issue_iid));
-        if issues.len() == before {
+        let mut removed = false;
+        for issues in b.by_group.values_mut() {
+            let before = issues.len();
+            issues.retain(|i| !(i.project_id == project_id && i.iid == issue_iid));
+            removed |= issues.len() != before;
+        }
+        if !removed {
             return Ok(false);
         }
-        self.put(&issues)?;
+        b.by_group.retain(|_, issues| !issues.is_empty());
+        self.store.put(KEY, b)?;
         Ok(true)
+    }
+
+    fn buckets(&self) -> Result<Option<IssueBuckets>> {
+        self.store.get(KEY)
     }
 }
 
-/// Current unix time in seconds; clock skew before the epoch collapses to 0.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// The group namespace an issue belongs to, parsed from its `web_url`
+/// (`https://host/<namespace>/-/issues/<iid>`). Returns `""` when there is no
+/// namespace to parse — such issues still show in `tt list`, they just don't
+/// match any `tt list <group>` filter.
+fn namespace_of(web_url: &str) -> String {
+    web_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(web_url)
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("")
+        .split("/-/")
+        .next()
+        .unwrap_or("")
+        .trim_matches('/')
+        .to_string()
+}
+
+/// Whether `namespace` falls under `group`, matching GitLab's subgroup-inclusive
+/// `.group(g)` filter: an exact match or a `group/…` descendant.
+fn in_group(namespace: &str, group: &str) -> bool {
+    let group = group.trim_matches('/');
+    !group.is_empty() && (namespace == group || namespace.starts_with(&format!("{group}/")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_issue(iid: i64, title: &str) -> Issue {
+    fn issue_at(web_url: &str, iid: i64, title: &str) -> Issue {
         Issue {
             id: iid * 10,
             iid,
             project_id: 1,
             title: title.to_string(),
-            web_url: format!("https://gl/-/issues/{iid}"),
+            web_url: web_url.to_string(),
             state: "opened".to_string(),
             parent: String::new(),
             total_time: String::new(),
@@ -103,10 +154,40 @@ mod tests {
         }
     }
 
+    /// Default helper: every issue lives in the same project `grp/proj`.
+    fn make_issue(iid: i64, title: &str) -> Issue {
+        issue_at(&format!("https://gl/grp/proj/-/issues/{iid}"), iid, title)
+    }
+
     fn cache() -> (IssueCache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache.redb");
         (IssueCache::open(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn namespace_of_parses_group_path() {
+        assert_eq!(namespace_of("https://gl/team/proj/-/issues/5"), "team/proj");
+        assert_eq!(
+            namespace_of("https://gl/team/sub/proj/-/issues/5"),
+            "team/sub/proj"
+        );
+    }
+
+    #[test]
+    fn namespace_of_empty_without_path() {
+        assert_eq!(namespace_of("https://gl"), "");
+        assert_eq!(namespace_of(""), "");
+    }
+
+    #[test]
+    fn in_group_matches_exact_and_descendants_only() {
+        assert!(in_group("team/proj", "team"));
+        assert!(in_group("team/sub/proj", "team/sub"));
+        assert!(in_group("team", "team"));
+        assert!(!in_group("teamfoo/proj", "team"), "not a prefix boundary");
+        assert!(!in_group("other/proj", "team"));
+        assert!(!in_group("team/proj", ""), "empty filter matches nothing");
     }
 
     #[test]
@@ -137,6 +218,36 @@ mod tests {
     }
 
     #[test]
+    fn get_group_matches_group_and_subgroups() {
+        let (c, _td) = cache();
+        c.put(&[
+            issue_at("https://gl/team/api/-/issues/1", 1, "api"),
+            issue_at("https://gl/team/sub/web/-/issues/2", 2, "web"),
+            issue_at("https://gl/other/x/-/issues/3", 3, "other"),
+        ])
+        .unwrap();
+
+        let team: Vec<i64> = c.get_group("team").unwrap().iter().map(|i| i.iid).collect();
+        assert_eq!(team, vec![1, 2], "team includes its subgroup");
+
+        let sub: Vec<i64> = c
+            .get_group("team/sub")
+            .unwrap()
+            .iter()
+            .map(|i| i.iid)
+            .collect();
+        assert_eq!(sub, vec![2]);
+
+        assert!(c.get_group("missing").unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_group_empty_on_cold_cache() {
+        let (c, _td) = cache();
+        assert!(c.get_group("team").unwrap().is_empty());
+    }
+
+    #[test]
     fn clear_removes_entry() {
         let (c, _td) = cache();
         c.put(&[make_issue(1, "a")]).unwrap();
@@ -147,7 +258,7 @@ mod tests {
     #[test]
     fn remove_issue_drops_only_the_match() {
         let (c, _td) = cache();
-        // make_issue uses project_id = 1 for every issue.
+        // make_issue uses project_id = 1 for every issue, all in one bucket.
         c.put(&[make_issue(1, "a"), make_issue(2, "b"), make_issue(3, "c")])
             .unwrap();
 
@@ -155,6 +266,21 @@ mod tests {
         let got = c.get().unwrap().unwrap();
         let iids: Vec<i64> = got.iter().map(|i| i.iid).collect();
         assert_eq!(iids, vec![1, 3], "only iid 2 removed");
+    }
+
+    #[test]
+    fn remove_issue_across_buckets_drops_emptied_bucket() {
+        let (c, _td) = cache();
+        c.put(&[
+            issue_at("https://gl/a/p/-/issues/1", 1, "a"),
+            issue_at("https://gl/b/p/-/issues/2", 2, "b"),
+        ])
+        .unwrap();
+
+        assert!(c.remove_issue(1, 1).unwrap());
+        let got: Vec<i64> = c.get().unwrap().unwrap().iter().map(|i| i.iid).collect();
+        assert_eq!(got, vec![2], "bucket a emptied");
+        assert!(c.get_group("a").unwrap().is_empty(), "emptied bucket dropped");
     }
 
     #[test]
@@ -189,7 +315,31 @@ mod tests {
     }
 
     #[test]
-    fn now_secs_is_positive() {
-        assert!(now_secs() > 0);
+    fn ignores_legacy_v1_table_without_panicking() {
+        use redb::Database;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.redb");
+
+        // Simulate a pre-existing v1 cache: a table under the OLD name holding
+        // bytes the new `IssueBuckets` type could never deserialize. The rename
+        // to `issues_cache_v2` must make this a non-event, not a `from_bytes` panic.
+        {
+            let db = Database::create(&path).unwrap();
+            let legacy: TableDefinition<&str, &[u8]> = TableDefinition::new("issues_cache");
+            let txn = db.begin_write().unwrap();
+            {
+                let mut t = txn.open_table(legacy).unwrap();
+                t.insert("assigned", b"not-valid-issuebuckets-json".as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let c = IssueCache::open(&path).unwrap();
+        assert!(c.get().unwrap().is_none(), "legacy v1 data is ignored");
+        // Still fully functional afterward.
+        c.put(&[make_issue(1, "fresh")]).unwrap();
+        assert_eq!(c.get().unwrap().unwrap().len(), 1);
     }
 }

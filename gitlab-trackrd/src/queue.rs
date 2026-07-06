@@ -650,9 +650,6 @@ mod tests {
         ) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!()
         }
-        async fn fetch_group_issues(&self, _g: Vec<String>) -> TrackrResult<Vec<IssueWithLabels>> {
-            unimplemented!()
-        }
         async fn add_spent_time(
             &self,
             _p: i64,

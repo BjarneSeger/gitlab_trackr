@@ -76,7 +76,11 @@ impl ServerConfig {
             return socket.clone();
         }
         dirs::runtime_dir()
-            .map(|d| d.join("gitlab-trackrd.socket").to_string_lossy().into_owned())
+            .map(|d| {
+                d.join("gitlab-trackrd.socket")
+                    .to_string_lossy()
+                    .into_owned()
+            })
             .unwrap_or_else(|| "/tmp/gitlab-trackrd.socket".to_string())
     }
 }
@@ -117,15 +121,15 @@ pub struct HistoryConfig {
 
 impl HistoryConfig {
     pub fn active_window(&self) -> Duration {
-        Duration::from_secs(self.active_window_hours * 3600)
+        Duration::from_hours(self.active_window_hours)
     }
 
     pub fn semi_window(&self) -> Duration {
-        Duration::from_secs(self.semi_window_hours * 3600)
+        Duration::from_hours(self.semi_window_hours)
     }
 
     pub fn stale_window(&self) -> Duration {
-        Duration::from_secs(self.stale_window_hours * 3600)
+        Duration::from_hours(self.stale_window_hours)
     }
 }
 
@@ -225,7 +229,9 @@ pub fn reload(shared: &SharedConfig) -> Result<(), confique::Error> {
 /// [`SharedConfig`] without touching the real XDG path.
 #[cfg(test)]
 pub fn defaults() -> Config {
-    Config::builder().load().expect("built-in defaults are valid")
+    Config::builder()
+        .load()
+        .expect("built-in defaults are valid")
 }
 
 /// Render an annotated TOML template (current defaults + doc comments inline).
