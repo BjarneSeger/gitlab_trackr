@@ -300,42 +300,45 @@ impl VarlinkInterface for Handlers {
         call: &mut dyn Call_GetAssignedIssues,
         groups: Option<Vec<String>>,
     ) -> varlink::Result<()> {
-        match self.cache.get() {
-            Ok(Some(issues)) => {
-                debug!(count = issues.len(), "cache hit");
-                return call.reply(issues);
+        // Pure cache reader — the background refresh loop owns population, so we
+        // never fetch here. A warm cache is served as-is (group issues are just
+        // the assigned set filtered by group); an empty cache means cold-start or
+        // dormant, distinguished below.
+        let all = match self.cache.get() {
+            Ok(Some(all)) => all,
+            Ok(None) => {
+                return match self.gitlab().await {
+                    // Live session, cache not warm yet: the next background tick
+                    // fills it. Report empty rather than a false auth error.
+                    Ok(_) => call.reply(Vec::new()),
+                    Err(e) => {
+                        let (reason, detail) = dormant_args(&e);
+                        call.reply_not_authenticated(reason, detail)
+                    }
+                };
             }
-            Ok(None) => debug!("cache miss, fetching from GitLab"),
-            Err(e) => warn!("cache read failed, treating as miss: {e}"),
-        }
-
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(&e);
-                return call.reply_not_authenticated(reason, detail);
+                warn!("cache read failed, treating as empty: {e}");
+                return call.reply(Vec::new());
             }
         };
 
-        let fetched = if let Some(groups) = groups {
-            gitlab.fetch_group_issues(groups).await
-        } else {
-            gitlab.fetch_assigned_issues(None).await
+        let issues = match groups {
+            Some(groups) if !groups.is_empty() => {
+                // Union each requested group, deduping overlaps (a parent group
+                // and its subgroup can both match the same issue).
+                let mut seen = std::collections::HashSet::new();
+                groups
+                    .iter()
+                    .flat_map(|g| self.cache.get_group(g).unwrap_or_default())
+                    .filter(|i| seen.insert((i.project_id, i.iid)))
+                    .collect()
+            }
+            _ => all,
         };
 
-        match fetched {
-            Ok(raw) => {
-                let issues = enrich_graph_status(&*gitlab, &self.boards, raw).await;
-                if let Err(e) = self.cache.put(&issues) {
-                    warn!(error = %e, "cache write failed");
-                }
-                call.reply(issues)
-            }
-            Err(e) => {
-                warn!(error = %e, "GitLab fetch failed");
-                call.reply_gitlab_error(e.to_string())
-            }
-        }
+        debug!(count = issues.len(), "serving issues from cache");
+        call.reply(issues)
     }
 
     #[instrument(skip(self, call))]
@@ -988,12 +991,6 @@ mod tests {
         ) -> TrackrResult<Vec<IssueWithLabels>> {
             unimplemented!("not used in enrich_graph_status tests")
         }
-        async fn fetch_group_issues(
-            &self,
-            _groups: Vec<String>,
-        ) -> TrackrResult<Vec<IssueWithLabels>> {
-            unimplemented!()
-        }
         async fn add_spent_time(
             &self,
             _project_id: i64,
@@ -1292,5 +1289,102 @@ mod tests {
 
         let reply = call.take_reply().expect("a reply");
         assert!(reply.error.is_some(), "project_id 0 → error reply");
+    }
+
+    // ── get_assigned_issues: pure cache reader ─────────────────────────────
+
+    /// Issues from a successful `GetAssignedIssues` reply.
+    fn reply_issues(call: &mut gitlab_trackr_api::AsyncCall) -> Vec<Issue> {
+        let reply = call.take_reply().expect("a reply");
+        assert!(reply.error.is_none(), "expected success, got {:?}", reply.error);
+        let params: gitlab_trackr_api::GetAssignedIssues_Reply =
+            serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply");
+        params.issues
+    }
+
+    /// Warm the cache with three issues: two under `team` (one in a subgroup)
+    /// and one under `other`.
+    fn seed_grouped_cache(h: &Handlers) {
+        h.cache
+            .put(&[
+                issue(1, 1, "api", "https://gl/team/api/-/issues/1"),
+                issue(1, 2, "web", "https://gl/team/sub/web/-/issues/2"),
+                issue(2, 3, "other", "https://gl/other/x/-/issues/3"),
+            ])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_assigned_issues_serves_all_from_cache_while_dormant() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        seed_grouped_cache(&h);
+
+        let mut call = AsyncCall::default();
+        h.get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, None)
+            .await
+            .unwrap();
+
+        // Served under a dormant session: proves it never fetched — a fetch would
+        // have replied NotAuthenticated instead of the cached list.
+        let mut iids: Vec<i64> = reply_issues(&mut call).iter().map(|i| i.iid).collect();
+        iids.sort_unstable();
+        assert_eq!(iids, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn get_assigned_issues_filters_by_group_from_cache() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        seed_grouped_cache(&h);
+
+        let mut call = AsyncCall::default();
+        h.get_assigned_issues(
+            &mut call as &mut dyn Call_GetAssignedIssues,
+            Some(vec!["team".to_string()]),
+        )
+        .await
+        .unwrap();
+
+        let mut iids: Vec<i64> = reply_issues(&mut call).iter().map(|i| i.iid).collect();
+        iids.sort_unstable();
+        assert_eq!(iids, vec![1, 2], "team includes its subgroup, excludes other");
+    }
+
+    #[tokio::test]
+    async fn get_assigned_issues_dedups_overlapping_groups() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+        seed_grouped_cache(&h);
+
+        let mut call = AsyncCall::default();
+        h.get_assigned_issues(
+            &mut call as &mut dyn Call_GetAssignedIssues,
+            Some(vec!["team".to_string(), "team/sub".to_string()]),
+        )
+        .await
+        .unwrap();
+
+        let mut iids: Vec<i64> = reply_issues(&mut call).iter().map(|i| i.iid).collect();
+        iids.sort_unstable();
+        assert_eq!(iids, vec![1, 2], "issue 2 (in both) not double-counted");
+    }
+
+    #[tokio::test]
+    async fn get_assigned_issues_empty_cache_dormant_is_not_authenticated() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers();
+
+        let mut call = AsyncCall::default();
+        h.get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, None)
+            .await
+            .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+            "cold cache + no session → honest auth error"
+        );
     }
 }
