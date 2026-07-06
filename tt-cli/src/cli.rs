@@ -181,7 +181,7 @@ pub enum QueueAction {
 #[derive(Subcommand)]
 pub enum ConfigAction {
     /// Print an annotated TOML template (with current defaults and doc
-    /// comments) to stdout. Pipe into `$XDG_CONFIG_HOME/gitlab_trackr_cli/config.toml`.
+    /// comments) to stdout. Pipe into `$XDG_CONFIG_HOME/gitlab-trackr-cli/config.toml`.
     Template,
     /// Print the resolved path to the user config file.
     Path,
