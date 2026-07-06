@@ -14,6 +14,7 @@ mod gitlab;
 mod handlers;
 mod history;
 mod queue;
+mod reconnect;
 mod reload;
 mod secrets;
 mod server;
@@ -94,6 +95,13 @@ async fn main() -> Result<()> {
 
     reload::spawn(Arc::clone(&config));
 
+    // If the daemon booted dormant because GitLab was unreachable, retry the
+    // connection in the background with exponential backoff. A successful
+    // reconnect flips the shared session to `Connected`, which drains the retry
+    // queue and resumes the refresh loops. No-op when already connected or when
+    // dormancy needs the user (bad token / logged out).
+    reconnect::spawn(Arc::clone(&handlers));
+
     let listener = server::make_listener(&socket)?;
 
     let (quick_interval, slow_interval) = {
@@ -120,8 +128,7 @@ async fn main() -> Result<()> {
         let handlers_ref = Arc::clone(&handlers);
         tokio::spawn(async move {
             info!("startup cache warm-up triggered");
-            handlers_ref.refresh_cache().await;
-            handlers_ref.backfill_history().await;
+            handlers_ref.warm_up().await;
         });
     }
 

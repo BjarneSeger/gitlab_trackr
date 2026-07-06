@@ -7,15 +7,16 @@
 //! moves the task to a persistent dead-letter store, surfaced via `tt queue`.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
-use crate::config::SharedConfig;
+use crate::config::{SharedConfig, next_backoff};
 use crate::db::KvStore;
 use crate::error::{Error, Result};
 use crate::handlers::SessionSlot;
@@ -85,6 +86,10 @@ pub struct RetryQueue {
     store: KvStore<u64, StoredTask>,
     dead_letter: KvStore<u64, StoredFailure>,
     next_id: AtomicU64,
+    /// Fired to wake the worker early while it is deferring a task for lack of a
+    /// session, so a freshly re-established connection drains the queue at once
+    /// instead of waiting out `session_wait`. See [`RetryQueue::drain_waker`].
+    drain_wake: Arc<Notify>,
 }
 
 /// A PostTime task currently in the retry queue, projected for the history view.
@@ -161,14 +166,32 @@ impl RetryQueue {
             });
         }
 
-        tokio::spawn(worker(session, store.clone(), dead_letter.clone(), rx, config));
+        let drain_wake = Arc::new(Notify::new());
+
+        tokio::spawn(worker(
+            session,
+            store.clone(),
+            dead_letter.clone(),
+            rx,
+            config,
+            Arc::clone(&drain_wake),
+        ));
 
         Ok(Self {
             sender: tx,
             store,
             dead_letter,
             next_id: AtomicU64::new(max_id + 1),
+            drain_wake,
         })
+    }
+
+    /// A handle to nudge the worker awake while it is deferring for lack of a
+    /// session. The background reconnect task fires this the instant it flips the
+    /// session back to `Connected`, so deferred writes flush immediately rather
+    /// than after the next `session_wait` tick.
+    pub fn drain_waker(&self) -> Arc<Notify> {
+        Arc::clone(&self.drain_wake)
     }
 
     /// Persist a `PostTime` task to disk and hand it to the background worker.
@@ -344,6 +367,7 @@ async fn worker(
     dead_letter: KvStore<u64, StoredFailure>,
     mut rx: mpsc::Receiver<QueuedTask>,
     config: SharedConfig,
+    drain_wake: Arc<Notify>,
 ) {
     while let Some(task) = rx.recv().await {
         let mut delay = config.read().unwrap().queue.base_delay();
@@ -352,7 +376,12 @@ async fn worker(
         // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
         let failure: Option<String> = 'retry: loop {
             attempt += 1;
-            let gitlab = match session.read().await.gitlab() {
+            // Bind the clone in its own statement so the read guard is released
+            // here — not held across the `select!` below or the API call. A
+            // guard held across the defer would block every session *writer*
+            // (the reconnect commit, `tt login`) for up to `session_wait`.
+            let current = session.read().await.gitlab();
+            let gitlab = match current {
                 Some(g) => g,
                 None => {
                     warn!(
@@ -363,7 +392,15 @@ async fn worker(
                         "no active session; deferring task"
                     );
                     let session_wait = config.read().unwrap().queue.session_wait();
-                    tokio::time::sleep(session_wait).await;
+                    // Wake early if a reconnect re-established the session, so a
+                    // deferred task flushes at once instead of waiting out the
+                    // full interval. The waker uses `notify_one`, which leaves a
+                    // permit if we haven't parked here yet — so a nudge fired the
+                    // instant before this `select!` is still delivered on entry.
+                    tokio::select! {
+                        _ = tokio::time::sleep(session_wait) => {}
+                        _ = drain_wake.notified() => {}
+                    }
                     continue 'retry;
                 }
             };
@@ -449,7 +486,8 @@ async fn worker(
                         "task network error, retrying"
                     );
                     tokio::time::sleep(sleep).await;
-                    delay = (delay * 2).min(config.read().unwrap().queue.max_delay());
+                    let max = config.read().unwrap().queue.max_delay();
+                    delay = next_backoff(delay, max);
                 }
                 Err(e) => {
                     error!(
@@ -737,7 +775,15 @@ mod tests {
             })));
         let (tx, rx) = mpsc::channel(8);
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-        let handle = tokio::spawn(worker(session, store, dead_letter.clone(), rx, config));
+        let drain_wake = Arc::new(Notify::new());
+        let handle = tokio::spawn(worker(
+            session,
+            store,
+            dead_letter.clone(),
+            rx,
+            config,
+            drain_wake,
+        ));
         tx.send(task).await.unwrap();
         drop(tx);
         handle.await.unwrap();
@@ -791,6 +837,85 @@ mod tests {
         assert!(
             snapshot_pending(&s).unwrap().is_empty(),
             "task removed after success"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_defers_while_dormant_then_drains_on_reconnect_nudge() {
+        let (s, _td) = store();
+        s.put(1, post_task(7, 100)).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dead_letter =
+            KvStore::open(&dir.path().join("dead_letter.redb"), DEAD_LETTER_TABLE).unwrap();
+
+        // Start dormant so the task can't run yet. `session_wait` is set to an
+        // hour so the defer branch's timeout can't possibly fire during the test:
+        // the only thing that can wake the worker in time is the reconnect nudge,
+        // so if the nudge regresses this test hangs and the `timeout` below fails.
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(
+            DormancyReason::NoCredentials,
+        )));
+        let mut cfg = crate::config::defaults();
+        cfg.queue.session_wait_secs = 3600;
+        let config = Arc::new(std::sync::RwLock::new(cfg));
+        let drain_wake = Arc::new(Notify::new());
+
+        let gitlab = Arc::new(FakeGitlab::default());
+        gitlab.push_add_spent_time(Ok(()));
+
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::spawn(worker(
+            session.clone(),
+            s.clone(),
+            dead_letter,
+            rx,
+            config,
+            Arc::clone(&drain_wake),
+        ));
+
+        tx.send(QueuedTask {
+            id: 1,
+            project_id: 7,
+            issue_iid: 7,
+            op: QueueOp::PostTime {
+                duration: "1h".into(),
+                summary: None,
+                issue_id: None,
+            },
+            queued_at_secs: 100,
+        })
+        .await
+        .unwrap();
+
+        // Give the worker a beat to reach the defer branch, then "reconnect":
+        // flip the session live and nudge the worker to drain immediately.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        *session.write().await = ConnState::Connected(Session {
+            gitlab: gitlab.clone(),
+            host: "test".into(),
+            user_id: 0,
+        });
+        drain_wake.notify_one();
+        drop(tx);
+
+        // The worker must drain via the nudge, not the (1-hour) session_wait
+        // timeout: bound the join so a lost wakeup fails the test instead of
+        // hanging it. With the nudge working this completes in well under a ms.
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("worker drained via the reconnect nudge, not the session_wait timeout")
+            .unwrap();
+
+        assert_eq!(
+            gitlab
+                .add_spent_time_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            snapshot_pending(&s).unwrap().is_empty(),
+            "deferred task drained after reconnect"
         );
     }
 

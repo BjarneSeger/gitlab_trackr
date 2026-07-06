@@ -6,6 +6,7 @@
 //! `serde_json::Value`.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::time::Duration;
 
 use gitlab::api::{AsyncQuery, UrlBase};
@@ -151,6 +152,45 @@ impl GitlabClient {
             host: host.to_string(),
             current_user_id,
         })
+    }
+
+    /// Like [`GitlabClient::connect`], but retries transient (network) failures
+    /// with bounded exponential back-off (see [`retry_transient`]). A permanent
+    /// rejection (a bad token) fails immediately without retrying. Used by the
+    /// interactive `Login` handler so a momentary blip doesn't fail the command.
+    pub async fn connect_with_retry(host: &str, token: &str) -> Result<Self> {
+        retry_transient("login connect", || Self::connect(host, token)).await
+    }
+}
+
+/// Run `op` with bounded exponential back-off on transient (network) failures:
+/// up to four attempts, sleeping 1 s → 2 s → 4 s between them. A permanent error
+/// returns immediately. Shared by `connect_with_retry` and `run_issues_query`.
+///
+/// Takes a future *factory* (`FnMut() -> Future`) rather than an async closure so
+/// the produced future has a single concrete type — an `impl AsyncFnMut` here
+/// yields a per-call future whose `Send`-ness isn't general enough for the
+/// `#[instrument]` callers.
+pub(crate) async fn retry_transient<T, Fut>(
+    op: &str,
+    mut f: impl FnMut() -> Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    let mut delay = Duration::from_secs(1);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e @ Error::Transient(_)) if attempt < 4 => {
+                warn!(attempt, error = %e, delay_secs = delay.as_secs(), op, "transient failure, retrying");
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(4));
+            }
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -383,30 +423,19 @@ impl GitlabApi for GitlabClient {
     }
 }
 
-/// Run `query` against `client`, retrying up to three times on transient errors
-/// with exponential back-off (1 s → 2 s → 4 s).
+/// Run `query` against `client`, retrying transient errors with exponential
+/// back-off (see [`retry_transient`]).
 async fn run_issues_query<Q>(client: &gitlab::AsyncGitlab, query: Q) -> Result<Vec<IssueWithLabels>>
 where
     Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
 {
-    let mut delay = Duration::from_secs(1);
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match query.query_async(client).await.map_err(classify) {
-            Ok(raw) => {
-                let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
-                info!(count = issues.len(), "fetched issues from GitLab");
-                return Ok(issues);
-            }
-            Err(e @ Error::Transient(_)) if attempt < 4 => {
-                warn!(attempt, error = %e, delay_secs = delay.as_secs(), "fetch failed, retrying");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(4));
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let raw = retry_transient("fetch issues", || async {
+        query.query_async(client).await.map_err(classify)
+    })
+    .await?;
+    let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
+    info!(count = issues.len(), "fetched issues from GitLab");
+    Ok(issues)
 }
 
 /// Map a GitLab API error to [`Error::Transient`] for network failures and

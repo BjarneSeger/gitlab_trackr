@@ -172,6 +172,16 @@ impl Handlers {
         self.prune_history();
     }
 
+    /// Warm the caches from scratch: refresh issues/boards, then backfill the
+    /// full history window. Order matters — history enrichment reads project IDs
+    /// from the issue cache, so issues must land first. Both steps are no-ops
+    /// while dormant. Shared by the startup warm-up, the post-reconnect recovery,
+    /// and the full cache-clear refill.
+    pub async fn warm_up(&self) {
+        self.refresh_cache().await;
+        self.backfill_history().await;
+    }
+
     /// Pull the user's GitLab timelogs spanning `window` back from now, enrich
     /// with cached issue data, and store. Best-effort — each step's failure is
     /// logged and swallowed. Pruning is a separate step (see [`Self::prune_history`])
@@ -403,11 +413,9 @@ impl VarlinkInterface for Handlers {
         // only happens at startup). Skipped when dormant.
         if let Ok(gitlab) = self.gitlab().await {
             if all {
-                // Full wipe: warm issues/boards first (history enrichment reads
-                // project IDs from the issue cache), then backfill every band —
-                // exactly the startup sequence.
-                self.refresh_cache().await;
-                self.backfill_history().await;
+                // Full wipe: re-run the startup warm-up (issues/boards, then the
+                // full history backfill) to repopulate every band at once.
+                self.warm_up().await;
             } else if want("stale") {
                 // The retention window subsumes the narrower tiers.
                 let retention = self.config.read().unwrap().history.retention();
@@ -719,7 +727,7 @@ impl VarlinkInterface for Handlers {
         host: String,
         token: String,
     ) -> varlink::Result<()> {
-        let client = match GitlabClient::connect(&host, &token).await {
+        let client = match GitlabClient::connect_with_retry(&host, &token).await {
             Ok(c) => c,
             Err(e) => {
                 warn!(error = %e, host, "Login: GitLab rejected the token");
@@ -737,6 +745,11 @@ impl VarlinkInterface for Handlers {
         let session = Session::from_client(client);
         info!(host, user_id = session.user_id, "logged in");
         *self.session.write().await = ConnState::Connected(session);
+        // Drain any writes deferred during the dormancy at once, rather than
+        // making them wait out the queue worker's `session_wait` tick — the same
+        // nudge the background reconnect fires. `notify_one` leaves a permit if
+        // the worker hasn't parked yet, so it can't be lost.
+        self.queue.drain_waker().notify_one();
         call.reply()
     }
 

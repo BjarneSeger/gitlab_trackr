@@ -105,6 +105,17 @@ impl DormancyReason {
             },
         }
     }
+
+    /// Whether the daemon should keep retrying the connection on its own.
+    ///
+    /// Only a transient network failure (`Unreachable`) is worth auto-retrying:
+    /// the credentials are known-good and the outage is expected to clear. Every
+    /// other reason needs the user to act — `tt login` after a `TokenRejected` /
+    /// `NoCredentials` / `LoggedOut`, or fixing the keychain — so retrying would
+    /// just spin. Consumed by the background reconnect task (see `reconnect`).
+    pub fn is_auto_retryable(&self) -> bool {
+        matches!(self, Self::Unreachable { .. })
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +163,27 @@ mod tests {
         let k = DormancyReason::KeychainError("boom".into());
         assert_eq!(k.reason(), NotAuthReason::keychain_error);
         assert_eq!(k.detail().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn only_unreachable_is_auto_retryable() {
+        let host = "gitlab.example.com".to_string();
+        assert!(
+            DormancyReason::Unreachable {
+                host: host.clone(),
+                detail: "connection refused".into(),
+            }
+            .is_auto_retryable()
+        );
+        assert!(
+            !DormancyReason::TokenRejected {
+                host,
+                detail: "401".into(),
+            }
+            .is_auto_retryable()
+        );
+        assert!(!DormancyReason::NoCredentials.is_auto_retryable());
+        assert!(!DormancyReason::KeychainError("boom".into()).is_auto_retryable());
+        assert!(!DormancyReason::LoggedOut.is_auto_retryable());
     }
 }
