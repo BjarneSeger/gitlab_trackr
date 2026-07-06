@@ -21,9 +21,9 @@ mod service;
 
 use boards::BoardCache;
 use cache::IssueCache;
-use error::Result;
+use error::{DormancyReason, Result};
 use gitlab::GitlabClient;
-use handlers::{Handlers, Session, SessionSlot};
+use handlers::{ConnState, Handlers, Session, SessionSlot};
 use history::HistoryCache;
 use queue::RetryQueue;
 use service::ServiceHandler;
@@ -49,30 +49,32 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "~/.local/share".into())
         .join("gitlab-trackrd/cache.redb");
 
-    let session: SessionSlot = Arc::new(RwLock::new(None));
-
-    // Credentials come only from the OS keychain (set via `tt login`).
-    let initial = match secrets::load().await {
-        Ok(opt) => opt,
+    // Credentials come only from the OS keychain (set via `tt login`). The
+    // daemon never refuses to start: any failure here leaves it *dormant*
+    // (serving, but returning `NotAuthenticated`). The dormancy reason is kept
+    // in the session slot so the CLI can report a specific cause.
+    let initial: ConnState = match secrets::load().await {
         Err(e) => {
             warn!(error = %e, "keychain read failed; starting dormant");
-            None
+            ConnState::Dormant(DormancyReason::KeychainError(e.to_string()))
         }
-    };
-    if let Some(c) = initial {
-        match GitlabClient::connect(&c.host, &c.token).await {
+        Ok(None) => {
+            info!("no credentials available; daemon starting dormant (run `tt login`)");
+            ConnState::Dormant(DormancyReason::NoCredentials)
+        }
+        Ok(Some(c)) => match GitlabClient::connect(&c.host, &c.token).await {
             Ok(client) => {
                 let s = Session::from_client(client);
                 info!(host = %s.host, user_id = s.user_id, "initial GitLab connection ready");
-                *session.write().await = Some(s);
+                ConnState::Connected(s)
             }
             Err(e) => {
-                warn!(error = %e, host = %c.host, "initial GitLab connection failed; daemon starting dormant")
+                warn!(error = %e, host = %c.host, "initial GitLab connection failed; daemon starting dormant");
+                ConnState::Dormant(DormancyReason::from_connect_error(&c.host, &e))
             }
-        }
-    } else {
-        info!("no credentials available; daemon starting dormant (run `tt login`)");
-    }
+        },
+    };
+    let session: SessionSlot = Arc::new(RwLock::new(initial));
 
     let cache = Arc::new(IssueCache::open(&db_path)?);
     let boards_db_path = db_path.with_file_name("boards.redb");

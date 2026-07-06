@@ -21,7 +21,7 @@ pub async fn run(iid: i64, project_id: Option<i64>) -> Result<()> {
         .close_issue(project_id, iid)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("CloseIssue failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("CloseIssue", e))?;
 
     println!("closed !{iid} (project {project_id})");
     Ok(())

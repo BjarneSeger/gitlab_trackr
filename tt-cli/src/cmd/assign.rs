@@ -21,7 +21,7 @@ pub async fn run(iid: i64, project_id: Option<i64>) -> Result<()> {
         .assign_self(project_id, iid)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("AssignSelf failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("AssignSelf", e))?;
 
     println!("assigned to !{iid} (project {project_id})");
     Ok(())

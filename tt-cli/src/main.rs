@@ -21,6 +21,7 @@ mod cli;
 mod client;
 mod cmd;
 mod config;
+mod friendly;
 mod state;
 
 use cli::{Cli, Command};

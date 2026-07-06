@@ -57,7 +57,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         .get_assigned_issues(None)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("GetAssignedIssues failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?;
 
     if reply.issues.is_empty() {
         println!("no assigned issues");
@@ -110,7 +110,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         .post_time(issue.project_id, issue.iid, duration.clone(), summary)
         .call()
         .await
-        .map_err(|e| anyhow::anyhow!("PostTime failed: {e}"))?;
+        .map_err(|e| crate::friendly::friendly("PostTime", e))?;
 
     let mut st = state::load().unwrap_or_default();
     st.last_issue = Some(state::LastIssue {

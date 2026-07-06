@@ -15,13 +15,13 @@ use gitlab_trackr_api::{
     Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_CloseIssue, Call_DismissFailure,
     Call_GetAssignedIssues, Call_GetFailures, Call_GetHistory, Call_Login, Call_Logout,
     Call_PostTime, Call_RetryFailure, Call_UnassignSelf, Call_WhoAmI, FailedTask, HistoryEvent,
-    Issue, VarlinkInterface,
+    Issue, NotAuthReason, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::config::SharedConfig;
-use crate::error::{Error, Result};
+use crate::error::{DormancyReason, Error};
 use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
 use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
@@ -48,9 +48,28 @@ impl Session {
     }
 }
 
-/// Slot the daemon shares between the handlers, the retry queue, and the
-/// background refresh task. `None` ⇒ dormant (no GitLab connection yet).
-pub type SessionSlot = Arc<RwLock<Option<Session>>>;
+/// Connection state the daemon shares between the handlers, the retry queue,
+/// and the background refresh task.
+///
+/// `Dormant` carries *why* there is no session (see [`DormancyReason`]) so the
+/// CLI can report a specific cause instead of a bare "not authenticated".
+pub enum ConnState {
+    Connected(Session),
+    Dormant(DormancyReason),
+}
+
+impl ConnState {
+    /// The live GitLab client, if connected. Used by the retry-queue worker,
+    /// which only needs the client and treats any dormant state as "defer".
+    pub fn gitlab(&self) -> Option<Arc<dyn GitlabApi>> {
+        match self {
+            Self::Connected(s) => Some(s.gitlab.clone()),
+            Self::Dormant(_) => None,
+        }
+    }
+}
+
+pub type SessionSlot = Arc<RwLock<ConnState>>;
 
 pub struct Handlers {
     pub session: SessionSlot,
@@ -64,24 +83,31 @@ pub struct Handlers {
 }
 
 impl Handlers {
-    /// Resolve the live GitLab client or return `NotAuthenticated`.
-    async fn gitlab(&self) -> Result<Arc<dyn GitlabApi>> {
-        self.session
-            .read()
-            .await
-            .as_ref()
-            .map(|s| s.gitlab.clone())
-            .ok_or(Error::NotAuthenticated)
+    /// Resolve the live GitLab client, or `NotAuthenticated` carrying the
+    /// dormancy reason.
+    async fn gitlab(&self) -> std::result::Result<Arc<dyn GitlabApi>, DormancyReason> {
+        match &*self.session.read().await {
+            ConnState::Connected(s) => Ok(s.gitlab.clone()),
+            ConnState::Dormant(r) => Err(r.clone()),
+        }
     }
 
-    /// Resolve the full session or return `NotAuthenticated`.
-    async fn current_session(&self) -> Result<Session> {
-        self.session
-            .read()
-            .await
-            .clone()
-            .ok_or(Error::NotAuthenticated)
+    /// Resolve the full session, or `NotAuthenticated` carrying the dormancy
+    /// reason.
+    async fn current_session(&self) -> std::result::Result<Session, DormancyReason> {
+        match &*self.session.read().await {
+            ConnState::Connected(s) => Ok(s.clone()),
+            ConnState::Dormant(r) => Err(r.clone()),
+        }
     }
+}
+
+/// Extract the varlink `(reason, detail)` pair from a dormancy error so the six
+/// `reply_not_authenticated` sites don't each repeat the match. The error is
+/// always `NotAuthenticated` here (all `gitlab()`/`current_session()` yield);
+/// the fallback is purely defensive.
+fn dormant_args(reason: &DormancyReason) -> (Option<NotAuthReason>, Option<String>) {
+    (Some(reason.reason()), reason.detail())
 }
 
 impl Handlers {
@@ -285,7 +311,10 @@ impl VarlinkInterface for Handlers {
 
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(_) => return call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                return call.reply_not_authenticated(reason, detail);
+            }
         };
 
         let fetched = if let Some(groups) = groups {
@@ -409,7 +438,10 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(_) => return call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                return call.reply_not_authenticated(reason, detail);
+            }
         };
         match gitlab
             .add_spent_time(project_id, issue_iid, &duration, summary.as_deref())
@@ -582,7 +614,10 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(_) => return call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                return call.reply_not_authenticated(reason, detail);
+            }
         };
         match gitlab.close_issue(project_id, issue_iid).await {
             Ok(()) => {
@@ -615,7 +650,10 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(_) => return call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                return call.reply_not_authenticated(reason, detail);
+            }
         };
         match gitlab.assign_self(project_id, issue_iid).await {
             Ok(()) => {
@@ -646,7 +684,10 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
-            Err(_) => return call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                return call.reply_not_authenticated(reason, detail);
+            }
         };
         match gitlab.unassign_self(project_id, issue_iid).await {
             Ok(()) => {
@@ -691,13 +732,13 @@ impl VarlinkInterface for Handlers {
         }
         let session = Session::from_client(client);
         info!(host, user_id = session.user_id, "logged in");
-        *self.session.write().await = Some(session);
+        *self.session.write().await = ConnState::Connected(session);
         call.reply()
     }
 
     #[instrument(skip(self, call))]
     async fn logout(&self, call: &mut dyn Call_Logout) -> varlink::Result<()> {
-        *self.session.write().await = None;
+        *self.session.write().await = ConnState::Dormant(DormancyReason::LoggedOut);
         if let Err(e) = secrets::delete().await {
             warn!(error = %e, "Logout: keychain delete failed");
             return call.reply_gitlab_error(format!("keychain delete failed: {e}"));
@@ -710,7 +751,10 @@ impl VarlinkInterface for Handlers {
     async fn who_am_i(&self, call: &mut dyn Call_WhoAmI) -> varlink::Result<()> {
         match self.current_session().await {
             Ok(s) => call.reply(s.host, s.user_id),
-            Err(_) => call.reply_not_authenticated(),
+            Err(e) => {
+                let (reason, detail) = dormant_args(&e);
+                call.reply_not_authenticated(reason, detail)
+            }
         }
     }
 }
@@ -1115,17 +1159,15 @@ mod tests {
     fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let p = |name: &str| dir.path().join(name);
-        let session: SessionSlot = Arc::new(RwLock::new(None));
+        let session: SessionSlot = Arc::new(RwLock::new(ConnState::Dormant(
+            DormancyReason::NoCredentials,
+        )));
         let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
         let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
         let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
         let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-        let queue = RetryQueue::new(
-            Arc::clone(&session),
-            &p("queue.redb"),
-            Arc::clone(&config),
-        )
-        .unwrap();
+        let queue =
+            RetryQueue::new(Arc::clone(&session), &p("queue.redb"), Arc::clone(&config)).unwrap();
         (
             Handlers {
                 session,

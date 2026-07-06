@@ -352,7 +352,7 @@ async fn worker(
         // `None` ⇒ succeeded; `Some(msg)` ⇒ gave up and should be dead-lettered.
         let failure: Option<String> = 'retry: loop {
             attempt += 1;
-            let gitlab = match session.read().await.as_ref().map(|s| s.gitlab.clone()) {
+            let gitlab = match session.read().await.gitlab() {
                 Some(g) => g,
                 None => {
                     warn!(
@@ -529,9 +529,10 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::DormancyReason;
     use crate::error::Result as TrackrResult;
     use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
-    use crate::handlers::Session;
+    use crate::handlers::{ConnState, Session};
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -731,11 +732,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dead_letter =
             KvStore::open(&dir.path().join("dead_letter.redb"), DEAD_LETTER_TABLE).unwrap();
-        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(Some(Session {
-            gitlab,
-            host: "test".to_string(),
-            user_id: 0,
-        })));
+        let session: SessionSlot =
+            Arc::new(tokio::sync::RwLock::new(ConnState::Connected(Session {
+                gitlab,
+                host: "test".to_string(),
+                user_id: 0,
+            })));
         let (tx, rx) = mpsc::channel(8);
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let handle = tokio::spawn(worker(session, store, dead_letter.clone(), rx, config));
@@ -951,7 +953,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Dormant session: the worker defers every task (30s sleep) instead of
         // processing it, so re-enqueued tasks stay put for assertions.
-        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
+        let session: SessionSlot =
+            Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(DormancyReason::NoCredentials)));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let q = RetryQueue::new(session, &dir.path().join("queue.redb"), config).unwrap();
         (q, dir)
@@ -1053,7 +1056,8 @@ mod tests {
                 .unwrap();
             dl.put(10, fail_entry(10)).unwrap();
         }
-        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(None));
+        let session: SessionSlot =
+            Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(DormancyReason::NoCredentials)));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let q = RetryQueue::new(session, &qpath, config).unwrap();
         assert_eq!(
