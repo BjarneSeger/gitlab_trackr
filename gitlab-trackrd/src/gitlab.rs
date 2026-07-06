@@ -140,7 +140,7 @@ impl GitlabClient {
         let inner = gitlab::GitlabBuilder::new(host.to_string(), token.to_string())
             .build_async()
             .await
-            .map_err(|e| Error::Gitlab(e.to_string()))?;
+            .map_err(classify_build)?;
 
         let user: serde_json::Value = CurrentUserEndpoint
             .query_async(&inner)
@@ -441,6 +441,26 @@ where
         Error::Transient(msg)
     } else {
         Error::Gitlab(msg)
+    }
+}
+
+/// Same split as [`classify`], but for the [`gitlab::GitlabError`] returned by
+/// `GitlabBuilder::build_async`. The builder runs an initial connection check,
+/// so an unreachable host must surface as [`Error::Transient`] (retryable) and
+/// not a permanent [`Error::Gitlab`] — otherwise `connect` reports a network
+/// outage as a rejected token.
+fn classify_build(e: gitlab::GitlabError) -> Error {
+    use gitlab::GitlabError;
+    match e {
+        // The connection check goes through the REST client, so route its
+        // ApiError through the same classifier as every other call.
+        GitlabError::Api { source } => classify(source),
+        // Transport failure or an empty reply — network-level, safe to retry.
+        e @ (GitlabError::Communication { .. } | GitlabError::NoResponse { .. }) => {
+            Error::Transient(e.to_string())
+        }
+        // URL/auth-header/HTTP-status/GraphQL/JSON failures are permanent.
+        other => Error::Gitlab(other.to_string()),
     }
 }
 
