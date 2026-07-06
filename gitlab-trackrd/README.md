@@ -22,18 +22,20 @@ annotated template with the current defaults:
 cargo run -p gitlab-trackrd --bin gen-config-template
 ```
 
+Keys are grouped into TOML tables, one per concern:
+
 | Key | Default | Description |
 |---|---|---|
-| `socket` | `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
-| `refresh_interval` | `300` | Seconds between refreshes of issues, boards, and the active history tier (last 24h). |
-| `semi_refresh_interval` | `86400` | Seconds between refreshes of the semi-active history tier (24h–30d). |
-| `active_window_hours` | `24` | Active history tier span. |
-| `semi_window_hours` | `720` | Semi-active history tier span (30 days). |
-| `stale_window_hours` | `2160` | Overall history retention (90 days); the stale band is fetched once at startup. |
-| `queue_base_delay_secs` | `1` | Retry-queue backoff initial delay. |
-| `queue_max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
-| `queue_max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
-| `queue_session_wait_secs` | `30` | Worker sleep while the daemon is dormant (no session). |
+| `[server]` `socket` | `$XDG_RUNTIME_DIR/gitlab-trackrd.socket` (falls back to `/tmp`) | Varlink Unix socket the daemon listens on. Ignored under systemd socket activation. |
+| `[refresh.quick]` `interval_secs` | `300` | Seconds between quick refreshes of issues, boards, and the recent timelog window. |
+| `[refresh.quick]` `window_hours` | `24` | How far back the quick timelog pull reaches (last 24h). Issues and boards are always fetched in full; this bounds only the timelog query. |
+| `[refresh.slow]` `interval_secs` | `86400` | Seconds between slow refreshes of the bulk timelog history (once a day). |
+| `[refresh.slow]` `window_hours` | `720` | How far back the slow timelog pull reaches (30 days). |
+| `[history]` `retention_hours` | `2160` | Total timelog history kept (90 days); fetched once at startup, anything older is pruned. Should be ≥ `refresh.slow.window_hours`. |
+| `[queue]` `base_delay_secs` | `1` | Retry-queue backoff initial delay. |
+| `[queue]` `max_delay_secs` | `1800` | Retry-queue backoff cap (30 min). |
+| `[queue]` `max_lifetime_secs` | `604800` | How long a task retries before being dead-lettered (7 days). |
+| `[queue]` `session_wait_secs` | `30` | Worker sleep while the daemon is dormant (no session). |
 
 Credentials are configured through the `org.thehoster.gitlab.trackrd.Login`
 interface or by just calling `tt login`.

@@ -136,13 +136,13 @@ impl Handlers {
             }
         }
 
-        let active_window = self.config.read().unwrap().history.active_window();
-        self.refresh_history_window(&gitlab, active_window).await;
+        let quick_window = self.config.read().unwrap().refresh.quick.window();
+        self.refresh_history_window(&gitlab, quick_window).await;
     }
 
-    /// Daily refresh of the semi-active tier (24h–30d) followed by a prune of
-    /// anything past the stale window. Acquires the session itself; no-op when
-    /// dormant. Called by the daily background loop.
+    /// Slow-tier refresh of the bulk history window followed by a prune of
+    /// anything past the retention horizon. Acquires the session itself; no-op
+    /// when dormant. Called by the daily background loop.
     pub async fn refresh_history_daily(&self) {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
@@ -151,13 +151,13 @@ impl Handlers {
                 return;
             }
         };
-        let semi_window = self.config.read().unwrap().history.semi_window();
-        self.refresh_history_window(&gitlab, semi_window).await;
+        let slow_window = self.config.read().unwrap().refresh.slow.window();
+        self.refresh_history_window(&gitlab, slow_window).await;
         self.prune_history();
     }
 
-    /// One-time backfill of the full stale window (up to 90d) so the older,
-    /// never-refreshed bands are populated. Acquires the session itself; no-op
+    /// One-time backfill of the full retention window (up to 90d) so the older,
+    /// never-refreshed history is populated. Acquires the session itself; no-op
     /// when dormant. Called once at startup and after a full cache clear.
     pub async fn backfill_history(&self) {
         let gitlab = match self.gitlab().await {
@@ -167,15 +167,15 @@ impl Handlers {
                 return;
             }
         };
-        let stale_window = self.config.read().unwrap().history.stale_window();
-        self.refresh_history_window(&gitlab, stale_window).await;
+        let retention = self.config.read().unwrap().history.retention();
+        self.refresh_history_window(&gitlab, retention).await;
         self.prune_history();
     }
 
     /// Pull the user's GitLab timelogs spanning `window` back from now, enrich
     /// with cached issue data, and store. Best-effort — each step's failure is
     /// logged and swallowed. Pruning is a separate step (see [`Self::prune_history`])
-    /// so the frequent active refresh doesn't scan the whole table every time.
+    /// so the frequent quick refresh doesn't scan the whole table every time.
     async fn refresh_history_window(&self, gitlab: &Arc<dyn GitlabApi>, window: Duration) {
         let now = now_secs();
         let cutoff = now.saturating_sub(window.as_secs());
@@ -213,10 +213,10 @@ impl Handlers {
         }
     }
 
-    /// Drop history entries that have aged past the stale window.
+    /// Drop history entries that have aged past the retention horizon.
     fn prune_history(&self) {
-        let stale_secs = self.config.read().unwrap().history.stale_window().as_secs();
-        let cutoff = now_secs().saturating_sub(stale_secs);
+        let retention_secs = self.config.read().unwrap().history.retention().as_secs();
+        let cutoff = now_secs().saturating_sub(retention_secs);
         match self.history.prune(cutoff) {
             Ok(0) => {}
             Ok(n) => info!(removed = n, "pruned stale history entries"),
@@ -365,19 +365,20 @@ impl VarlinkInterface for Handlers {
             }
         }
 
-        // History tiers. `all` wipes the whole store in one shot; individual
-        // flags clear just their `spent_at` band (active is open-ended on top,
-        // the bands abut at the active/semi window boundaries).
+        // History bands. `all` wipes the whole store in one shot; individual
+        // flags clear just their `spent_at` band (`quick` is open-ended on top;
+        // the bands abut at the quick/slow window boundaries, and `stale` covers
+        // everything older than the slow window down to retention).
         let now = now_secs();
-        let (active_secs, semi_secs) = {
+        let (quick_secs, slow_secs) = {
             let c = self.config.read().unwrap();
             (
-                c.history.active_window().as_secs(),
-                c.history.semi_window().as_secs(),
+                c.refresh.quick.window().as_secs(),
+                c.refresh.slow.window().as_secs(),
             )
         };
-        let active_start = now.saturating_sub(active_secs);
-        let semi_start = now.saturating_sub(semi_secs);
+        let quick_start = now.saturating_sub(quick_secs);
+        let slow_start = now.saturating_sub(slow_secs);
 
         if all {
             if let Err(e) = self.history.clear() {
@@ -386,38 +387,38 @@ impl VarlinkInterface for Handlers {
                 info!("history cleared");
             }
         } else {
-            if want("active") {
-                clear_band(&self.history, active_start, u64::MAX, "active");
+            if want("quick") {
+                clear_band(&self.history, quick_start, u64::MAX, "quick");
             }
-            if want("semi") {
-                clear_band(&self.history, semi_start, active_start, "semi");
+            if want("slow") {
+                clear_band(&self.history, slow_start, quick_start, "slow");
             }
             if want("stale") {
-                clear_band(&self.history, 0, semi_start, "stale");
+                clear_band(&self.history, 0, slow_start, "stale");
             }
         }
 
         // Re-fetch what we cleared so it repopulates immediately rather than
-        // waiting for the next scheduled refresh (which, for the stale tier,
+        // waiting for the next scheduled refresh (which, for the stale band,
         // only happens at startup). Skipped when dormant.
         if let Ok(gitlab) = self.gitlab().await {
             if all {
                 // Full wipe: warm issues/boards first (history enrichment reads
-                // project IDs from the issue cache), then backfill every tier —
+                // project IDs from the issue cache), then backfill every band —
                 // exactly the startup sequence.
                 self.refresh_cache().await;
                 self.backfill_history().await;
             } else if want("stale") {
-                // `stale`'s window subsumes the narrower tiers.
-                let stale_window = self.config.read().unwrap().history.stale_window();
-                self.refresh_history_window(&gitlab, stale_window).await;
+                // The retention window subsumes the narrower tiers.
+                let retention = self.config.read().unwrap().history.retention();
+                self.refresh_history_window(&gitlab, retention).await;
                 self.prune_history();
-            } else if want("semi") {
-                let semi_window = self.config.read().unwrap().history.semi_window();
-                self.refresh_history_window(&gitlab, semi_window).await;
-            } else if want("active") {
-                let active_window = self.config.read().unwrap().history.active_window();
-                self.refresh_history_window(&gitlab, active_window).await;
+            } else if want("slow") {
+                let slow_window = self.config.read().unwrap().refresh.slow.window();
+                self.refresh_history_window(&gitlab, slow_window).await;
+            } else if want("quick") {
+                let quick_window = self.config.read().unwrap().refresh.quick.window();
+                self.refresh_history_window(&gitlab, quick_window).await;
             }
         }
 
@@ -1192,14 +1193,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_cache_active_scope_only_clears_last_24h() {
+    async fn clear_cache_quick_scope_only_clears_last_24h() {
         use gitlab_trackr_api::AsyncCall;
         let (h, _dir) = dormant_handlers();
         let now = now_secs();
         h.history
             .upsert(&[
-                stored(1, now - 3_600),       // within 24h → active
-                stored(2, now - 3 * 86_400),  // 3 days → semi
+                stored(1, now - 3_600),       // within 24h → quick
+                stored(2, now - 3 * 86_400),  // 3 days → slow
                 stored(3, now - 45 * 86_400), // 45 days → stale
             ])
             .unwrap();
@@ -1207,7 +1208,7 @@ mod tests {
         let mut call = AsyncCall::default();
         h.clear_cache(
             &mut call as &mut dyn Call_ClearCache,
-            Some(vec!["active".to_string()]),
+            Some(vec!["quick".to_string()]),
         )
         .await
         .unwrap();
@@ -1219,11 +1220,7 @@ mod tests {
             .iter()
             .map(|e| e.timelog_id)
             .collect();
-        assert_eq!(
-            remaining,
-            vec![2, 3],
-            "only the active-band entry is removed"
-        );
+        assert_eq!(remaining, vec![2, 3], "only the quick-band entry is removed");
     }
 
     #[tokio::test]

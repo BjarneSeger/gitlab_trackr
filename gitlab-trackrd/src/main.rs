@@ -96,22 +96,19 @@ async fn main() -> Result<()> {
 
     let listener = server::make_listener(&socket)?;
 
-    let (active_secs, semi_secs) = {
+    let (quick_interval, slow_interval) = {
         let c = config.read().unwrap();
-        (c.refresh.active_secs, c.refresh.semi_secs)
+        (c.refresh.quick.interval_secs, c.refresh.slow.interval_secs)
     };
     if server::is_socket_activated() {
         info!(
-            refresh_interval = active_secs,
-            semi_refresh_interval = semi_secs,
-            "starting gitlab-trackrd from socket"
+            quick_interval,
+            slow_interval, "starting gitlab-trackrd from socket"
         );
     } else {
         info!(
             socket = socket,
-            refresh_interval = active_secs,
-            semi_refresh_interval = semi_secs,
-            "starting gitlab-trackrd"
+            quick_interval, slow_interval, "starting gitlab-trackrd"
         );
     }
 
@@ -128,31 +125,31 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Active tier: refresh issues, boards, and the last-24h history every
-    // `refresh.active_secs`. The interval is re-read each tick so a config
-    // reload takes effect after the current sleep.
+    // Quick tier: refresh issues, boards, and the recent history window every
+    // `refresh.quick.interval_secs`. The interval is re-read each tick so a
+    // config reload takes effect after the current sleep.
     {
         let handlers_ref = Arc::clone(&handlers);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             loop {
-                let secs = config.read().unwrap().refresh.active_secs;
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                let interval = config.read().unwrap().refresh.quick.interval();
+                tokio::time::sleep(interval).await;
                 info!("background cache refresh triggered");
                 handlers_ref.refresh_cache().await;
             }
         });
     }
 
-    // Semi-active tier: re-poll the 24h–30d history band once a day and prune
-    // anything past the stale window.
+    // Slow tier: re-poll the bulk history window once a day and prune anything
+    // past the retention horizon.
     {
         let handlers_ref = Arc::clone(&handlers);
         let config = Arc::clone(&config);
         tokio::spawn(async move {
             loop {
-                let secs = config.read().unwrap().refresh.semi_secs;
-                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                let interval = config.read().unwrap().refresh.slow.interval();
+                tokio::time::sleep(interval).await;
                 info!("daily history refresh triggered");
                 handlers_ref.refresh_history_daily().await;
             }

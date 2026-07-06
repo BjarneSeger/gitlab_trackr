@@ -1,7 +1,7 @@
 //! `tt list` — dump the daemon's view of your assigned, open issues.
 //!
-//! Hits the daemon's cache, so it's effectively free if called within the
-//! cache TTL window.
+//! Pure cache read: the daemon's background refresh owns freshness, so this just
+//! serves whatever was last synced — no fetch, effectively free.
 
 use anyhow::Result;
 use gitlab_trackr_api::VarlinkClientInterface;

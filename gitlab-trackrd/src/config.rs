@@ -46,11 +46,12 @@ pub struct Config {
     #[config(nested)]
     pub server: ServerConfig,
 
-    /// Background refresh cadence for the cache tiers.
+    /// Background refresh tiers — cadence plus timelog window for each of the
+    /// `quick` and `slow` tiers.
     #[config(nested)]
     pub refresh: RefreshConfig,
 
-    /// Timelog history retention tiers.
+    /// Timelog history retention.
     #[config(nested)]
     pub history: HistoryConfig,
 
@@ -85,51 +86,98 @@ impl ServerConfig {
     }
 }
 
-/// How often the background loops re-poll each cache tier (driven from
-/// `main.rs`).
+/// Background refresh tiers (driven from `main.rs`). Work is split by cost and
+/// volatility:
+///
+/// * `quick` — fast-changing and cheap to fetch: assigned issues, board
+///   columns, and your most recent timelogs. Polled frequently.
+/// * `slow` — the large, slow-moving body of timelog history. Polled rarely.
+///
+/// Each tier owns both its cadence (`interval_secs`) and how far back its
+/// timelog pull reaches (`window_hours`), so the two are configured together
+/// instead of split across tables. Keep the windows ordered
+/// `quick.window_hours` ≤ `slow.window_hours` ≤ `history.retention_hours`.
 #[derive(Debug, ConfiqueConfig)]
 pub struct RefreshConfig {
-    /// Seconds between active-tier refreshes (assigned issues, boards, and the
-    /// last-24h timelog history).
-    #[config(default = 300)]
-    pub active_secs: u64,
+    /// Quick tier: assigned issues, boards, and recent timelogs.
+    #[config(nested)]
+    pub quick: QuickRefreshConfig,
 
-    /// Seconds between semi-active history refreshes (the 24h–30d band). Once a
-    /// day by default.
-    #[config(default = 86400)]
-    pub semi_secs: u64,
+    /// Slow tier: the bulk of your timelog history.
+    #[config(nested)]
+    pub slow: SlowRefreshConfig,
 }
 
-/// Timelog history retention tiers, consumed by `history.rs` via `Handlers`.
+/// The `quick` refresh tier — see [`RefreshConfig`]. Its own struct (rather than
+/// a shared tier type) because confique bakes `#[config(default)]` per type, and
+/// the two tiers ship different defaults.
+#[derive(Debug, ConfiqueConfig)]
+pub struct QuickRefreshConfig {
+    /// Seconds between quick refreshes (assigned issues, boards, and the most
+    /// recent timelogs). Five minutes by default.
+    #[config(default = 300)]
+    pub interval_secs: u64,
+
+    /// How far back, in hours, the quick timelog pull reaches. Issues and boards
+    /// are always fetched in full; this bounds only the timelog query. (24h by
+    /// default.)
+    #[config(default = 24)]
+    pub window_hours: u64,
+}
+
+impl QuickRefreshConfig {
+    /// Cadence between refreshes.
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_secs)
+    }
+
+    /// Timelog look-back span.
+    pub fn window(&self) -> Duration {
+        Duration::from_hours(self.window_hours)
+    }
+}
+
+/// The `slow` refresh tier — see [`RefreshConfig`]. Distinct from
+/// [`QuickRefreshConfig`] only in its defaults (see that type's note).
+#[derive(Debug, ConfiqueConfig)]
+pub struct SlowRefreshConfig {
+    /// Seconds between slow refreshes of the bulk timelog history. Once a day by
+    /// default.
+    #[config(default = 86400)]
+    pub interval_secs: u64,
+
+    /// How far back, in hours, the slow timelog pull reaches. (30 days by
+    /// default.)
+    #[config(default = 720)]
+    pub window_hours: u64,
+}
+
+impl SlowRefreshConfig {
+    /// Cadence between refreshes.
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_secs)
+    }
+
+    /// Timelog look-back span.
+    pub fn window(&self) -> Duration {
+        Duration::from_hours(self.window_hours)
+    }
+}
+
+/// Timelog history retention, consumed by `history.rs` via `Handlers`.
 #[derive(Debug, ConfiqueConfig)]
 pub struct HistoryConfig {
-    /// Active history tier, in hours: the most volatile band, re-polled every
-    /// `refresh.active_secs`.
-    #[config(default = 24)]
-    pub active_window_hours: u64,
-
-    /// Semi-active history tier, in hours: re-polled every
-    /// `refresh.semi_secs`. (30 days by default.)
-    #[config(default = 720)]
-    pub semi_window_hours: u64,
-
-    /// Overall history retention, in hours: fetched once at startup; anything
-    /// older is pruned. (90 days by default.)
+    /// Total timelog history to keep, in hours: fetched once at startup, and
+    /// anything older is pruned. Should be ≥ `refresh.slow.window_hours`.
+    /// (90 days by default.)
     #[config(default = 2160)]
-    pub stale_window_hours: u64,
+    pub retention_hours: u64,
 }
 
 impl HistoryConfig {
-    pub fn active_window(&self) -> Duration {
-        Duration::from_hours(self.active_window_hours)
-    }
-
-    pub fn semi_window(&self) -> Duration {
-        Duration::from_hours(self.semi_window_hours)
-    }
-
-    pub fn stale_window(&self) -> Duration {
-        Duration::from_hours(self.stale_window_hours)
+    /// Retention horizon: the oldest timelog kept on disk.
+    pub fn retention(&self) -> Duration {
+        Duration::from_hours(self.retention_hours)
     }
 }
 

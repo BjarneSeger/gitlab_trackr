@@ -48,11 +48,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Refresh {
-            active,
-            semi,
+            quick,
+            slow,
             stale,
             issues,
-        } => cmd::refresh::run(active, semi, stale, issues).await,
+        } => cmd::refresh::run(quick, slow, stale, issues).await,
         Command::Config { action } => {
             cmd::config::run(action);
             Ok(())

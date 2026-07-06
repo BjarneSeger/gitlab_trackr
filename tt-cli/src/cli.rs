@@ -89,16 +89,16 @@ pub enum Command {
         shell: Shell,
     },
     /// Drop the daemon's caches and re-fetch. With no flags it clears
-    /// everything (issues, boards, and all history tiers); pass tier flags to
-    /// target only those. Cleared history tiers are re-fetched immediately.
+    /// everything (issues, boards, and all history bands); pass band flags to
+    /// target only those. Cleared history bands are re-fetched immediately.
     Refresh {
-        /// Clear the active history tier (the last 24h).
+        /// Clear the quick history band (the last 24h).
         #[arg(long)]
-        active: bool,
-        /// Clear the semi-active history tier (24h–30d).
+        quick: bool,
+        /// Clear the slow history band (24h–30d).
         #[arg(long)]
-        semi: bool,
-        /// Clear the stale history tier (30d–90d).
+        slow: bool,
+        /// Clear the stale history band (30d–90d).
         #[arg(long)]
         stale: bool,
         /// Clear the assigned-issue and board caches.

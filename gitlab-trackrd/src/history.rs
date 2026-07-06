@@ -3,10 +3,10 @@
 //! Keyed by the GitLab Timelog ID so repeated polls dedupe naturally. The store
 //! holds a single set of entries spanning up to the configured retention
 //! window; the handler refresh cycle re-polls different `spent_at` bands at
-//! different cadences (the active band every few minutes, the semi-active band
-//! once a day, the rest fetched once at startup, all sized from the daemon
-//! config). [`HistoryCache::upsert`] writes whatever a poll
-//! returned and [`HistoryCache::prune`] drops anything past the stale window.
+//! different cadences (the quick band every few minutes, the slow band once a
+//! day, the rest fetched once at startup, all sized from the daemon config).
+//! [`HistoryCache::upsert`] writes whatever a poll returned and
+//! [`HistoryCache::prune`] drops anything past the retention window.
 
 use std::path::Path;
 
@@ -71,8 +71,8 @@ impl HistoryCache {
     }
 
     /// Remove every entry whose `spent_at_secs` falls in `[min_secs, max_secs)`.
-    /// Returns the number of removed entries. Used to clear a single tier:
-    /// active is `[now-24h, u64::MAX)`, semi `[now-30d, now-24h)`, stale
+    /// Returns the number of removed entries. Used to clear a single band:
+    /// quick is `[now-24h, u64::MAX)`, slow `[now-30d, now-24h)`, stale
     /// `[0, now-30d)`.
     pub fn clear_between(&self, min_secs: u64, max_secs: u64) -> Result<usize> {
         let matched: Vec<u64> = self

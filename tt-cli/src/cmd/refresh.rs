@@ -1,24 +1,24 @@
 //! `tt refresh` — drop the daemon's caches and re-fetch.
 //!
 //! With no flags this clears everything (assigned issues, boards, and all three
-//! history tiers) — use it after editing an issue in the GitLab UI when you
-//! don't want to wait out the daemon's refresh interval. The per-tier flags
-//! clear only the named caches; cleared history tiers are re-fetched right away.
+//! history bands) — use it after editing an issue in the GitLab UI when you
+//! don't want to wait out the daemon's refresh interval. The per-band flags
+//! clear only the named caches; cleared history bands are re-fetched right away.
 
 use anyhow::Result;
 use gitlab_trackr_api::VarlinkClientInterface;
 
 use crate::{client, config};
 
-pub async fn run(active: bool, semi: bool, stale: bool, issues: bool) -> Result<()> {
+pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool) -> Result<()> {
     // Collect the requested scopes. No flags ⇒ `None`, which the daemon reads
     // as "clear everything".
     let mut scope: Vec<String> = Vec::new();
-    if active {
-        scope.push("active".to_string());
+    if quick {
+        scope.push("quick".to_string());
     }
-    if semi {
-        scope.push("semi".to_string());
+    if slow {
+        scope.push("slow".to_string());
     }
     if stale {
         scope.push("stale".to_string());
