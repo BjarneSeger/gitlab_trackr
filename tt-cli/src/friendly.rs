@@ -31,7 +31,7 @@ fn message_for(reason: Option<&str>, detail: Option<&str>) -> String {
         }
         Some("unreachable") => {
             "Can't reach GitLab — the daemon is not connected. \
-             Run `tt login` once GitLab is reachable (or restart the daemon)."
+             Restart the daemon once a connection can be established."
         }
         Some("keychain-error") => {
             "Couldn't read your saved credentials from the keychain. \
@@ -68,7 +68,10 @@ mod tests {
 
     #[test]
     fn detail_is_appended_when_present() {
-        let m = message_for(Some("unreachable"), Some("gitlab.example.com: connection refused"));
+        let m = message_for(
+            Some("unreachable"),
+            Some("gitlab.example.com: connection refused"),
+        );
         assert!(m.ends_with("(gitlab.example.com: connection refused)"));
         // An empty detail is ignored rather than rendered as "()".
         assert!(!message_for(Some("unreachable"), Some("")).ends_with("()"));
