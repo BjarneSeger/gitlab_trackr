@@ -130,7 +130,7 @@ mod tests {
         assert_eq!(r.code(), "token-rejected");
         assert_eq!(
             r.detail().as_deref(),
-            Some("gitlab.example.com: 401 Unauthorized")
+            Some("gitlab.example.com: GitLab error: 401 Unauthorized")
         );
     }
 
