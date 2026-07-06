@@ -60,10 +60,7 @@ pub struct FetchedTimelog {
 /// [`GitlabClient`].
 #[async_trait::async_trait]
 pub trait GitlabApi: Send + Sync {
-    async fn fetch_assigned_issues(
-        &self,
-        group: Option<String>,
-    ) -> Result<Vec<IssueWithLabels>>;
+    async fn fetch_assigned_issues(&self, group: Option<String>) -> Result<Vec<IssueWithLabels>>;
 
     async fn fetch_group_issues(&self, groups: Vec<String>) -> Result<Vec<IssueWithLabels>>;
 
@@ -165,10 +162,7 @@ impl GitlabApi for GitlabClient {
     ///
     /// Retries up to three times on transient network errors with exponential backoff.
     #[instrument(skip(self))]
-    async fn fetch_assigned_issues(
-        &self,
-        group: Option<String>,
-    ) -> Result<Vec<IssueWithLabels>> {
+    async fn fetch_assigned_issues(&self, group: Option<String>) -> Result<Vec<IssueWithLabels>> {
         use gitlab::api::issues::{GroupIssues, IssueScope, IssueState, Issues};
 
         if let Some(group) = group {
@@ -357,13 +351,15 @@ impl GitlabApi for GitlabClient {
     /// Add the authenticated user to the issue's `assignee_ids` list.
     #[instrument(skip(self))]
     async fn assign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
-        self.mutate_self_assignment(project_id, issue_iid, true).await
+        self.mutate_self_assignment(project_id, issue_iid, true)
+            .await
     }
 
     /// Remove the authenticated user from the issue's `assignee_ids` list.
     #[instrument(skip(self))]
     async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
-        self.mutate_self_assignment(project_id, issue_iid, false).await
+        self.mutate_self_assignment(project_id, issue_iid, false)
+            .await
     }
 
     /// Collect the label names of every list across every board in `project_id`.
@@ -402,10 +398,7 @@ impl GitlabApi for GitlabClient {
 
 /// Run `query` against `client`, retrying up to three times on transient errors
 /// with exponential back-off (1 s → 2 s → 4 s).
-async fn run_issues_query<Q>(
-    client: &gitlab::AsyncGitlab,
-    query: Q,
-) -> Result<Vec<IssueWithLabels>>
+async fn run_issues_query<Q>(client: &gitlab::AsyncGitlab, query: Q) -> Result<Vec<IssueWithLabels>>
 where
     Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
 {
@@ -638,7 +631,13 @@ fn compute_new_assignees(current: &[i64], self_id: i64, add: bool) -> Option<Vec
         out.push(self_id);
         Some(out)
     } else {
-        Some(current.iter().copied().filter(|id| *id != self_id).collect())
+        Some(
+            current
+                .iter()
+                .copied()
+                .filter(|id| *id != self_id)
+                .collect(),
+        )
     }
 }
 
@@ -860,7 +859,10 @@ mod tests {
         assert_eq!(r.issue.state, "opened");
         assert_eq!(r.issue.parent, "https://example.com/epics/1");
         assert_eq!(r.issue.total_time, "2h");
-        assert!(r.issue.graph_status.is_empty(), "graph_status is filled later");
+        assert!(
+            r.issue.graph_status.is_empty(),
+            "graph_status is filled later"
+        );
         assert_eq!(r.labels, vec!["bug".to_string(), "high".to_string()]);
     }
 
@@ -881,10 +883,7 @@ mod tests {
 
     #[test]
     fn compute_new_assignees_add_when_absent() {
-        assert_eq!(
-            compute_new_assignees(&[1, 2], 5, true),
-            Some(vec![1, 2, 5])
-        );
+        assert_eq!(compute_new_assignees(&[1, 2], 5, true), Some(vec![1, 2, 5]));
     }
 
     #[test]

@@ -12,12 +12,6 @@ pub enum Error {
     #[error("network error: {0}")]
     Transient(String),
 
-    /// The daemon is running but not connected to GitLab. Carries the reason
-    /// so the CLI can surface a specific, actionable message rather than a bare
-    /// "not authenticated" (see [`DormancyReason`]).
-    #[error("not authenticated ({})", .0.code())]
-    NotAuthenticated(DormancyReason),
-
     #[error("secret store: {0}")]
     Secrets(String),
 
@@ -102,11 +96,7 @@ impl DormancyReason {
                 host: host.to_string(),
                 detail: detail.clone(),
             },
-            Error::Gitlab(detail) => Self::TokenRejected {
-                host: host.to_string(),
-                detail: detail.clone(),
-            },
-            other => Self::Unreachable {
+            other => Self::TokenRejected {
                 host: host.to_string(),
                 detail: other.to_string(),
             },

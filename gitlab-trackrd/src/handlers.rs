@@ -21,7 +21,7 @@ use gitlab_trackr_api::{
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::config::SharedConfig;
-use crate::error::{DormancyReason, Error, Result};
+use crate::error::{DormancyReason, Error};
 use crate::gitlab::{FetchedTimelog, GitlabApi, GitlabClient, IssueWithLabels};
 use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
@@ -85,19 +85,19 @@ pub struct Handlers {
 impl Handlers {
     /// Resolve the live GitLab client, or `NotAuthenticated` carrying the
     /// dormancy reason.
-    async fn gitlab(&self) -> Result<Arc<dyn GitlabApi>> {
+    async fn gitlab(&self) -> std::result::Result<Arc<dyn GitlabApi>, DormancyReason> {
         match &*self.session.read().await {
             ConnState::Connected(s) => Ok(s.gitlab.clone()),
-            ConnState::Dormant(r) => Err(Error::NotAuthenticated(r.clone())),
+            ConnState::Dormant(r) => Err(r.clone()),
         }
     }
 
     /// Resolve the full session, or `NotAuthenticated` carrying the dormancy
     /// reason.
-    async fn current_session(&self) -> Result<Session> {
+    async fn current_session(&self) -> std::result::Result<Session, DormancyReason> {
         match &*self.session.read().await {
             ConnState::Connected(s) => Ok(s.clone()),
-            ConnState::Dormant(r) => Err(Error::NotAuthenticated(r.clone())),
+            ConnState::Dormant(r) => Err(r.clone()),
         }
     }
 }
@@ -106,11 +106,7 @@ impl Handlers {
 /// `reply_not_authenticated` sites don't each repeat the match. The error is
 /// always `NotAuthenticated` here (all `gitlab()`/`current_session()` yield);
 /// the fallback is purely defensive.
-fn dormant_args(err: Error) -> (Option<String>, Option<String>) {
-    let reason = match err {
-        Error::NotAuthenticated(r) => r,
-        _ => DormancyReason::NoCredentials,
-    };
+fn dormant_args(reason: &DormancyReason) -> (Option<String>, Option<String>) {
     (Some(reason.code().to_string()), reason.detail())
 }
 
@@ -316,7 +312,7 @@ impl VarlinkInterface for Handlers {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
             }
         };
@@ -443,7 +439,7 @@ impl VarlinkInterface for Handlers {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
             }
         };
@@ -619,7 +615,7 @@ impl VarlinkInterface for Handlers {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
             }
         };
@@ -655,7 +651,7 @@ impl VarlinkInterface for Handlers {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
             }
         };
@@ -689,7 +685,7 @@ impl VarlinkInterface for Handlers {
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
             }
         };
@@ -756,7 +752,7 @@ impl VarlinkInterface for Handlers {
         match self.current_session().await {
             Ok(s) => call.reply(s.host, s.user_id),
             Err(e) => {
-                let (reason, detail) = dormant_args(e);
+                let (reason, detail) = dormant_args(&e);
                 call.reply_not_authenticated(reason, detail)
             }
         }
@@ -1163,18 +1159,15 @@ mod tests {
     fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let p = |name: &str| dir.path().join(name);
-        let session: SessionSlot =
-            Arc::new(RwLock::new(ConnState::Dormant(DormancyReason::NoCredentials)));
+        let session: SessionSlot = Arc::new(RwLock::new(ConnState::Dormant(
+            DormancyReason::NoCredentials,
+        )));
         let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
         let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
         let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
         let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-        let queue = RetryQueue::new(
-            Arc::clone(&session),
-            &p("queue.redb"),
-            Arc::clone(&config),
-        )
-        .unwrap();
+        let queue =
+            RetryQueue::new(Arc::clone(&session), &p("queue.redb"), Arc::clone(&config)).unwrap();
         (
             Handlers {
                 session,
