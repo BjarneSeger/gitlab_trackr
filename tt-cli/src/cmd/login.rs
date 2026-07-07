@@ -17,9 +17,7 @@ pub async fn run(host: String) -> Result<()> {
     );
 
     println!("Opening {url}");
-    println!(
-        "Generate a token with the `api` and `read_user` scopes, then paste it below."
-    );
+    println!("Generate a token with the `api` and `read_user` scopes, then paste it below.");
     if let Err(e) = open::that(&url) {
         eprintln!("(couldn't open browser automatically: {e})");
         eprintln!("Open the URL above manually.");

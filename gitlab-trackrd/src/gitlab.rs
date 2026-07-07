@@ -171,10 +171,7 @@ impl GitlabClient {
 /// the produced future has a single concrete type — an `impl AsyncFnMut` here
 /// yields a per-call future whose `Send`-ness isn't general enough for the
 /// `#[instrument]` callers.
-pub(crate) async fn retry_transient<T, Fut>(
-    op: &str,
-    mut f: impl FnMut() -> Fut,
-) -> Result<T>
+pub(crate) async fn retry_transient<T, Fut>(op: &str, mut f: impl FnMut() -> Fut) -> Result<T>
 where
     Fut: Future<Output = Result<T>>,
 {

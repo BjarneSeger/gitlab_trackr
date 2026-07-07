@@ -540,7 +540,10 @@ impl VarlinkInterface for Handlers {
             // failing the command. Every other dormant reason needs the user, so
             // those still reject.
             Err(DormancyReason::Unreachable { .. }) => {
-                info!(project_id, issue_iid, "PostTime while unreachable, queuing for retry");
+                info!(
+                    project_id,
+                    issue_iid, "PostTime while unreachable, queuing for retry"
+                );
                 self.defer_post_time(project_id, issue_iid, duration, summary)
                     .await;
                 return call.reply();
@@ -717,7 +720,10 @@ impl VarlinkInterface for Handlers {
             // Queue through a known outage (see `post_time`); other dormant
             // reasons reject.
             Err(DormancyReason::Unreachable { .. }) => {
-                info!(project_id, issue_iid, "CloseIssue while unreachable, queuing for retry");
+                info!(
+                    project_id,
+                    issue_iid, "CloseIssue while unreachable, queuing for retry"
+                );
                 self.defer_close_issue(project_id, issue_iid).await;
                 return call.reply();
             }
@@ -759,7 +765,10 @@ impl VarlinkInterface for Handlers {
             // Queue through a known outage (see `post_time`); other dormant
             // reasons reject.
             Err(DormancyReason::Unreachable { .. }) => {
-                info!(project_id, issue_iid, "AssignSelf while unreachable, queuing for retry");
+                info!(
+                    project_id,
+                    issue_iid, "AssignSelf while unreachable, queuing for retry"
+                );
                 self.defer_assign_self(project_id, issue_iid).await;
                 return call.reply();
             }
@@ -800,7 +809,10 @@ impl VarlinkInterface for Handlers {
             // Queue through a known outage (see `post_time`); other dormant
             // reasons reject.
             Err(DormancyReason::Unreachable { .. }) => {
-                info!(project_id, issue_iid, "UnassignSelf while unreachable, queuing for retry");
+                info!(
+                    project_id,
+                    issue_iid, "UnassignSelf while unreachable, queuing for retry"
+                );
                 self.defer_unassign_self(project_id, issue_iid).await;
                 return call.reply();
             }
@@ -1406,7 +1418,11 @@ mod tests {
             .iter()
             .map(|e| e.timelog_id)
             .collect();
-        assert_eq!(remaining, vec![2, 3], "only the quick-band entry is removed");
+        assert_eq!(
+            remaining,
+            vec![2, 3],
+            "only the quick-band entry is removed"
+        );
     }
 
     #[tokio::test]
@@ -1612,7 +1628,11 @@ mod tests {
     /// Issues from a successful `GetAssignedIssues` reply.
     fn reply_issues(call: &mut gitlab_trackr_api::AsyncCall) -> Vec<Issue> {
         let reply = call.take_reply().expect("a reply");
-        assert!(reply.error.is_none(), "expected success, got {:?}", reply.error);
+        assert!(
+            reply.error.is_none(),
+            "expected success, got {:?}",
+            reply.error
+        );
         let params: gitlab_trackr_api::GetAssignedIssues_Reply =
             serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply");
         params.issues
@@ -1664,7 +1684,11 @@ mod tests {
 
         let mut iids: Vec<i64> = reply_issues(&mut call).iter().map(|i| i.iid).collect();
         iids.sort_unstable();
-        assert_eq!(iids, vec![1, 2], "team includes its subgroup, excludes other");
+        assert_eq!(
+            iids,
+            vec![1, 2],
+            "team includes its subgroup, excludes other"
+        );
     }
 
     #[tokio::test]

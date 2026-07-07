@@ -298,7 +298,10 @@ pub fn next_backoff(current: Duration, max: Duration) -> Duration {
 /// `next_backoff` handles the overflow ceiling.
 fn normalize_backoff(base_secs: &mut u64, max_secs: &mut u64, section: &str) {
     if *base_secs == 0 {
-        warn!(section, "base_delay_secs of 0 would busy-spin the backoff loop; flooring to 1");
+        warn!(
+            section,
+            "base_delay_secs of 0 would busy-spin the backoff loop; flooring to 1"
+        );
         *base_secs = 1;
     }
     if *max_secs < *base_secs {
@@ -385,10 +388,19 @@ mod tests {
     #[test]
     fn next_backoff_doubles_caps_and_saturates() {
         let max = Duration::from_secs(60);
-        assert_eq!(next_backoff(Duration::from_secs(2), max), Duration::from_secs(4));
-        assert_eq!(next_backoff(Duration::from_secs(30), max), Duration::from_secs(60));
+        assert_eq!(
+            next_backoff(Duration::from_secs(2), max),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(30), max),
+            Duration::from_secs(60)
+        );
         // Already at the cap: stays capped rather than growing.
-        assert_eq!(next_backoff(Duration::from_secs(60), max), Duration::from_secs(60));
+        assert_eq!(
+            next_backoff(Duration::from_secs(60), max),
+            Duration::from_secs(60)
+        );
         // Doubling would overflow `Duration`: saturate to the cap, don't panic.
         assert_eq!(next_backoff(Duration::from_secs(u64::MAX), max), max);
     }
@@ -397,7 +409,11 @@ mod tests {
     fn normalize_backoff_floors_zero_and_orders() {
         let (mut base, mut max) = (0u64, 0u64);
         normalize_backoff(&mut base, &mut max, "test");
-        assert_eq!((base, max), (1, 1), "a zero base is floored and max raised to it");
+        assert_eq!(
+            (base, max),
+            (1, 1),
+            "a zero base is floored and max raised to it"
+        );
 
         let (mut base, mut max) = (2u64, 60u64);
         normalize_backoff(&mut base, &mut max, "test");
@@ -405,6 +421,10 @@ mod tests {
 
         let (mut base, mut max) = (5u64, 3u64);
         normalize_backoff(&mut base, &mut max, "test");
-        assert_eq!((base, max), (5, 5), "a max below base is raised to the base");
+        assert_eq!(
+            (base, max),
+            (5, 5),
+            "a max below base is raised to the base"
+        );
     }
 }

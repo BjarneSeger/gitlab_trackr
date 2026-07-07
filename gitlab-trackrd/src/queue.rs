@@ -1075,8 +1075,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Dormant session: the worker defers every task (30s sleep) instead of
         // processing it, so re-enqueued tasks stay put for assertions.
-        let session: SessionSlot =
-            Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(DormancyReason::NoCredentials)));
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(
+            DormancyReason::NoCredentials,
+        )));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let q = RetryQueue::new(session, &dir.path().join("queue.redb"), config).unwrap();
         (q, dir)
@@ -1178,8 +1179,9 @@ mod tests {
                 .unwrap();
             dl.put(10, fail_entry(10)).unwrap();
         }
-        let session: SessionSlot =
-            Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(DormancyReason::NoCredentials)));
+        let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(
+            DormancyReason::NoCredentials,
+        )));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
         let q = RetryQueue::new(session, &qpath, config).unwrap();
         assert_eq!(

@@ -72,10 +72,7 @@ mod tests {
         let (c, _td) = cache();
         c.put(1, vec!["Doing".into(), "Done".into()]).unwrap();
         c.put(2, vec!["Review".into()]).unwrap();
-        assert_eq!(
-            c.get(1).unwrap(),
-            Some(vec!["Doing".into(), "Done".into()])
-        );
+        assert_eq!(c.get(1).unwrap(), Some(vec!["Doing".into(), "Done".into()]));
         assert_eq!(c.get(2).unwrap(), Some(vec!["Review".into()]));
         assert!(c.get(3).unwrap().is_none());
     }

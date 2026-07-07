@@ -74,8 +74,14 @@ impl_owned_copy!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 macro_rules! impl_redb_json_value {
     ($t:ty, $name:expr) => {
         impl redb::Value for $t {
-            type SelfType<'a> = $t where Self: 'a;
-            type AsBytes<'a> = Vec<u8> where Self: 'a;
+            type SelfType<'a>
+                = $t
+            where
+                Self: 'a;
+            type AsBytes<'a>
+                = Vec<u8>
+            where
+                Self: 'a;
 
             fn fixed_width() -> Option<usize> {
                 None

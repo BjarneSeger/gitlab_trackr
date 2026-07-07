@@ -87,10 +87,10 @@ pub fn load() -> Result<State> {
     if !path.exists() {
         return Ok(State::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let s: State = serde_json::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let s: State =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(s)
 }
 
@@ -104,12 +104,11 @@ pub fn save(state: &State) -> Result<()> {
     let parent = path
         .parent()
         .context("state path has no parent directory")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("creating {}", parent.display()))?;
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let tmp = path.with_extension("json.tmp");
     {
-        let mut f = std::fs::File::create(&tmp)
-            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         let bytes = serde_json::to_vec_pretty(state)?;
         f.write_all(&bytes)?;
         f.sync_all().ok();

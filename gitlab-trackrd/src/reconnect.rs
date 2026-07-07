@@ -532,7 +532,10 @@ mod tests {
         let ConnState::Dormant(DormancyReason::Unreachable { host, detail }) = &*slot else {
             panic!("expected Dormant(Unreachable)");
         };
-        assert_eq!(host, "gitlab.example.com", "captures the live session's host");
+        assert_eq!(
+            host, "gitlab.example.com",
+            "captures the live session's host"
+        );
         assert_eq!(detail, "connection refused");
         drop(slot);
 

@@ -29,8 +29,7 @@ struct IssueBuckets {
 
 impl_redb_json_value!(IssueBuckets, "IssueBuckets");
 
-const ISSUES_TABLE: TableDefinition<&str, IssueBuckets> =
-    TableDefinition::new("issues_cache_v2");
+const ISSUES_TABLE: TableDefinition<&str, IssueBuckets> = TableDefinition::new("issues_cache_v2");
 
 const KEY: &str = "assigned";
 
@@ -295,7 +294,10 @@ mod tests {
         assert!(c.remove_issue(1, 1).unwrap());
         let got: Vec<i64> = c.get().unwrap().unwrap().iter().map(|i| i.iid).collect();
         assert_eq!(got, vec![2], "bucket a emptied");
-        assert!(c.get_group("a").unwrap().is_empty(), "emptied bucket dropped");
+        assert!(
+            c.get_group("a").unwrap().is_empty(),
+            "emptied bucket dropped"
+        );
     }
 
     #[test]
@@ -322,7 +324,11 @@ mod tests {
         // issue_at uses project_id = 1 and sets id = iid * 10.
         c.put(&[make_issue(1, "a"), make_issue(2, "b")]).unwrap();
 
-        assert_eq!(c.issue_id(1, 2).unwrap(), Some(20), "matched issue's global id");
+        assert_eq!(
+            c.issue_id(1, 2).unwrap(),
+            Some(20),
+            "matched issue's global id"
+        );
         assert_eq!(c.issue_id(1, 99).unwrap(), None, "no such iid");
         assert_eq!(
             c.issue_id(7, 1).unwrap(),

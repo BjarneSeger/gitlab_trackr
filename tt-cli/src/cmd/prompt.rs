@@ -82,7 +82,10 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
             Err(e) => return Err(e).context("issue picker"),
         };
 
-        let duration = match Text::new("Duration:").with_initial_value(&suggested).prompt() {
+        let duration = match Text::new("Duration:")
+            .with_initial_value(&suggested)
+            .prompt()
+        {
             Ok(d) => d,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
                 println!("(skipped)");
@@ -98,11 +101,20 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
             Err(e) => return Err(e).context("summary prompt"),
         };
 
-        Ok(Some(PromptAnswers { issue: picked.0, duration, summary }))
+        Ok(Some(PromptAnswers {
+            issue: picked.0,
+            duration,
+            summary,
+        }))
     })
     .await??;
 
-    let Some(PromptAnswers { issue, duration, summary }) = answers else {
+    let Some(PromptAnswers {
+        issue,
+        duration,
+        summary,
+    }) = answers
+    else {
         return Ok(false);
     };
 
