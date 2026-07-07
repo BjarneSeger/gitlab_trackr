@@ -7,49 +7,63 @@ it into you workflow? Then this is the repo for you! We have:
 - [A cli to communicate with it and to remind you to track](tt-cli/README.md)
 - [A ready-to-import Go binding for the daemon's varlink interface](clients/go/README.md)
 
-# Setup
-Install the `gitlab-trackr-utils` package (see the releases tab), which provides
-gitlab-trackrd as an abstraction over the gitlab api with caching. Now you can go
-and use the `tt` command, which is part of `gitlab-trackr-utils`, or script the api
-(or `tt` itself) or build your own application on top of `gitlab_trackr_api`, which
-provides the varlink definition.
+# Quickstart
 
-## Setting up the daemon
-To use the daemon, you need to start it first:
+## 1. Install
+
+Install the `gitlab-trackr-utils` package (deb, rpm and arch packages plus prebuilt
+binaries are on the releases tab). It ships the `gitlab-trackrd` daemon, the `tt`
+CLI, shell completions, and systemd user units.
+
+## 2. Start the daemon
+
+The daemon is a systemd user unit — enable and start it:
 
 ```sh
-systemctl enable --now gitlab-trackrd.service
+systemctl enable --now --user gitlab-trackrd.service
 ```
 
-Then, you will need to authenticate. For this, you can use `tt` like this:
+## 3. Log in
 
 ```sh
 tt login --host gitlab.com
 ```
 
-This will take you to creating a PAT for gitlab-trackr with the appropriate scopes.
-Paste it back to the prompt and now you are logged in, with the token stored
-securely in your platforms keystore (keyring on Linux, keychain on macOS).
+This walks you through creating a personal access token with the appropriate scopes.
+Paste it back to the prompt and you are logged in — the token is stored in your
+platform's keystore (Secret Service/keyring on Linux, Keychain on macOS), never in a
+file.
 
-## Setting up the cli
-To get the regular tick for reminding you to track your time, use:
+The daemon keeps working offline: reads serve the local cache, and time you log
+while GitLab is unreachable is queued and posted once it reconnects.
 
-```sh
-tt hook YOUR_SHELL >> YOUR_SHELL_RC
-```
-
-which fires a prompt asking you to what you were working on, with a list of assigned
-issues at regular intervals.
-
-### Config
-The config file will by default be located at
+## 4. Get reminded to track
 
 ```sh
-tt config path
+tt hook YOUR_SHELL >> YOUR_SHELL_RC    # bash, zsh, fish or nu
 ```
 
-And you can get a default one by running
+The hook fires a prompt at regular intervals asking what you were working on, with a
+list of your assigned issues to pick from.
+
+## 5. Everyday use
 
 ```sh
-tt config template
+tt list                  # your assigned issues, straight from the cache
+tt log 42 1h30m          # log time on issue #42
+tt history               # what you tracked recently (including queued entries)
+tt queue                 # writes that failed permanently, with retry/dismiss
 ```
+
+## Config
+
+The CLI config lives at the path shown by `tt config path`; get an annotated default
+with `tt config template`. The daemon reads its own config — see
+[gitlab-trackrd/README.md](gitlab-trackrd/README.md#configuration).
+
+# Scripting and integrating
+
+Script `tt` itself, or talk to the daemon's varlink socket directly — the interface
+is documented in [the interface docs](gitlab-trackrd/docs/varlink_interface.md) and
+available as the [`gitlab-trackr-api`](gitlab-trackr-api/README.md) Rust crate or the
+[Go binding](clients/go/README.md).
