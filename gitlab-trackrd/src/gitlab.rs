@@ -307,7 +307,13 @@ impl GitlabApi for GitlabClient {
             start_time: since.to_rfc3339(),
         };
 
-        let raw: serde_json::Value = endpoint.query_async(&self.inner).await.map_err(classify)?;
+        // Retry transient (network) failures like the issues fetch does: a
+        // read is idempotent, so a momentary blip is absorbed here instead of
+        // demoting the whole session (see `handlers::note_gitlab_error`).
+        let raw: serde_json::Value = retry_transient("fetch timelogs", || async {
+            endpoint.query_async(&self.inner).await.map_err(classify)
+        })
+        .await?;
 
         if let Some(errs) = raw["errors"].as_array()
             && !errs.is_empty()

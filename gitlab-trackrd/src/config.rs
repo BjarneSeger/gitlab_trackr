@@ -242,11 +242,15 @@ impl QueueConfig {
 /// cap tuned for long-lived write retries.
 #[derive(Debug, Clone, Copy, ConfiqueConfig)]
 pub struct ReconnectConfig {
-    /// Whether the daemon auto-reconnects after an unreachable-GitLab dormancy.
-    /// When `false`, recovery is manual (`tt login` or a restart). Re-read on
-    /// every retry, so disabling it via a hot config reload stops an in-flight
-    /// reconnect on the next iteration; *enabling* it only starts the task at
-    /// the next daemon boot (the task is spawned once at startup).
+    /// Whether the daemon auto-reconnects after an unreachable-GitLab dormancy
+    /// (whether GitLab was down at boot or the connection dropped mid-run). When
+    /// `false`, recovery is manual (`tt login` or a restart) — the session still
+    /// honestly reports `unreachable`, it just isn't retried. Re-read on every
+    /// retry, so disabling it via a hot config reload stops an in-flight reconnect
+    /// on the next iteration. The supervisor task is long-lived (parked between
+    /// outages) and re-checks the dormant slot on a periodic tick (≤ `max_delay`),
+    /// so a `false`→`true` reload is picked up at the next tick — no disconnect,
+    /// `tt login`, or restart required.
     #[config(default = true)]
     pub enabled: bool,
 

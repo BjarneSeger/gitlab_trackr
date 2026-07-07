@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{debug, info, instrument, warn};
 
 use gitlab_trackr_api::{
@@ -80,6 +80,11 @@ pub struct Handlers {
     /// Live daemon config; history windows are read from `config.history` at use
     /// time so a hot reload takes effect without a restart.
     pub config: SharedConfig,
+    /// Nudged the instant a runtime GitLab call fails transiently and the session
+    /// is demoted to `Dormant(Unreachable)` (see [`crate::reconnect::commit_unreachable`]),
+    /// waking the background reconnect supervisor so it re-engages at once instead
+    /// of only at startup.
+    pub reconnect_signal: Arc<Notify>,
 }
 
 impl Handlers {
@@ -99,6 +104,80 @@ impl Handlers {
             ConnState::Connected(s) => Ok(s.clone()),
             ConnState::Dormant(r) => Err(r.clone()),
         }
+    }
+
+    /// Route a GitLab error observed by a background refresh into the connection
+    /// state: a transient (network) failure demotes the live session to
+    /// `Dormant(Unreachable)` and wakes the reconnect supervisor, so a connection
+    /// lost mid-run is noticed and retried the same way one down at boot is.
+    /// `gitlab` is the client the failed call used; demotion is guarded on its
+    /// identity so a stale in-flight fetch can't clobber a session a concurrent
+    /// `tt login` just established (see [`crate::reconnect::commit_unreachable`]).
+    /// Any non-transient error (e.g. a mid-run token revocation, not
+    /// auto-retryable) is left to the caller's log. Idempotent: a second call
+    /// while already dormant is a no-op.
+    ///
+    /// Only the background refresh paths call this. The write handlers queue on a
+    /// transient failure (the retry queue drains them) rather than demoting, so a
+    /// single blipped write can't tear the whole session down; the periodic
+    /// refresh — which retries internally before failing — stays the demotion
+    /// authority.
+    async fn note_gitlab_error(&self, gitlab: &Arc<dyn GitlabApi>, e: &Error) {
+        if let Error::Transient(detail) = e {
+            crate::reconnect::commit_unreachable(
+                &self.session,
+                &self.reconnect_signal,
+                gitlab,
+                detail.clone(),
+            )
+            .await;
+        }
+    }
+
+    /// The global numeric issue ID (the one GraphQL embeds in
+    /// `gid://gitlab/Issue/<id>`) for a cached `(project, iid)`, so a queued
+    /// retry can use the GraphQL path. `None` when the issue isn't cached — the
+    /// queue then falls back to REST without a `spent_at`.
+    fn resolve_issue_id(&self, project_id: i64, issue_iid: i64) -> Option<i64> {
+        self.cache.issue_id(project_id, issue_iid).ok().flatten()
+    }
+
+    /// Queue a `PostTime` write for retry when GitLab can't be reached right now
+    /// (a known outage or a transient failure mid-call); the retry queue drains
+    /// it on reconnect. Shared by the `Unreachable`-dormancy and transient-error
+    /// arms of [`Self::post_time`].
+    async fn defer_post_time(
+        &self,
+        project_id: i64,
+        issue_iid: i64,
+        duration: String,
+        summary: Option<String>,
+    ) {
+        let issue_id = self.resolve_issue_id(project_id, issue_iid);
+        self.queue
+            .post_time(project_id, issue_iid, duration, summary, issue_id)
+            .await;
+    }
+
+    /// Queue a `CloseIssue` write for retry and drop the issue from the cache so
+    /// `tt list` reflects it at once. Shared by both deferral arms of
+    /// [`Self::close_issue`].
+    async fn defer_close_issue(&self, project_id: i64, issue_iid: i64) {
+        self.queue.close_issue(project_id, issue_iid).await;
+        self.forget_cached_issue(project_id, issue_iid);
+    }
+
+    /// Queue an `AssignSelf` write for retry. Shared by both deferral arms of
+    /// [`Self::assign_self`].
+    async fn defer_assign_self(&self, project_id: i64, issue_iid: i64) {
+        self.queue.assign_self(project_id, issue_iid).await;
+    }
+
+    /// Queue an `UnassignSelf` write for retry and drop the issue from the cache.
+    /// Shared by both deferral arms of [`Self::unassign_self`].
+    async fn defer_unassign_self(&self, project_id: i64, issue_iid: i64) {
+        self.queue.unassign_self(project_id, issue_iid).await;
+        self.forget_cached_issue(project_id, issue_iid);
     }
 }
 
@@ -133,6 +212,11 @@ impl Handlers {
             }
             Err(e) => {
                 warn!(error = %e, "background cache refresh: GitLab fetch failed");
+                self.note_gitlab_error(&gitlab, &e).await;
+                // Demoted (or already dormant): skip the doomed timelog fetch
+                // below against the host we just declared unreachable. The
+                // supervisor's post-reconnect warm-up refills history.
+                return;
             }
         }
 
@@ -196,6 +280,7 @@ impl Handlers {
             Ok(f) => f,
             Err(e) => {
                 warn!(error = %e, "timelog refresh: GitLab fetch failed");
+                self.note_gitlab_error(gitlab, &e).await;
                 return;
             }
         };
@@ -450,6 +535,16 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
+            // A known outage (the daemon has already demoted and is retrying the
+            // connection): queue the write so it drains on reconnect rather than
+            // failing the command. Every other dormant reason needs the user, so
+            // those still reject.
+            Err(DormancyReason::Unreachable { .. }) => {
+                info!(project_id, issue_iid, "PostTime while unreachable, queuing for retry");
+                self.defer_post_time(project_id, issue_iid, duration, summary)
+                    .await;
+                return call.reply();
+            }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
@@ -463,16 +558,9 @@ impl VarlinkInterface for Handlers {
                 info!(project_id, issue_iid, duration, "posted time");
                 call.reply()
             }
-            Err(Error::Transient(ref e)) => {
-                warn!(error = %e, project_id, issue_iid, "PostTime network error, queuing for retry");
-                let issue_id = self.cache.get().ok().flatten().and_then(|issues| {
-                    issues
-                        .into_iter()
-                        .find(|i| i.project_id == project_id && i.iid == issue_iid)
-                        .map(|i| i.id)
-                });
-                self.queue
-                    .post_time(project_id, issue_iid, duration, summary, issue_id)
+            Err(err @ Error::Transient(_)) => {
+                warn!(error = %err, project_id, issue_iid, "PostTime network error, queuing for retry");
+                self.defer_post_time(project_id, issue_iid, duration, summary)
                     .await;
                 call.reply()
             }
@@ -626,6 +714,13 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
+            // Queue through a known outage (see `post_time`); other dormant
+            // reasons reject.
+            Err(DormancyReason::Unreachable { .. }) => {
+                info!(project_id, issue_iid, "CloseIssue while unreachable, queuing for retry");
+                self.defer_close_issue(project_id, issue_iid).await;
+                return call.reply();
+            }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
@@ -637,10 +732,9 @@ impl VarlinkInterface for Handlers {
                 self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
-            Err(Error::Transient(ref e)) => {
-                warn!(error = %e, project_id, issue_iid, "CloseIssue network error, queuing for retry");
-                self.queue.close_issue(project_id, issue_iid).await;
-                self.forget_cached_issue(project_id, issue_iid);
+            Err(err @ Error::Transient(_)) => {
+                warn!(error = %err, project_id, issue_iid, "CloseIssue network error, queuing for retry");
+                self.defer_close_issue(project_id, issue_iid).await;
                 call.reply()
             }
             Err(e) => {
@@ -662,6 +756,13 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
+            // Queue through a known outage (see `post_time`); other dormant
+            // reasons reject.
+            Err(DormancyReason::Unreachable { .. }) => {
+                info!(project_id, issue_iid, "AssignSelf while unreachable, queuing for retry");
+                self.defer_assign_self(project_id, issue_iid).await;
+                return call.reply();
+            }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
@@ -672,9 +773,9 @@ impl VarlinkInterface for Handlers {
                 info!(project_id, issue_iid, "assigned self");
                 call.reply()
             }
-            Err(Error::Transient(ref e)) => {
-                warn!(error = %e, project_id, issue_iid, "AssignSelf network error, queuing for retry");
-                self.queue.assign_self(project_id, issue_iid).await;
+            Err(err @ Error::Transient(_)) => {
+                warn!(error = %err, project_id, issue_iid, "AssignSelf network error, queuing for retry");
+                self.defer_assign_self(project_id, issue_iid).await;
                 call.reply()
             }
             Err(e) => {
@@ -696,6 +797,13 @@ impl VarlinkInterface for Handlers {
         }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
+            // Queue through a known outage (see `post_time`); other dormant
+            // reasons reject.
+            Err(DormancyReason::Unreachable { .. }) => {
+                info!(project_id, issue_iid, "UnassignSelf while unreachable, queuing for retry");
+                self.defer_unassign_self(project_id, issue_iid).await;
+                return call.reply();
+            }
             Err(e) => {
                 let (reason, detail) = dormant_args(&e);
                 return call.reply_not_authenticated(reason, detail);
@@ -707,10 +815,9 @@ impl VarlinkInterface for Handlers {
                 self.forget_cached_issue(project_id, issue_iid);
                 call.reply()
             }
-            Err(Error::Transient(ref e)) => {
-                warn!(error = %e, project_id, issue_iid, "UnassignSelf network error, queuing for retry");
-                self.queue.unassign_self(project_id, issue_iid).await;
-                self.forget_cached_issue(project_id, issue_iid);
+            Err(err @ Error::Transient(_)) => {
+                warn!(error = %err, project_id, issue_iid, "UnassignSelf network error, queuing for retry");
+                self.defer_unassign_self(project_id, issue_iid).await;
                 call.reply()
             }
             Err(e) => {
@@ -965,12 +1072,27 @@ mod tests {
 
     // ── enrich_graph_status with FakeGitlab ────────────────────────────────
 
+    /// How a `FakeGitlab` fails its issue / timelog fetches, so the background
+    /// refresh tests can drive the runtime-demotion logic.
+    #[derive(Clone, Copy)]
+    enum FetchErr {
+        /// Network failure → `Error::Transient` (should demote to `Unreachable`).
+        Transient,
+        /// GitLab-side failure → `Error::Gitlab` (must NOT demote).
+        Permanent,
+    }
+
     /// Minimal `GitlabApi` impl that returns pre-canned `fetch_board_list_labels`
     /// responses and counts how many times each method was called.
     #[derive(Default)]
     struct FakeGitlab {
         board_labels: Mutex<HashMap<i64, TrackrResult<Vec<String>>>>,
         board_calls: AtomicUsize,
+        /// When set, `fetch_assigned_issues` / `fetch_my_timelogs` fail this way.
+        fetch_err: Option<FetchErr>,
+        /// When set, `add_spent_time` fails this way (drives the write-handler
+        /// deferral path).
+        write_err: Option<FetchErr>,
     }
 
     impl FakeGitlab {
@@ -992,8 +1114,44 @@ mod tests {
             me
         }
 
+        /// A fake whose issue and timelog fetches fail in the given way.
+        fn failing(err: FetchErr) -> Self {
+            Self {
+                fetch_err: Some(err),
+                ..Self::default()
+            }
+        }
+
+        /// A fake whose `add_spent_time` write fails in the given way.
+        fn failing_write(err: FetchErr) -> Self {
+            Self {
+                write_err: Some(err),
+                ..Self::default()
+            }
+        }
+
         fn board_calls(&self) -> usize {
             self.board_calls.load(Ordering::SeqCst)
+        }
+
+        fn fetch_result<T>(&self) -> TrackrResult<Vec<T>> {
+            match self.fetch_err {
+                Some(FetchErr::Transient) => Err(crate::error::Error::Transient("offline".into())),
+                Some(FetchErr::Permanent) => {
+                    Err(crate::error::Error::Gitlab("500 Server Error".into()))
+                }
+                None => unimplemented!("fetch not configured for this fake"),
+            }
+        }
+
+        fn write_result(&self) -> TrackrResult<()> {
+            match self.write_err {
+                Some(FetchErr::Transient) => Err(crate::error::Error::Transient("offline".into())),
+                Some(FetchErr::Permanent) => {
+                    Err(crate::error::Error::Gitlab("400 Bad Request".into()))
+                }
+                None => Ok(()),
+            }
         }
     }
 
@@ -1003,7 +1161,7 @@ mod tests {
             &self,
             _group: Option<String>,
         ) -> TrackrResult<Vec<IssueWithLabels>> {
-            unimplemented!("not used in enrich_graph_status tests")
+            self.fetch_result()
         }
         async fn add_spent_time(
             &self,
@@ -1012,7 +1170,7 @@ mod tests {
             _duration: &str,
             _summary: Option<&str>,
         ) -> TrackrResult<()> {
-            unimplemented!()
+            self.write_result()
         }
         async fn create_timelog(
             &self,
@@ -1027,7 +1185,7 @@ mod tests {
             &self,
             _since: chrono::DateTime<chrono::Utc>,
         ) -> TrackrResult<Vec<FetchedTimelog>> {
-            unimplemented!()
+            self.fetch_result()
         }
         async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
             unimplemented!()
@@ -1165,14 +1323,12 @@ mod tests {
 
     // ── clear_cache scoping ────────────────────────────────────────────────
 
-    /// Build `Handlers` with a dormant session (no GitLab), so `clear_cache`
-    /// clears without the follow-up re-fetch — letting us assert the bands.
-    fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
+    /// Build `Handlers` around a given connection state and a fresh set of temp
+    /// databases.
+    fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let p = |name: &str| dir.path().join(name);
-        let session: SessionSlot = Arc::new(RwLock::new(ConnState::Dormant(
-            DormancyReason::NoCredentials,
-        )));
+        let session: SessionSlot = Arc::new(RwLock::new(state));
         let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
         let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
         let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
@@ -1187,9 +1343,26 @@ mod tests {
                 history,
                 queue,
                 config,
+                reconnect_signal: Arc::new(Notify::new()),
             },
             dir,
         )
+    }
+
+    /// Build `Handlers` with a dormant (no-GitLab) session, so `clear_cache`
+    /// clears without the follow-up re-fetch — letting us assert the bands.
+    fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
+        handlers_with(ConnState::Dormant(DormancyReason::NoCredentials))
+    }
+
+    /// Build `Handlers` connected to a `FakeGitlab`, so the background refresh
+    /// path runs against a controllable client.
+    fn connected_handlers(fake: FakeGitlab) -> (Handlers, tempfile::TempDir) {
+        handlers_with(ConnState::Connected(Session {
+            gitlab: Arc::new(fake),
+            host: "gitlab.example.com".into(),
+            user_id: 1,
+        }))
     }
 
     fn stored(timelog_id: u64, spent_at_secs: u64) -> StoredTimelog {
@@ -1299,6 +1472,139 @@ mod tests {
 
         let reply = call.take_reply().expect("a reply");
         assert!(reply.error.is_some(), "project_id 0 → error reply");
+    }
+
+    // ── runtime disconnect detection & recovery ────────────────────────────
+
+    #[tokio::test]
+    async fn refresh_cache_demotes_to_unreachable_on_transient_error() {
+        let (h, _dir) = connected_handlers(FakeGitlab::failing(FetchErr::Transient));
+
+        h.refresh_cache().await;
+
+        assert!(
+            matches!(
+                &*h.session.read().await,
+                ConnState::Dormant(DormancyReason::Unreachable { .. })
+            ),
+            "a transient background failure demotes the live session"
+        );
+        // A permit was left for the reconnect supervisor.
+        tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())
+            .await
+            .expect("the reconnect supervisor was signalled");
+    }
+
+    #[tokio::test]
+    async fn refresh_cache_stays_connected_on_permanent_error() {
+        let (h, _dir) = connected_handlers(FakeGitlab::failing(FetchErr::Permanent));
+
+        h.refresh_cache().await;
+
+        assert!(
+            matches!(&*h.session.read().await, ConnState::Connected(_)),
+            "a non-transient error must not demote (it is not auto-retryable)"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_time_queues_through_an_unreachable_outage() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+            host: "gitlab.example.com".into(),
+            detail: "connection refused".into(),
+        }));
+        let mut call = AsyncCall::default();
+
+        h.post_time(
+            &mut call as &mut dyn Call_PostTime,
+            7,
+            42,
+            "30m".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "unreachable → queued and reported success, not rejected"
+        );
+        assert_eq!(
+            h.queue.pending_post_time().unwrap().len(),
+            1,
+            "the write is queued to drain on reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_time_rejects_when_dormant_but_not_unreachable() {
+        use gitlab_trackr_api::AsyncCall;
+        let (h, _dir) = dormant_handlers(); // NoCredentials
+        let mut call = AsyncCall::default();
+
+        h.post_time(
+            &mut call as &mut dyn Call_PostTime,
+            7,
+            42,
+            "30m".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert!(
+            reply.error.is_some(),
+            "no credentials → reject; queuing wouldn't help"
+        );
+        assert!(
+            h.queue.pending_post_time().unwrap().is_empty(),
+            "nothing queued for a non-unreachable dormancy"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_time_transient_queues_without_demoting() {
+        use gitlab_trackr_api::AsyncCall;
+        // Connected session; the write hits a single transient error. The write
+        // must be queued (data-safe, the queue drains it) but the session must
+        // NOT be demoted — one blip is not a disconnect. The periodic background
+        // refresh (which retries internally) stays the demotion authority.
+        let (h, _dir) = connected_handlers(FakeGitlab::failing_write(FetchErr::Transient));
+        let mut call = AsyncCall::default();
+
+        h.post_time(
+            &mut call as &mut dyn Call_PostTime,
+            7,
+            42,
+            "30m".to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reply = call.take_reply().expect("a reply");
+        assert!(
+            reply.error.is_none(),
+            "transient write → queued and reported success"
+        );
+        assert_eq!(
+            h.queue.pending_post_time().unwrap().len(),
+            1,
+            "the write is queued to drain on reconnect"
+        );
+        assert!(
+            matches!(&*h.session.read().await, ConnState::Connected(_)),
+            "a single transient write blip must not demote the live session"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+                .await
+                .is_err(),
+            "no reconnect signal from a write blip"
+        );
     }
 
     // ── get_assigned_issues: pure cache reader ─────────────────────────────
