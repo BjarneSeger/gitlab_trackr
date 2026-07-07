@@ -6,12 +6,10 @@
 //! retries for up to 7 days; a GitLab rejection or an exhausted retry window
 //! moves the task to a persistent dead-letter store, surfaced via `tt queue`.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
@@ -20,13 +18,9 @@ use crate::config::{SharedConfig, next_backoff};
 use crate::db::KvStore;
 use crate::error::{Error, Result};
 use crate::handlers::SessionSlot;
-use crate::impl_redb_json_value;
 
-// Table name bumped from `post_time_queue` so older `StoredTask` records that
-// don't carry the new `op` field don't crash deserialization on startup.
-const QUEUE_TABLE: TableDefinition<u64, StoredTask> = TableDefinition::new("retry_queue_v4");
-const DEAD_LETTER_TABLE: TableDefinition<u64, StoredFailure> =
-    TableDefinition::new("dead_letter_v1");
+const QUEUE_KEYSPACE: &str = "retry_queue_v1";
+const DEAD_LETTER_KEYSPACE: &str = "dead_letter_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum QueueOp {
@@ -54,8 +48,6 @@ struct StoredTask {
     queued_at_secs: u64,
 }
 
-impl_redb_json_value!(StoredTask, "StoredTaskV4");
-
 /// A task the worker gave up on — GitLab rejected it outright, or it exhausted
 /// the retry window. Persisted so the user can inspect, retry, or dismiss it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,8 +62,6 @@ struct StoredFailure {
     /// The GitLab error or retry-window-exhaustion message.
     error: String,
 }
-
-impl_redb_json_value!(StoredFailure, "StoredFailureV1");
 
 struct QueuedTask {
     id: u64,
@@ -115,16 +105,15 @@ pub struct FailedTaskView {
 }
 
 impl RetryQueue {
-    /// Open (or create) the queue database at `db_path`, reload any tasks that
+    /// Open (or create) the queue keyspaces in `db`, reload any tasks that
     /// survived a previous restart, and spawn the background worker.
-    pub fn new(session: SessionSlot, db_path: &Path, config: SharedConfig) -> Result<Self> {
-        let store = KvStore::open(db_path, QUEUE_TABLE)?;
-        // The dead-letter store lives in its own redb file beside the queue —
-        // redb takes an exclusive lock per file, so it can't share `db_path`.
-        let dead_letter = KvStore::open(
-            &db_path.with_file_name("dead_letter.redb"),
-            DEAD_LETTER_TABLE,
-        )?;
+    ///
+    /// Both stores are durable — every mutation fsyncs — because queued writes
+    /// must survive a crash, unlike the re-syncable caches.
+    pub fn new(session: SessionSlot, db: &fjall::Database, config: SharedConfig) -> Result<Self> {
+        let store: KvStore<u64, StoredTask> = KvStore::open_durable(db, QUEUE_KEYSPACE)?;
+        let dead_letter: KvStore<u64, StoredFailure> =
+            KvStore::open_durable(db, DEAD_LETTER_KEYSPACE)?;
 
         let initial_tasks = store.scan(|id, stored| {
             Ok(QueuedTask {
@@ -273,7 +262,7 @@ impl RetryQueue {
             op: stored.op.clone(),
             queued_at_secs: stored.queued_at_secs,
         };
-        if let Err(e) = self.store.put(id, stored) {
+        if let Err(e) = self.store.put(id, &stored) {
             warn!(
                 error = %e,
                 "failed to persist task to queue db; it will not survive a restart"
@@ -514,7 +503,7 @@ async fn worker(
                 failed_at_secs: now_secs(),
                 error,
             };
-            if let Err(e) = dead_letter.put(task.id, stored) {
+            if let Err(e) = dead_letter.put(task.id, &stored) {
                 warn!(
                     error = %e,
                     task_id = task.id,
@@ -599,10 +588,16 @@ mod tests {
 
     // ── snapshot_pending ────────────────────────────────────────────────────
 
+    fn test_db(dir: &tempfile::TempDir) -> fjall::Database {
+        fjall::Database::builder(dir.path().join("db"))
+            .open()
+            .unwrap()
+    }
+
     fn store() -> (KvStore<u64, StoredTask>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("queue.redb");
-        (KvStore::open(&path, QUEUE_TABLE).unwrap(), dir)
+        let db = test_db(&dir);
+        (KvStore::open_durable(&db, QUEUE_KEYSPACE).unwrap(), dir)
     }
 
     fn post_task(id: i64, queued_at: u64) -> StoredTask {
@@ -630,10 +625,10 @@ mod tests {
     #[test]
     fn snapshot_pending_filters_close_issue_and_sorts_newest_first() {
         let (s, _td) = store();
-        s.put(1, post_task(1, 100)).unwrap();
-        s.put(2, close_task(2, 150)).unwrap();
-        s.put(3, post_task(3, 200)).unwrap();
-        s.put(4, post_task(4, 50)).unwrap();
+        s.put(1, &post_task(1, 100)).unwrap();
+        s.put(2, &close_task(2, 150)).unwrap();
+        s.put(3, &post_task(3, 200)).unwrap();
+        s.put(4, &post_task(4, 50)).unwrap();
 
         let snap = snapshot_pending(&s).unwrap();
         let project_ids: Vec<i64> = snap.iter().map(|p| p.project_id).collect();
@@ -765,8 +760,7 @@ mod tests {
         task: QueuedTask,
     ) -> Vec<FailedTaskView> {
         let dir = tempfile::tempdir().unwrap();
-        let dead_letter =
-            KvStore::open(&dir.path().join("dead_letter.redb"), DEAD_LETTER_TABLE).unwrap();
+        let dead_letter = KvStore::open_durable(&test_db(&dir), DEAD_LETTER_KEYSPACE).unwrap();
         let session: SessionSlot =
             Arc::new(tokio::sync::RwLock::new(ConnState::Connected(Session {
                 gitlab,
@@ -809,8 +803,7 @@ mod tests {
     #[tokio::test]
     async fn worker_removes_task_on_success() {
         let (s, _td) = store();
-        let stored = post_task(7, 100);
-        s.put(1, stored).unwrap();
+        s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
         gitlab.push_add_spent_time(Ok(()));
@@ -843,11 +836,10 @@ mod tests {
     #[tokio::test]
     async fn worker_defers_while_dormant_then_drains_on_reconnect_nudge() {
         let (s, _td) = store();
-        s.put(1, post_task(7, 100)).unwrap();
+        s.put(1, &post_task(7, 100)).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let dead_letter =
-            KvStore::open(&dir.path().join("dead_letter.redb"), DEAD_LETTER_TABLE).unwrap();
+        let dead_letter = KvStore::open_durable(&test_db(&dir), DEAD_LETTER_KEYSPACE).unwrap();
 
         // Start dormant so the task can't run yet. `session_wait` is set to an
         // hour so the defer branch's timeout can't possibly fire during the test:
@@ -935,7 +927,7 @@ mod tests {
         };
         s.put(
             1,
-            StoredTask {
+            &StoredTask {
                 project_id: 7,
                 issue_iid: 7,
                 op: task.op.clone(),
@@ -967,7 +959,7 @@ mod tests {
     #[tokio::test]
     async fn worker_drops_task_on_permanent_error() {
         let (s, _td) = store();
-        s.put(1, post_task(7, 100)).unwrap();
+        s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
         gitlab.push_add_spent_time(Err(Error::Gitlab("403".into())));
@@ -1001,7 +993,7 @@ mod tests {
     #[tokio::test]
     async fn worker_close_issue_success() {
         let (s, _td) = store();
-        s.put(1, close_task(7, 100)).unwrap();
+        s.put(1, &close_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
         gitlab.push_close_issue(Ok(()));
@@ -1026,13 +1018,16 @@ mod tests {
     #[tokio::test]
     async fn worker_assign_self_success() {
         let (s, _td) = store();
-        let stored = StoredTask {
-            project_id: 7,
-            issue_iid: 7,
-            op: QueueOp::AssignSelf,
-            queued_at_secs: 100,
-        };
-        s.put(1, stored).unwrap();
+        s.put(
+            1,
+            &StoredTask {
+                project_id: 7,
+                issue_iid: 7,
+                op: QueueOp::AssignSelf,
+                queued_at_secs: 100,
+            },
+        )
+        .unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
         gitlab.push_assign_self(Ok(()));
@@ -1079,14 +1074,14 @@ mod tests {
             DormancyReason::NoCredentials,
         )));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-        let q = RetryQueue::new(session, &dir.path().join("queue.redb"), config).unwrap();
+        let q = RetryQueue::new(session, &test_db(&dir), config).unwrap();
         (q, dir)
     }
 
     #[tokio::test]
     async fn worker_dead_letters_on_permanent_error() {
         let (s, _td) = store();
-        s.put(1, post_task(7, 100)).unwrap();
+        s.put(1, &post_task(7, 100)).unwrap();
 
         let gitlab = Arc::new(FakeGitlab::default());
         gitlab.push_add_spent_time(Err(Error::Gitlab("403 Forbidden".into())));
@@ -1124,7 +1119,7 @@ mod tests {
         q.dead_letter
             .put(
                 5,
-                StoredFailure {
+                &StoredFailure {
                     project_id: 7,
                     issue_iid: 9,
                     op: QueueOp::CloseIssue,
@@ -1157,8 +1152,8 @@ mod tests {
     #[tokio::test]
     async fn dismiss_and_clear_failures() {
         let (q, _td) = retry_queue();
-        q.dead_letter.put(1, fail_entry(1)).unwrap();
-        q.dead_letter.put(2, fail_entry(2)).unwrap();
+        q.dead_letter.put(1, &fail_entry(1)).unwrap();
+        q.dead_letter.put(2, &fail_entry(2)).unwrap();
 
         assert!(q.dismiss_failure(1).unwrap(), "known id dismissed");
         assert!(!q.dismiss_failure(1).unwrap(), "already gone → false");
@@ -1171,19 +1166,18 @@ mod tests {
     #[tokio::test]
     async fn new_seeds_next_id_above_both_tables() {
         let dir = tempfile::tempdir().unwrap();
-        let qpath = dir.path().join("queue.redb");
-        {
-            let store = KvStore::open(&qpath, QUEUE_TABLE).unwrap();
-            store.put(3, post_task(1, 100)).unwrap();
-            let dl = KvStore::open(&qpath.with_file_name("dead_letter.redb"), DEAD_LETTER_TABLE)
-                .unwrap();
-            dl.put(10, fail_entry(10)).unwrap();
-        }
+        let db = test_db(&dir);
+        let store: KvStore<u64, StoredTask> = KvStore::open_durable(&db, QUEUE_KEYSPACE).unwrap();
+        store.put(3, &post_task(1, 100)).unwrap();
+        let dl: KvStore<u64, StoredFailure> =
+            KvStore::open_durable(&db, DEAD_LETTER_KEYSPACE).unwrap();
+        dl.put(10, &fail_entry(10)).unwrap();
+
         let session: SessionSlot = Arc::new(tokio::sync::RwLock::new(ConnState::Dormant(
             DormancyReason::NoCredentials,
         )));
         let config = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-        let q = RetryQueue::new(session, &qpath, config).unwrap();
+        let q = RetryQueue::new(session, &db, config).unwrap();
         assert_eq!(
             q.next_id.load(std::sync::atomic::Ordering::Relaxed),
             11,

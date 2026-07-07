@@ -1,37 +1,30 @@
-//! redb-backed cache for project board-list labels.
+//! fjall-backed cache for project board-list labels.
 //!
 //! Keyed by `project_id`. No TTL — entries live until [`BoardCache::clear`]
 //! wipes them (called from the `ClearCache` varlink method). The daemon
 //! relies on its regular refresh cycle to keep this fresh enough.
 
-use std::path::Path;
-
-use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
 
 use crate::db::KvStore;
 use crate::error::Result;
-use crate::impl_redb_json_value;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectBoardLabels {
     labels: Vec<String>,
 }
 
-impl_redb_json_value!(ProjectBoardLabels, "ProjectBoardLabels");
-
-const BOARDS_TABLE: TableDefinition<i64, ProjectBoardLabels> =
-    TableDefinition::new("project_board_labels");
+const BOARDS_KEYSPACE: &str = "project_board_labels_v1";
 
 pub struct BoardCache {
     store: KvStore<i64, ProjectBoardLabels>,
 }
 
 impl BoardCache {
-    /// Open (or create) the board-cache database at `path`.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Open (or create) the board-cache keyspace in `db`.
+    pub fn open(db: &fjall::Database) -> Result<Self> {
         Ok(Self {
-            store: KvStore::open(path, BOARDS_TABLE)?,
+            store: KvStore::open(db, BOARDS_KEYSPACE)?,
         })
     }
 
@@ -42,7 +35,7 @@ impl BoardCache {
 
     /// Insert or overwrite the label list for `project_id`.
     pub fn put(&self, project_id: i64, labels: Vec<String>) -> Result<()> {
-        self.store.put(project_id, ProjectBoardLabels { labels })
+        self.store.put(project_id, &ProjectBoardLabels { labels })
     }
 
     /// Drop every entry so the next `get` for any project returns `None`.
@@ -57,8 +50,10 @@ mod tests {
 
     fn cache() -> (BoardCache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("boards.redb");
-        (BoardCache::open(&path).unwrap(), dir)
+        let db = fjall::Database::builder(dir.path().join("db"))
+            .open()
+            .unwrap();
+        (BoardCache::open(&db).unwrap(), dir)
     }
 
     #[test]

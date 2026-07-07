@@ -1,7 +1,7 @@
-//! redb-backed cache for the assigned-issues list, keyed by group.
+//! fjall-backed cache for the assigned-issues list, keyed by group.
 //!
 //! Hides `KvStore` behind a small [`IssueCache`] interface; callers see plain
-//! `Result<Option<_>>` / `Result<()>` and never touch a transaction.
+//! `Result<Option<_>>` / `Result<()>` and never touch the storage layer.
 //!
 //! The background refresh loop fetches every assigned issue and hands the whole
 //! list to [`IssueCache::put`], which buckets them by group (parsed from each
@@ -10,14 +10,11 @@
 //! and readers always serve whatever was last synced.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
 
 use crate::db::KvStore;
 use crate::error::Result;
-use crate::impl_redb_json_value;
 use gitlab_trackr_api::Issue;
 
 /// On-disk cache: assigned issues bucketed by their group namespace.
@@ -27,9 +24,7 @@ struct IssueBuckets {
     by_group: BTreeMap<String, Vec<Issue>>,
 }
 
-impl_redb_json_value!(IssueBuckets, "IssueBuckets");
-
-const ISSUES_TABLE: TableDefinition<&str, IssueBuckets> = TableDefinition::new("issues_cache_v2");
+const ISSUES_KEYSPACE: &str = "issues_cache_v1";
 
 const KEY: &str = "assigned";
 
@@ -38,10 +33,10 @@ pub struct IssueCache {
 }
 
 impl IssueCache {
-    /// Open (or create) the cache database at `path`.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Open (or create) the issue-cache keyspace in `db`.
+    pub fn open(db: &fjall::Database) -> Result<Self> {
         Ok(Self {
-            store: KvStore::open(path, ISSUES_TABLE)?,
+            store: KvStore::open(db, ISSUES_KEYSPACE)?,
         })
     }
 
@@ -74,7 +69,7 @@ impl IssueCache {
                 .or_default()
                 .push(issue.clone());
         }
-        self.store.put(KEY, IssueBuckets { by_group })
+        self.store.put(KEY, &IssueBuckets { by_group })
     }
 
     /// Drop the cached entry so the next `get` returns `None`.
@@ -100,7 +95,7 @@ impl IssueCache {
             return Ok(false);
         }
         b.by_group.retain(|_, issues| !issues.is_empty());
-        self.store.put(KEY, b)?;
+        self.store.put(KEY, &b)?;
         Ok(true)
     }
 
@@ -175,8 +170,10 @@ mod tests {
 
     fn cache() -> (IssueCache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.redb");
-        (IssueCache::open(&path).unwrap(), dir)
+        let db = fjall::Database::builder(dir.path().join("db"))
+            .open()
+            .unwrap();
+        (IssueCache::open(&db).unwrap(), dir)
     }
 
     #[test]
@@ -346,42 +343,17 @@ mod tests {
     #[test]
     fn survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.redb");
+        let path = dir.path().join("db");
+        // Both the store and the Database must drop before reopening — fjall
+        // holds a single-process lock on the directory.
         {
-            let c = IssueCache::open(&path).unwrap();
+            let db = fjall::Database::builder(&path).open().unwrap();
+            let c = IssueCache::open(&db).unwrap();
             c.put(&[make_issue(1, "persisted")]).unwrap();
         }
-        let c = IssueCache::open(&path).unwrap();
+        let db = fjall::Database::builder(&path).open().unwrap();
+        let c = IssueCache::open(&db).unwrap();
         let got = c.get().unwrap().unwrap();
         assert_eq!(got[0].title, "persisted");
-    }
-
-    #[test]
-    fn ignores_legacy_v1_table_without_panicking() {
-        use redb::Database;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.redb");
-
-        // Simulate a pre-existing v1 cache: a table under the OLD name holding
-        // bytes the new `IssueBuckets` type could never deserialize. The rename
-        // to `issues_cache_v2` must make this a non-event, not a `from_bytes` panic.
-        {
-            let db = Database::create(&path).unwrap();
-            let legacy: TableDefinition<&str, &[u8]> = TableDefinition::new("issues_cache");
-            let txn = db.begin_write().unwrap();
-            {
-                let mut t = txn.open_table(legacy).unwrap();
-                t.insert("assigned", b"not-valid-issuebuckets-json".as_slice())
-                    .unwrap();
-            }
-            txn.commit().unwrap();
-        }
-
-        let c = IssueCache::open(&path).unwrap();
-        assert!(c.get().unwrap().is_none(), "legacy v1 data is ignored");
-        // Still fully functional afterward.
-        c.put(&[make_issue(1, "fresh")]).unwrap();
-        assert_eq!(c.get().unwrap().unwrap().len(), 1);
     }
 }

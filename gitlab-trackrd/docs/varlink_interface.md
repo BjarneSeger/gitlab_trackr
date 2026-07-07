@@ -16,7 +16,7 @@ type Issue (
 ## `GetAssignedIssues() -> (issues: []Issue)`
 
 Returns all open issues assigned to the authenticated user.  Results are
-served from the redb cache (`~/.local/share/gitlab-trackrd/cache.redb`) for
+served from the local cache (`~/.local/share/gitlab-trackrd/db/`) for
 up to `GITLAB_TRACKRD_CACHE_TTL` seconds before a live GitLab request is made.
 
 ## `PostTime(project_id: int, issue_iid: int, duration: string) -> ()`

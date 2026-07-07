@@ -1,4 +1,4 @@
-//! redb-backed store for the tiered timelog history.
+//! fjall-backed store for the tiered timelog history.
 //!
 //! Keyed by the GitLab Timelog ID so repeated polls dedupe naturally. The store
 //! holds a single set of entries spanning up to the configured retention
@@ -8,14 +8,10 @@
 //! [`HistoryCache::upsert`] writes whatever a poll returned and
 //! [`HistoryCache::prune`] drops anything past the retention window.
 
-use std::path::Path;
-
-use redb::TableDefinition;
 use serde::{Deserialize, Serialize};
 
 use crate::db::KvStore;
 use crate::error::Result;
-use crate::impl_redb_json_value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTimelog {
@@ -29,25 +25,23 @@ pub struct StoredTimelog {
     pub summary: String,
 }
 
-impl_redb_json_value!(StoredTimelog, "StoredTimelog");
-
-const HISTORY_TABLE: TableDefinition<u64, StoredTimelog> = TableDefinition::new("timelog_history");
+const HISTORY_KEYSPACE: &str = "timelog_history_v1";
 
 pub struct HistoryCache {
     store: KvStore<u64, StoredTimelog>,
 }
 
 impl HistoryCache {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open(db: &fjall::Database) -> Result<Self> {
         Ok(Self {
-            store: KvStore::open(path, HISTORY_TABLE)?,
+            store: KvStore::open(db, HISTORY_KEYSPACE)?,
         })
     }
 
     /// Insert or overwrite each event keyed by its `timelog_id`.
     pub fn upsert(&self, events: &[StoredTimelog]) -> Result<()> {
         for event in events {
-            self.store.put(event.timelog_id, event.clone())?;
+            self.store.put(event.timelog_id, event)?;
         }
         Ok(())
     }
@@ -116,8 +110,10 @@ mod tests {
 
     fn cache() -> (HistoryCache, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.redb");
-        (HistoryCache::open(&path).unwrap(), dir)
+        let db = fjall::Database::builder(dir.path().join("db"))
+            .open()
+            .unwrap();
+        (HistoryCache::open(&db).unwrap(), dir)
     }
 
     #[test]
@@ -217,12 +213,16 @@ mod tests {
     #[test]
     fn survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.redb");
+        let path = dir.path().join("db");
+        // Both the store and the Database must drop before reopening — fjall
+        // holds a single-process lock on the directory.
         {
-            let h = HistoryCache::open(&path).unwrap();
+            let db = fjall::Database::builder(&path).open().unwrap();
+            let h = HistoryCache::open(&db).unwrap();
             h.upsert(&[entry(1, 100, "persisted")]).unwrap();
         }
-        let h = HistoryCache::open(&path).unwrap();
+        let db = fjall::Database::builder(&path).open().unwrap();
+        let h = HistoryCache::open(&db).unwrap();
         let all = h.all_since(0).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].issue_title, "persisted");

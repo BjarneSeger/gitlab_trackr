@@ -257,8 +257,10 @@ impl GitlabApi for FakeGitlab {
 
 fn boards_cache() -> (BoardCache, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("boards.redb");
-    (BoardCache::open(&path).unwrap(), dir)
+    let db = fjall::Database::builder(dir.path().join("db"))
+        .open()
+        .unwrap();
+    (BoardCache::open(&db).unwrap(), dir)
 }
 
 fn iwl(project_id: i64, state: &str, labels: &[&str]) -> IssueWithLabels {
@@ -371,18 +373,18 @@ async fn enrich_graph_status_caches_per_project_within_one_call() {
 
 // ── clear_cache scoping ────────────────────────────────────────────────
 
-/// Build `Handlers` around a given connection state and a fresh set of temp
-/// databases.
+/// Build `Handlers` around a given connection state and a fresh temp database.
 fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let p = |name: &str| dir.path().join(name);
+    let db = fjall::Database::builder(dir.path().join("db"))
+        .open()
+        .unwrap();
     let session: SessionSlot = Arc::new(RwLock::new(state));
-    let cache = Arc::new(IssueCache::open(&p("cache.redb")).unwrap());
-    let boards = Arc::new(BoardCache::open(&p("boards.redb")).unwrap());
-    let history = Arc::new(HistoryCache::open(&p("history.redb")).unwrap());
+    let cache = Arc::new(IssueCache::open(&db).unwrap());
+    let boards = Arc::new(BoardCache::open(&db).unwrap());
+    let history = Arc::new(HistoryCache::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
-    let queue =
-        RetryQueue::new(Arc::clone(&session), &p("queue.redb"), Arc::clone(&config)).unwrap();
+    let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     (
         Handlers {
             session,

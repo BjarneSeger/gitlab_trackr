@@ -8,7 +8,7 @@ default-run = "gitlab-trackrd"
 [dependencies]
 gitlab.workspace = true
 notify.workspace = true
-redb.workspace = true
+fjall.workspace = true
 varlink.workspace = true
 tokio.workspace = true
 serde.workspace = true

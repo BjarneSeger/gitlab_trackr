@@ -18,19 +18,7 @@ pub enum Error {
     Secrets(String),
 
     #[error(transparent)]
-    DbOpen(#[from] redb::DatabaseError),
-
-    #[error(transparent)]
-    DbTransaction(#[from] redb::TransactionError),
-
-    #[error(transparent)]
-    DbTable(#[from] redb::TableError),
-
-    #[error(transparent)]
-    DbStorage(#[from] redb::StorageError),
-
-    #[error(transparent)]
-    DbCommit(#[from] redb::CommitError),
+    Fjall(#[from] fjall::Error),
 
     #[error("db: {0}")]
     Db(&'static str),

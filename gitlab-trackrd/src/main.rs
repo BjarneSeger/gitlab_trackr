@@ -46,9 +46,25 @@ async fn main() -> Result<()> {
         }
     };
     let socket = config.read().unwrap().server.resolved_socket();
-    let db_path = dirs::data_local_dir()
+    let data_dir = dirs::data_local_dir()
         .unwrap_or_else(|| "~/.local/share".into())
-        .join("gitlab-trackrd/cache.redb");
+        .join("gitlab-trackrd");
+    // One-time cleanup of the pre-fjall redb stores; their data was cache and
+    // is repopulated by the regular sync.
+    for file in [
+        "cache.redb",
+        "boards.redb",
+        "history.redb",
+        "queue.redb",
+        "dead_letter.redb",
+    ] {
+        if let Err(e) = std::fs::remove_file(data_dir.join(file))
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(error = %e, file, "failed to remove legacy redb store");
+        }
+    }
+    let db_dir = data_dir.join("db");
 
     // Credentials come only from the OS keychain (set via `tt login`). The
     // daemon never refuses to start: any failure here leaves it *dormant*
@@ -77,13 +93,12 @@ async fn main() -> Result<()> {
     };
     let session: SessionSlot = Arc::new(RwLock::new(initial));
 
-    let cache = Arc::new(IssueCache::open(&db_path)?);
-    let boards_db_path = db_path.with_file_name("boards.redb");
-    let boards = Arc::new(BoardCache::open(&boards_db_path)?);
-    let history_db_path = db_path.with_file_name("history.redb");
-    let history = Arc::new(HistoryCache::open(&history_db_path)?);
-    let queue_db_path = db_path.with_file_name("queue.redb");
-    let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path, Arc::clone(&config))?;
+    std::fs::create_dir_all(&db_dir)?;
+    let db = fjall::Database::builder(&db_dir).open()?;
+    let cache = Arc::new(IssueCache::open(&db)?);
+    let boards = Arc::new(BoardCache::open(&db)?);
+    let history = Arc::new(HistoryCache::open(&db)?);
+    let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
     // Woken when a runtime GitLab failure demotes the session to
     // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
     // not only at boot. See `reconnect::spawn`.
