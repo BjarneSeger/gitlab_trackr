@@ -105,6 +105,21 @@ impl IssueCache {
         Ok(true)
     }
 
+    /// The global numeric `id` (the value GraphQL embeds as
+    /// `gid://gitlab/Issue/<id>`) for the cached issue identified by
+    /// `(project_id, issue_iid)`, or `None` when it isn't cached. Shares the
+    /// `(project_id, iid)` key predicate with [`Self::remove_issue`].
+    pub fn issue_id(&self, project_id: i64, issue_iid: i64) -> Result<Option<i64>> {
+        let Some(b) = self.buckets()? else {
+            return Ok(None);
+        };
+        Ok(b.by_group
+            .into_values()
+            .flatten()
+            .find(|i| i.project_id == project_id && i.iid == issue_iid)
+            .map(|i| i.id))
+    }
+
     fn buckets(&self) -> Result<Option<IssueBuckets>> {
         self.store.get(KEY)
     }
@@ -299,6 +314,27 @@ mod tests {
     fn remove_issue_on_empty_cache_returns_false() {
         let (c, _td) = cache();
         assert!(!c.remove_issue(1, 1).unwrap());
+    }
+
+    #[test]
+    fn issue_id_resolves_by_project_and_iid() {
+        let (c, _td) = cache();
+        // issue_at uses project_id = 1 and sets id = iid * 10.
+        c.put(&[make_issue(1, "a"), make_issue(2, "b")]).unwrap();
+
+        assert_eq!(c.issue_id(1, 2).unwrap(), Some(20), "matched issue's global id");
+        assert_eq!(c.issue_id(1, 99).unwrap(), None, "no such iid");
+        assert_eq!(
+            c.issue_id(7, 1).unwrap(),
+            None,
+            "iid matches but project_id does not"
+        );
+    }
+
+    #[test]
+    fn issue_id_on_empty_cache_is_none() {
+        let (c, _td) = cache();
+        assert_eq!(c.issue_id(1, 1).unwrap(), None);
     }
 
     #[test]

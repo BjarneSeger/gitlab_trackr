@@ -1,7 +1,7 @@
 //! `gitlab-trackrd` — GitLab time-tracking varlink daemon.
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -14,6 +14,7 @@ mod gitlab;
 mod handlers;
 mod history;
 mod queue;
+mod reconnect;
 mod reload;
 mod secrets;
 mod server;
@@ -83,6 +84,10 @@ async fn main() -> Result<()> {
     let history = Arc::new(HistoryCache::open(&history_db_path)?);
     let queue_db_path = db_path.with_file_name("queue.redb");
     let queue = RetryQueue::new(Arc::clone(&session), &queue_db_path, Arc::clone(&config))?;
+    // Woken when a runtime GitLab failure demotes the session to
+    // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
+    // not only at boot. See `reconnect::spawn`.
+    let reconnect_signal = Arc::new(Notify::new());
     let handlers = Arc::new(Handlers {
         session,
         cache,
@@ -90,9 +95,17 @@ async fn main() -> Result<()> {
         history,
         queue,
         config: Arc::clone(&config),
+        reconnect_signal,
     });
 
     reload::spawn(Arc::clone(&config));
+
+    // If the daemon booted dormant because GitLab was unreachable, retry the
+    // connection in the background with exponential backoff. A successful
+    // reconnect flips the shared session to `Connected`, which drains the retry
+    // queue and resumes the refresh loops. No-op when already connected or when
+    // dormancy needs the user (bad token / logged out).
+    reconnect::spawn(Arc::clone(&handlers));
 
     let listener = server::make_listener(&socket)?;
 
@@ -120,8 +133,7 @@ async fn main() -> Result<()> {
         let handlers_ref = Arc::clone(&handlers);
         tokio::spawn(async move {
             info!("startup cache warm-up triggered");
-            handlers_ref.refresh_cache().await;
-            handlers_ref.backfill_history().await;
+            handlers_ref.warm_up().await;
         });
     }
 

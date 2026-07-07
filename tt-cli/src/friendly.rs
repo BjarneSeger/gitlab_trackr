@@ -32,8 +32,9 @@ fn message_for(reason: Option<NotAuthReason>, detail: Option<&str>) -> String {
             "GitLab rejected the stored token. Run `tt login` to re-authenticate."
         }
         Some(NotAuthReason::unreachable) => {
-            "Can't reach GitLab — the daemon is not connected. \
-             Restart the daemon once a connection can be established."
+            "Can't reach GitLab — the daemon is not connected. It retries \
+             automatically unless auto-reconnect is disabled; if so, restart it \
+             once GitLab is reachable."
         }
         Some(NotAuthReason::keychain_error) => {
             "Couldn't read your saved credentials from the keychain. \

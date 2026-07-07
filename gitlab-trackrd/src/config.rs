@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use confique::Config as ConfiqueConfig;
+use tracing::warn;
 
 /// Shared, swappable config read by every consumer at the moment of use, so a
 /// hot reload (see `reload`) takes effect without a restart.
@@ -58,6 +59,10 @@ pub struct Config {
     /// Retry-queue backoff and lifetime tuning.
     #[config(nested)]
     pub queue: QueueConfig,
+
+    /// Background auto-reconnect backoff (re-establishing a dormant session).
+    #[config(nested)]
+    pub reconnect: ReconnectConfig,
 }
 
 /// Varlink server settings (see `server.rs`).
@@ -226,16 +231,48 @@ impl QueueConfig {
     }
 }
 
-impl Default for QueueConfig {
-    /// Mirrors the `#[config(default = ...)]` values above; used as the worker's
-    /// `OnceLock` fallback and by the queue tests.
-    fn default() -> Self {
-        Self {
-            base_delay_secs: 1,
-            max_delay_secs: 1800,
-            max_lifetime_secs: 604800,
-            session_wait_secs: 30,
-        }
+/// Background auto-reconnect tuning, consumed by `reconnect.rs`.
+///
+/// When the daemon is dormant because GitLab was *unreachable* (the stored
+/// credentials are known-good), a background task retries the connection with
+/// exponential backoff using these values. Unlike the queue there is nothing to
+/// dead-letter, so retries continue indefinitely — the delay is merely capped —
+/// until the connection succeeds or the session state changes. The cap is kept
+/// short (a minute) so recovery is noticed promptly, versus the queue's 30-min
+/// cap tuned for long-lived write retries.
+#[derive(Debug, Clone, Copy, ConfiqueConfig)]
+pub struct ReconnectConfig {
+    /// Whether the daemon auto-reconnects after an unreachable-GitLab dormancy
+    /// (whether GitLab was down at boot or the connection dropped mid-run). When
+    /// `false`, recovery is manual (`tt login` or a restart) — the session still
+    /// honestly reports `unreachable`, it just isn't retried. Re-read on every
+    /// retry, so disabling it via a hot config reload stops an in-flight reconnect
+    /// on the next iteration. The supervisor task is long-lived (parked between
+    /// outages) and re-checks the dormant slot on a periodic tick (≤ `max_delay`),
+    /// so a `false`→`true` reload is picked up at the next tick — no disconnect,
+    /// `tt login`, or restart required.
+    #[config(default = true)]
+    pub enabled: bool,
+
+    /// Auto-reconnect exponential backoff: initial delay, in seconds.
+    #[config(default = 2)]
+    pub base_delay_secs: u64,
+
+    /// Auto-reconnect exponential backoff: maximum delay between attempts, in
+    /// seconds. (1 min.)
+    #[config(default = 60)]
+    pub max_delay_secs: u64,
+}
+
+impl ReconnectConfig {
+    /// Initial exponential-backoff delay.
+    pub fn base_delay(&self) -> Duration {
+        Duration::from_secs(self.base_delay_secs)
+    }
+
+    /// Exponential-backoff cap.
+    pub fn max_delay(&self) -> Duration {
+        Duration::from_secs(self.max_delay_secs)
     }
 }
 
@@ -246,14 +283,56 @@ pub fn config_path() -> PathBuf {
         .join("gitlab-trackrd/config.toml")
 }
 
+/// Double `current`, capped at `max`, saturating instead of panicking on
+/// overflow — the exponential-backoff step shared by the retry queue and the
+/// auto-reconnect loop. `Duration * u32` panics on overflow, so an absurd
+/// configured cap would crash the loop without the `checked_mul` guard.
+pub fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.checked_mul(2).unwrap_or(max).min(max)
+}
+
+/// Clamp a section's exponential-backoff `*_secs` pair into a sane range and
+/// warn on any change. A `base` of 0 would busy-spin the retry loop (a zero
+/// sleep between attempts); a `max` below `base` would collapse the schedule
+/// back to that zero after the first step. Values are otherwise left as-is —
+/// `next_backoff` handles the overflow ceiling.
+fn normalize_backoff(base_secs: &mut u64, max_secs: &mut u64, section: &str) {
+    if *base_secs == 0 {
+        warn!(section, "base_delay_secs of 0 would busy-spin the backoff loop; flooring to 1");
+        *base_secs = 1;
+    }
+    if *max_secs < *base_secs {
+        warn!(
+            section,
+            base = *base_secs,
+            max = *max_secs,
+            "max_delay_secs is below base_delay_secs; raising it to the base"
+        );
+        *max_secs = *base_secs;
+    }
+}
+
 /// Load the layered config: user file → system default → built-in defaults.
 ///
-/// Missing files are treated as empty layers; parse errors propagate.
+/// Missing files are treated as empty layers; parse errors propagate. Backoff
+/// delays are normalized (see [`normalize_backoff`]) so a hand-edited config
+/// can't busy-spin or overflow the retry loops.
 pub fn load() -> Result<Config, confique::Error> {
-    Config::builder()
+    let mut config = Config::builder()
         .file(config_path())
         .file(Path::new(SYSTEM_CONFIG))
-        .load()
+        .load()?;
+    normalize_backoff(
+        &mut config.reconnect.base_delay_secs,
+        &mut config.reconnect.max_delay_secs,
+        "reconnect",
+    );
+    normalize_backoff(
+        &mut config.queue.base_delay_secs,
+        &mut config.queue.max_delay_secs,
+        "queue",
+    );
+    Ok(config)
 }
 
 /// Load once and wrap for sharing across the daemon's tasks. Used at startup; a
@@ -289,4 +368,43 @@ pub fn defaults() -> Config {
 #[allow(dead_code)]
 pub fn template() -> String {
     confique::toml::template::<Config>(confique::toml::FormatOptions::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_defaults_are_short_and_enabled() {
+        let c = defaults();
+        assert!(c.reconnect.enabled);
+        assert_eq!(c.reconnect.base_delay(), Duration::from_secs(2));
+        assert_eq!(c.reconnect.max_delay(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn next_backoff_doubles_caps_and_saturates() {
+        let max = Duration::from_secs(60);
+        assert_eq!(next_backoff(Duration::from_secs(2), max), Duration::from_secs(4));
+        assert_eq!(next_backoff(Duration::from_secs(30), max), Duration::from_secs(60));
+        // Already at the cap: stays capped rather than growing.
+        assert_eq!(next_backoff(Duration::from_secs(60), max), Duration::from_secs(60));
+        // Doubling would overflow `Duration`: saturate to the cap, don't panic.
+        assert_eq!(next_backoff(Duration::from_secs(u64::MAX), max), max);
+    }
+
+    #[test]
+    fn normalize_backoff_floors_zero_and_orders() {
+        let (mut base, mut max) = (0u64, 0u64);
+        normalize_backoff(&mut base, &mut max, "test");
+        assert_eq!((base, max), (1, 1), "a zero base is floored and max raised to it");
+
+        let (mut base, mut max) = (2u64, 60u64);
+        normalize_backoff(&mut base, &mut max, "test");
+        assert_eq!((base, max), (2, 60), "in-range values are left untouched");
+
+        let (mut base, mut max) = (5u64, 3u64);
+        normalize_backoff(&mut base, &mut max, "test");
+        assert_eq!((base, max), (5, 5), "a max below base is raised to the base");
+    }
 }
