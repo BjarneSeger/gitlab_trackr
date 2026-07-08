@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "gitlab-trackrd"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -3069,7 +3069,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tt-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "carapace_spec_clap",
