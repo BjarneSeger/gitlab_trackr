@@ -15,7 +15,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 use gitlab_trackr_api::NotAuthReason;
 
@@ -26,6 +26,7 @@ use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::history::HistoryCache;
 use crate::queue::RetryQueue;
+use crate::search::SearchCache;
 
 mod refresh;
 mod varlink;
@@ -82,6 +83,11 @@ pub struct Handlers {
     pub cache: Arc<IssueCache>,
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
+    pub search: Arc<SearchCache>,
+    /// Serializes search-cache syncs: warm-up, the periodic loop, and
+    /// `ClearCache` can all trigger one concurrently, and a second concurrent
+    /// sync would only duplicate work — losers `try_lock` and skip.
+    pub search_sync_gate: Mutex<()>,
     pub queue: RetryQueue,
     /// Live daemon config; history windows are read from `config.history` at use
     /// time so a hot reload takes effect without a restart.

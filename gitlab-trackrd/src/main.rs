@@ -16,6 +16,7 @@ mod history;
 mod queue;
 mod reconnect;
 mod reload;
+mod search;
 mod secrets;
 mod server;
 mod service;
@@ -27,6 +28,7 @@ use gitlab::GitlabClient;
 use handlers::{ConnState, Handlers, Session, SessionSlot};
 use history::HistoryCache;
 use queue::RetryQueue;
+use search::SearchCache;
 use service::ServiceHandler;
 
 #[tokio::main]
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
     let cache = Arc::new(IssueCache::open(&db)?);
     let boards = Arc::new(BoardCache::open(&db)?);
     let history = Arc::new(HistoryCache::open(&db)?);
+    let search = Arc::new(SearchCache::open(&db)?);
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
     // Woken when a runtime GitLab failure demotes the session to
     // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
@@ -108,6 +111,8 @@ async fn main() -> Result<()> {
         cache,
         boards,
         history,
+        search,
+        search_sync_gate: tokio::sync::Mutex::new(()),
         queue,
         config: Arc::clone(&config),
         reconnect_signal,

@@ -383,6 +383,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let cache = Arc::new(IssueCache::open(&db).unwrap());
     let boards = Arc::new(BoardCache::open(&db).unwrap());
     let history = Arc::new(HistoryCache::open(&db).unwrap());
+    let search = Arc::new(crate::search::SearchCache::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     (
@@ -391,6 +392,8 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             cache,
             boards,
             history,
+            search,
+            search_sync_gate: tokio::sync::Mutex::new(()),
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
