@@ -35,6 +35,11 @@ async fn main() -> Result<()> {
     let output = args.output;
     match args.command {
         Command::List { groups } => cmd::list::run(groups, output).await,
+        Command::Search {
+            query,
+            kinds,
+            limit,
+        } => cmd::search::run(query, kinds, limit, output).await,
         Command::Log {
             iid,
             duration,
@@ -52,7 +57,8 @@ async fn main() -> Result<()> {
             slow,
             stale,
             issues,
-        } => cmd::refresh::run(quick, slow, stale, issues).await,
+            search,
+        } => cmd::refresh::run(quick, slow, stale, issues, search).await,
         Command::Config { action } => {
             cmd::config::run(action);
             Ok(())

@@ -10,7 +10,7 @@ use gitlab_trackr_api::VarlinkClientInterface;
 
 use crate::{client, config};
 
-pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool) -> Result<()> {
+pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool, search: bool) -> Result<()> {
     // Collect the requested scopes. No flags ⇒ `None`, which the daemon reads
     // as "clear everything".
     let mut scope: Vec<String> = Vec::new();
@@ -25,6 +25,9 @@ pub async fn run(quick: bool, slow: bool, stale: bool, issues: bool) -> Result<(
     }
     if issues {
         scope.push("issues".to_string());
+    }
+    if search {
+        scope.push("search".to_string());
     }
     let scope = if scope.is_empty() { None } else { Some(scope) };
 

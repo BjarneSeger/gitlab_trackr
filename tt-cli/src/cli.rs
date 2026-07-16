@@ -8,8 +8,9 @@ use clap::{Parser, Subcommand, ValueEnum};
     max_term_width = 100
 )]
 pub struct Cli {
-    /// Output format for data-returning commands (`list`, `history`, `whoami`).
-    /// Mutation commands accept the flag but keep their plain status messages.
+    /// Output format for data-returning commands (`list`, `search`, `history`,
+    /// `whoami`). Mutation commands accept the flag but keep their plain
+    /// status messages.
     #[arg(
         long = "output",
         short = 'o',
@@ -59,6 +60,20 @@ pub enum Command {
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<String>,
     },
+    /// Search the daemon's cached issues, merge requests, projects, and
+    /// groups. Matches titles, labels, and project/group paths
+    /// case-insensitively; a query like `#123` finds issues/MRs by number.
+    /// Pure cache read — freshness comes from the background search sync.
+    Search {
+        /// Search text.
+        query: String,
+        /// Restrict to one or more result kinds. Repeat the flag to combine.
+        #[arg(long = "kind", value_enum, value_name = "KIND")]
+        kinds: Vec<SearchKind>,
+        /// Maximum results per kind (daemon default: 50).
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Log time on an issue non-interactively.
     Log {
         /// Issue IID (per-project number, shown as `#42` in the GitLab UI).
@@ -104,6 +119,10 @@ pub enum Command {
         /// Clear the assigned-issue and board caches.
         #[arg(long)]
         issues: bool,
+        /// Clear the search cache (issues, MRs, projects, groups) and run a
+        /// full search resync.
+        #[arg(long)]
+        search: bool,
     },
     /// Inspect or scaffold the user configuration file.
     Config {
@@ -193,4 +212,14 @@ pub enum Shell {
     Zsh,
     Bash,
     Nu,
+}
+
+/// Result kinds `tt search` can restrict to (`--kind`). `mrs` maps to the
+/// wire value `merge_requests`.
+#[derive(Clone, Copy, ValueEnum)]
+pub enum SearchKind {
+    Issues,
+    Mrs,
+    Projects,
+    Groups,
 }
