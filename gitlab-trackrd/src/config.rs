@@ -63,6 +63,10 @@ pub struct Config {
     /// Background auto-reconnect backoff (re-establishing a dormant session).
     #[config(nested)]
     pub reconnect: ReconnectConfig,
+
+    /// Search-cache population and sync cadence.
+    #[config(nested)]
+    pub search: SearchConfig,
 }
 
 /// Varlink server settings (see `server.rs`).
@@ -276,6 +280,57 @@ impl ReconnectConfig {
     }
 }
 
+/// Search-cache sync tuning, consumed by `handlers/search_sync.rs`.
+///
+/// The search cache holds issues, merge requests, projects, and groups as
+/// individual entries. It is synced incrementally (`updated_after` deltas)
+/// on the partial cadence and fully resynced — which also reconciles
+/// deletions — on the full cadence. Both stamps persist across restarts, so
+/// restarting the daemon inside the partial interval does not re-poll GitLab.
+#[derive(Debug, ConfiqueConfig)]
+pub struct SearchConfig {
+    /// What the search cache holds for issues and merge requests: `"all"`
+    /// syncs everything your token can see (GitLab `scope=all`; on very large
+    /// instances the initial sync can be huge — prefer `"member"` there),
+    /// `"member"` only what is in projects you are a member of. Projects and
+    /// groups themselves are always membership-scoped.
+    #[config(default = "all")]
+    pub population: SearchPopulation,
+
+    /// Minimum seconds between incremental search-cache syncs. (30 min by
+    /// default.)
+    #[config(default = 1800)]
+    pub partial_interval_secs: u64,
+
+    /// Seconds between full search-cache resyncs, which also remove deleted
+    /// items. (7 days by default.)
+    #[config(default = 604800)]
+    pub full_interval_secs: u64,
+}
+
+/// Which issues/MRs the search cache is populated with — see
+/// [`SearchConfig::population`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SearchPopulation {
+    /// Everything the token can see (`scope=all` on the global endpoints).
+    All,
+    /// Only projects the user is a member of (one fetch per project).
+    Member,
+}
+
+impl SearchConfig {
+    /// Minimum gap between incremental syncs; also the sync loop's tick.
+    pub fn partial_interval(&self) -> Duration {
+        Duration::from_secs(self.partial_interval_secs)
+    }
+
+    /// Gap between full resyncs.
+    pub fn full_interval(&self) -> Duration {
+        Duration::from_secs(self.full_interval_secs)
+    }
+}
+
 /// `$XDG_CONFIG_HOME/gitlab-trackrd/config.toml` (falls back to `./`).
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
@@ -335,7 +390,29 @@ pub fn load() -> Result<Config, confique::Error> {
         &mut config.queue.max_delay_secs,
         "queue",
     );
+    normalize_search(&mut config.search);
     Ok(config)
+}
+
+/// Clamp the search sync cadences into a sane range and warn on any change.
+/// A partial interval of 0 would busy-spin the sync loop; a full interval
+/// below the partial one would make every sync a full resync.
+fn normalize_search(search: &mut SearchConfig) {
+    if search.partial_interval_secs < 60 {
+        warn!(
+            configured = search.partial_interval_secs,
+            "search.partial_interval_secs below 60 would hammer GitLab; flooring to 60"
+        );
+        search.partial_interval_secs = 60;
+    }
+    if search.full_interval_secs < search.partial_interval_secs {
+        warn!(
+            partial = search.partial_interval_secs,
+            full = search.full_interval_secs,
+            "search.full_interval_secs is below partial_interval_secs; raising it to the partial interval"
+        );
+        search.full_interval_secs = search.partial_interval_secs;
+    }
 }
 
 /// Load once and wrap for sharing across the daemon's tasks. Used at startup; a
@@ -403,6 +480,35 @@ mod tests {
         );
         // Doubling would overflow `Duration`: saturate to the cap, don't panic.
         assert_eq!(next_backoff(Duration::from_secs(u64::MAX), max), max);
+    }
+
+    #[test]
+    fn search_defaults() {
+        let c = defaults();
+        assert_eq!(c.search.population, SearchPopulation::All);
+        assert_eq!(c.search.partial_interval(), Duration::from_secs(1800));
+        assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
+    }
+
+    #[test]
+    fn normalize_search_floors_partial_and_orders_full() {
+        let mut s = defaults().search;
+        s.partial_interval_secs = 0;
+        s.full_interval_secs = 10;
+        normalize_search(&mut s);
+        assert_eq!(
+            (s.partial_interval_secs, s.full_interval_secs),
+            (60, 60),
+            "zero partial floored to a minute, inverted full raised to it"
+        );
+
+        let mut s = defaults().search;
+        normalize_search(&mut s);
+        assert_eq!(
+            (s.partial_interval_secs, s.full_interval_secs),
+            (1800, 604800),
+            "defaults are left untouched"
+        );
     }
 
     #[test]
