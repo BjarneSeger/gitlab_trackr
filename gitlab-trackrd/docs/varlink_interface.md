@@ -5,9 +5,12 @@ Machine-readable definition: [`gitlab-trackr-api/varlink/org.thehoster.gitlab.tr
 
 **Caching model**: the daemon has no TTL. Background sync owns freshness — a quick
 tier refreshes issues, boards, and the recent timelog window every few minutes, a slow
-tier re-polls the bulk history daily — and read methods serve whatever was last synced
-from the local store (`$XDG_DATA_HOME/gitlab-trackrd/db/`). Reads never trigger a
-GitLab round-trip.
+tier re-polls the bulk history daily, and the search corpus (issues, merge requests,
+projects, groups) syncs incrementally via `updated_after` deltas at most every
+`search.partial_interval_secs` (default 30 min) with a full resync — which also
+reconciles deletions — every `search.full_interval_secs` (default weekly). Read
+methods serve whatever was last synced from the local store
+(`$XDG_DATA_HOME/gitlab-trackrd/db/`). Reads never trigger a GitLab round-trip.
 
 **Write model**: mutating methods reply success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
@@ -58,6 +61,35 @@ type FailedTask (
 )
 ```
 
+```varlink
+type MergeRequest (
+  id:         int,    # global MR ID (unique across the GitLab instance)
+  iid:        int,    # per-project MR number (the "!7" shown in the UI)
+  project_id: int,
+  title:      string,
+  web_url:    string,
+  state:      string  # "opened" | "closed" | "merged" | "locked"
+)
+```
+
+```varlink
+type Project (
+  id:      int,
+  name:    string,
+  path:    string,  # full namespace path ("team/backend/api")
+  web_url: string
+)
+```
+
+```varlink
+type Group (
+  id:      int,
+  name:    string,
+  path:    string,  # full group path ("team/backend")
+  web_url: string
+)
+```
+
 # Errors
 
 `GitlabError (message: string)` — GitLab rejected the request (invalid input, API
@@ -96,6 +128,28 @@ Open issues assigned to the authenticated user, served purely from the cache.
 issues appearing under several requested groups are deduplicated. Omitted or empty
 `groups` returns everything. When the cache has never been populated: replies with an
 empty list if a session exists (first sync pending), `NotAuthenticated` otherwise.
+
+### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
+
+Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
+Matching is a case-insensitive substring test on issue/MR titles and labels and on
+project/group names and paths; a query of the exact form `#123` additionally matches
+issues and MRs by their per-project number. Descriptions are not cached and not
+searched.
+
+`kinds` restricts the reply to a subset of `issues`, `merge_requests`, `projects`,
+`groups` (omitted or empty = all four; an unknown kind is an eager `GitlabError`).
+`limit` caps each returned array separately (default 50; must be positive). Issues
+and MRs come newest-updated first, projects and groups sorted by path. An empty or
+whitespace-only `query` is an eager `GitlabError`.
+
+What the corpus contains depends on the `[search]` daemon config: issues and MRs
+from everything the token can see (`population = "all"`, the default) or only from
+member projects (`"member"`); projects and groups are always membership-scoped.
+Issue `graph_status` is filled best-effort from already-cached board labels and is
+empty for projects the board cache has never seen. When the cache has never been
+synced: replies with empty arrays if a session exists (first sync pending),
+`NotAuthenticated` otherwise.
 
 ### `GetHistory(days: ?int) -> (events: []HistoryEvent)`
 
@@ -172,6 +226,7 @@ each scope string selects a slice:
 | scope    | clears                                              | re-fetches            |
 |----------|-----------------------------------------------------|-----------------------|
 | `issues` | assigned-issues and board caches                    | (next quick refresh)  |
+| `search` | search corpus (issues, MRs, projects, groups) and its sync stamps | full search resync |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) | that window |
 | `slow`   | history between the quick and slow windows          | the slow window       |
 | `stale`  | history older than the slow window                  | the full retention window, then prunes |

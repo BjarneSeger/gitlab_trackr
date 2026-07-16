@@ -9,18 +9,26 @@ use tracing::{debug, info, instrument, warn};
 use gitlab_trackr_api::{
     Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_CloseIssue, Call_DismissFailure,
     Call_GetAssignedIssues, Call_GetFailures, Call_GetHistory, Call_Login, Call_Logout,
-    Call_PostTime, Call_RetryFailure, Call_UnassignSelf, Call_WhoAmI, FailedTask, HistoryEvent,
-    Issue, VarlinkInterface,
+    Call_PostTime, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask,
+    Group, HistoryEvent, Issue, MergeRequest, Project, VarlinkInterface,
 };
 
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::GitlabClient;
 use crate::history::HistoryCache;
+use crate::search::{SearchIssue, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
 
+use super::refresh::graph_status_from;
 use super::{
     ConnState, Handlers, Session, dormant_args, issue_ref_error, looks_like_duration, now_secs,
 };
+
+/// The kind strings `Search` accepts, matching the `ClearCache` scope style.
+const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups"];
+
+/// Per-kind result cap when the caller doesn't pass a `limit`.
+const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 impl Handlers {
     /// The global numeric issue ID (the one GraphQL embeds in
@@ -79,6 +87,49 @@ impl Handlers {
             Err(e) => warn!(error = %e, project_id, issue_iid, "cache issue removal failed"),
         }
     }
+
+    /// Map a cached search issue onto the wire `Issue`. `graph_status` is
+    /// best-effort from already-cached board labels only — `Search` is a pure
+    /// cache reader, so projects the assigned-issues refresh never touched
+    /// simply get an empty status.
+    fn wire_search_issue(&self, i: SearchIssue) -> Issue {
+        let board = self.boards.get(i.project_id).ok().flatten();
+        let graph_status = graph_status_from(board.as_deref(), &i.labels, &i.state);
+        Issue {
+            id: i.id,
+            iid: i.iid,
+            project_id: i.project_id,
+            title: i.title,
+            web_url: i.web_url,
+            state: i.state,
+            parent: i.parent,
+            total_time: i.total_time,
+            graph_status,
+        }
+    }
+}
+
+/// A cache read for one `Search` kind, degraded to empty on failure so the
+/// daemon stays available (the standing cache-error convention).
+fn read_or_empty<T>(result: crate::error::Result<Vec<T>>, kind: &str) -> Vec<T> {
+    result.unwrap_or_else(|e| {
+        warn!(error = %e, kind, "search cache read failed, treating as empty");
+        Vec::new()
+    })
+}
+
+/// Whether an issue/MR matches the search: case-insensitive substring on the
+/// title or any label, or an exact `#iid` reference query.
+fn search_item_matches(
+    needle: &str,
+    iid_query: Option<i64>,
+    title: &str,
+    labels: &[String],
+    iid: i64,
+) -> bool {
+    text_matches(needle, title)
+        || labels.iter().any(|l| text_matches(needle, l))
+        || iid_query == Some(iid)
 }
 
 #[async_trait::async_trait]
@@ -123,6 +174,131 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
+    async fn search(
+        &self,
+        call: &mut dyn Call_Search,
+        query: String,
+        kinds: Option<Vec<String>>,
+        limit: Option<i64>,
+    ) -> varlink::Result<()> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return call.reply_gitlab_error("empty search query".to_string());
+        }
+        let limit = match limit {
+            None => DEFAULT_SEARCH_LIMIT,
+            Some(n) if n > 0 => n as usize,
+            Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
+        };
+        let kinds = kinds.unwrap_or_default();
+        if let Some(bad) = kinds.iter().find(|k| !SEARCH_KINDS.contains(&k.as_str())) {
+            return call.reply_gitlab_error(format!(
+                "unknown kind {bad:?} (expected one of: {})",
+                SEARCH_KINDS.join(", ")
+            ));
+        }
+        let want = |k: &str| kinds.is_empty() || kinds.iter().any(|x| x == k);
+
+        // Cold cache (never synced): mirror `get_assigned_issues` — an honest
+        // NotAuthenticated while dormant, an empty reply while the first sync
+        // is still pending.
+        let never_synced = match self.search.stamps() {
+            Ok(s) => s.last_partial_sync_secs == 0,
+            Err(e) => {
+                warn!("search stamp read failed, treating as never synced: {e}");
+                true
+            }
+        };
+        if never_synced {
+            return match self.gitlab().await {
+                Ok(_) => call.reply(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                Err(e) => {
+                    let (reason, detail) = dormant_args(&e);
+                    call.reply_not_authenticated(reason, detail)
+                }
+            };
+        }
+
+        let iid_query = parse_iid_query(&query);
+
+        let mut issues: Vec<Issue> = Vec::new();
+        if want("issues") {
+            let mut hits: Vec<SearchIssue> = read_or_empty(self.search.all_issues(), "issues")
+                .into_iter()
+                .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
+                .collect();
+            hits.sort_by_key(|i| std::cmp::Reverse(i.updated_at_secs));
+            hits.truncate(limit);
+            issues = hits
+                .into_iter()
+                .map(|i| self.wire_search_issue(i))
+                .collect();
+        }
+
+        let mut merge_requests: Vec<MergeRequest> = Vec::new();
+        if want("merge_requests") {
+            let mut hits = read_or_empty(self.search.all_mrs(), "merge requests");
+            hits.retain(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid));
+            hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
+            hits.truncate(limit);
+            merge_requests = hits
+                .into_iter()
+                .map(|m| MergeRequest {
+                    id: m.id,
+                    iid: m.iid,
+                    project_id: m.project_id,
+                    title: m.title,
+                    web_url: m.web_url,
+                    state: m.state,
+                })
+                .collect();
+        }
+
+        let mut projects: Vec<Project> = Vec::new();
+        if want("projects") {
+            let mut hits = read_or_empty(self.search.all_projects(), "projects");
+            hits.retain(|p| text_matches(&needle, &p.name) || text_matches(&needle, &p.path));
+            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            hits.truncate(limit);
+            projects = hits
+                .into_iter()
+                .map(|p| Project {
+                    id: p.id,
+                    name: p.name,
+                    path: p.path,
+                    web_url: p.web_url,
+                })
+                .collect();
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        if want("groups") {
+            let mut hits = read_or_empty(self.search.all_groups(), "groups");
+            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.path));
+            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            hits.truncate(limit);
+            groups = hits
+                .into_iter()
+                .map(|g| Group {
+                    id: g.id,
+                    name: g.name,
+                    path: g.path,
+                    web_url: g.web_url,
+                })
+                .collect();
+        }
+
+        debug!(
+            issues = issues.len(),
+            merge_requests = merge_requests.len(),
+            projects = projects.len(),
+            groups = groups.len(),
+            "serving search results from cache"
+        );
+        call.reply(issues, merge_requests, projects, groups)
+    }
+
+    #[instrument(skip(self, call))]
     async fn clear_cache(
         &self,
         call: &mut dyn Call_ClearCache,
@@ -142,6 +318,14 @@ impl VarlinkInterface for Handlers {
                 warn!("board cache clear failed: {e}");
             } else {
                 info!("board cache cleared");
+            }
+        }
+
+        if want("search") {
+            if let Err(e) = self.search.clear() {
+                warn!("search cache clear failed: {e}");
+            } else {
+                info!("search cache cleared; next sync will be full");
             }
         }
 
@@ -177,16 +361,22 @@ impl VarlinkInterface for Handlers {
         if let Ok(gitlab) = self.gitlab().await {
             if all {
                 self.warm_up().await;
-            } else if want("stale") {
-                let retention = self.config.read().unwrap().history.retention();
-                self.refresh_history_window(&gitlab, retention).await;
-                self.prune_history();
-            } else if want("slow") {
-                let slow_window = self.config.read().unwrap().refresh.slow.window();
-                self.refresh_history_window(&gitlab, slow_window).await;
-            } else if want("quick") {
-                let quick_window = self.config.read().unwrap().refresh.quick.window();
-                self.refresh_history_window(&gitlab, quick_window).await;
+            } else {
+                if want("search") {
+                    // The clear above zeroed the stamps, so this runs full.
+                    self.sync_search_cache().await;
+                }
+                if want("stale") {
+                    let retention = self.config.read().unwrap().history.retention();
+                    self.refresh_history_window(&gitlab, retention).await;
+                    self.prune_history();
+                } else if want("slow") {
+                    let slow_window = self.config.read().unwrap().refresh.slow.window();
+                    self.refresh_history_window(&gitlab, slow_window).await;
+                } else if want("quick") {
+                    let quick_window = self.config.read().unwrap().refresh.quick.window();
+                    self.refresh_history_window(&gitlab, quick_window).await;
+                }
             }
         }
 

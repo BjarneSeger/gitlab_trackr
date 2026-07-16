@@ -460,7 +460,8 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
 
 /// Build `Handlers` with a dormant (no-GitLab) session, so `clear_cache`
 /// clears without the follow-up re-fetch — letting us assert the bands.
-fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
+/// `pub(crate)` so the `service.rs` dispatch smoke test can borrow it.
+pub(crate) fn dormant_handlers() -> (Handlers, tempfile::TempDir) {
     handlers_with(ConnState::Dormant(DormancyReason::NoCredentials))
 }
 
@@ -1064,6 +1065,287 @@ async fn search_sync_permanent_failure_does_not_demote() {
             .is_err(),
         "no reconnect signal for a permanent error"
     );
+}
+
+// ── Search: pure cache reader ──────────────────────────────────────────
+
+use gitlab_trackr_api::{Call_Search, Search_Reply};
+
+/// Parsed parameters from a successful `Search` reply.
+fn reply_search(call: &mut gitlab_trackr_api::AsyncCall) -> Search_Reply {
+    let reply = call.take_reply().expect("a reply");
+    assert!(
+        reply.error.is_none(),
+        "expected success, got {:?}",
+        reply.error
+    );
+    serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply")
+}
+
+/// Drive `Search` against `h` and parse the successful reply.
+async fn run_search(
+    h: &Handlers,
+    query: &str,
+    kinds: Option<Vec<String>>,
+    limit: Option<i64>,
+) -> Search_Reply {
+    use gitlab_trackr_api::AsyncCall;
+    let mut call = AsyncCall::default();
+    h.search(
+        &mut call as &mut dyn Call_Search,
+        query.to_string(),
+        kinds,
+        limit,
+    )
+    .await
+    .unwrap();
+    reply_search(&mut call)
+}
+
+/// Seed all four search kinds and stamp the cache as synced.
+fn seed_search_cache(h: &Handlers) {
+    let mut labeled = search_issue(2, "unrelated title");
+    labeled.labels = vec!["Backend".to_string()];
+    h.search
+        .upsert_issues(&[search_issue(1, "OAuth token refresh"), labeled])
+        .unwrap();
+    h.search
+        .upsert_mrs(&[search_mr(3, "Fix oauth flow")])
+        .unwrap();
+    h.search
+        .upsert_projects(&[search_project(4, "team/auth-service")])
+        .unwrap();
+    h.search.upsert_groups(&[search_group(5, "team")]).unwrap();
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: 1,
+            last_full_sync_secs: 1,
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn search_matches_title_labels_and_paths_case_insensitively() {
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    let r = run_search(&h, "OAUTH", None, None).await;
+    assert_eq!(r.issues.len(), 1, "title substring match");
+    assert_eq!(r.issues[0].id, 1);
+    assert_eq!(r.merge_requests.len(), 1, "MR title match");
+    assert!(r.projects.is_empty());
+    assert!(r.groups.is_empty());
+
+    let r = run_search(&h, "backend", None, None).await;
+    assert_eq!(r.issues.len(), 1, "label match");
+    assert_eq!(r.issues[0].id, 2);
+
+    let r = run_search(&h, "team", None, None).await;
+    assert_eq!(r.projects.len(), 1, "project path match");
+    assert_eq!(r.groups.len(), 1, "group path match");
+}
+
+#[tokio::test]
+async fn search_iid_reference_matches_issues_and_mrs() {
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    // search_issue(1, ..) has iid 10; search_mr(3, ..) has iid 30.
+    let r = run_search(&h, "#10", None, None).await;
+    assert_eq!(r.issues.len(), 1, "issue found by #iid");
+    assert!(r.merge_requests.is_empty(), "no MR has iid 10");
+
+    let r = run_search(&h, "#30", None, None).await;
+    assert!(r.issues.is_empty());
+    assert_eq!(r.merge_requests.len(), 1, "MR found by #iid");
+}
+
+#[tokio::test]
+async fn search_kinds_filter_restricts_the_reply() {
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    let r = run_search(&h, "team", Some(vec!["projects".to_string()]), None).await;
+    assert_eq!(r.projects.len(), 1);
+    assert!(
+        r.groups.is_empty(),
+        "matching group suppressed by the kinds filter"
+    );
+}
+
+#[tokio::test]
+async fn search_orders_by_recency_and_applies_per_kind_limit() {
+    let (h, _dir) = dormant_handlers();
+    let mut old = search_issue(1, "match old");
+    old.updated_at_secs = 100;
+    let mut new = search_issue(2, "match new");
+    new.updated_at_secs = 200;
+    h.search.upsert_issues(&[old, new]).unwrap();
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: 1,
+            last_full_sync_secs: 1,
+        })
+        .unwrap();
+
+    let r = run_search(&h, "match", None, Some(1)).await;
+    assert_eq!(r.issues.len(), 1, "per-kind limit applied");
+    assert_eq!(r.issues[0].id, 2, "most recently updated wins");
+}
+
+#[tokio::test]
+async fn search_rejects_bad_arguments_eagerly() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    for (query, kinds, limit) in [
+        ("  ", None, None),
+        ("x", Some(vec!["epics".to_string()]), None),
+        ("x", None, Some(0)),
+        ("x", None, Some(-3)),
+    ] {
+        let mut call = AsyncCall::default();
+        h.search(
+            &mut call as &mut dyn Call_Search,
+            query.to_string(),
+            kinds,
+            limit,
+        )
+        .await
+        .unwrap();
+        let reply = call.take_reply().expect("a reply");
+        assert_eq!(
+            reply.error.as_deref(),
+            Some("org.thehoster.gitlab.trackrd.GitlabError"),
+            "bad args must be rejected eagerly"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_cold_cache_dormant_is_not_authenticated() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+
+    let mut call = AsyncCall::default();
+    h.search(
+        &mut call as &mut dyn Call_Search,
+        "x".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "never-synced cache + no session → honest auth error"
+    );
+}
+
+#[tokio::test]
+async fn search_cold_cache_connected_is_empty() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    let r = run_search(&h, "canned", None, None).await;
+    assert!(
+        r.issues.is_empty() && r.merge_requests.is_empty(),
+        "first sync still pending → empty reply, no fetch from the read path"
+    );
+    assert_eq!(
+        fake.project_list_calls.load(Ordering::SeqCst),
+        0,
+        "the read handler must never touch GitLab"
+    );
+}
+
+#[tokio::test]
+async fn search_graph_status_comes_from_cached_boards_only() {
+    let (h, _dir) = dormant_handlers();
+    h.boards.put(1, vec!["Doing".to_string()]).unwrap();
+
+    let mut on_board = search_issue(1, "match on-board");
+    on_board.labels = vec!["random".to_string(), "Doing".to_string()];
+    let mut off_board = search_issue(2, "match off-board");
+    off_board.labels = vec!["random".to_string()];
+    let mut foreign = search_issue(3, "match foreign project");
+    foreign.project_id = 99;
+    h.search
+        .upsert_issues(&[on_board, off_board, foreign])
+        .unwrap();
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: 1,
+            last_full_sync_secs: 1,
+        })
+        .unwrap();
+
+    let r = run_search(&h, "match", None, None).await;
+    let by_id: HashMap<i64, &Issue> = r.issues.iter().map(|i| (i.id, i)).collect();
+    assert_eq!(by_id[&1].graph_status, "Doing", "board label matched");
+    assert_eq!(
+        by_id[&2].graph_status, "opened",
+        "no matching label → state fallback"
+    );
+    assert_eq!(
+        by_id[&3].graph_status, "",
+        "project without cached board → empty, no fetch"
+    );
+}
+
+#[tokio::test]
+async fn clear_cache_search_scope_empties_and_resets_stamps() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(
+        &mut call as &mut dyn Call_ClearCache,
+        Some(vec!["search".to_string()]),
+    )
+    .await
+    .unwrap();
+
+    assert!(h.search.all_issues().unwrap().is_empty());
+    assert!(h.search.all_projects().unwrap().is_empty());
+    assert_eq!(
+        h.search.stamps().unwrap().last_partial_sync_secs,
+        0,
+        "stamps reset so the next sync runs full"
+    );
+    // Dormant → no re-fetch; history untouched by the search scope.
+}
+
+#[tokio::test]
+async fn clear_cache_search_scope_triggers_full_resync_when_connected() {
+    use gitlab_trackr_api::AsyncCall;
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(
+        &mut call as &mut dyn Call_ClearCache,
+        Some(vec!["search".to_string()]),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        fake.project_list_calls.load(Ordering::SeqCst) > 0,
+        "connected clear re-syncs immediately"
+    );
+    assert_eq!(
+        h.search.all_issues().unwrap().len(),
+        1,
+        "cache repopulated from the canned full sync"
+    );
+    assert!(h.search.stamps().unwrap().last_full_sync_secs > 0);
 }
 
 #[tokio::test]

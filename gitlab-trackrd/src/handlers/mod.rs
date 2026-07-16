@@ -34,7 +34,7 @@ mod search_sync;
 mod varlink;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Live GitLab connection. Carries enough state for `WhoAmI` to answer without
 /// a round-trip.

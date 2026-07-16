@@ -196,19 +196,31 @@ pub(crate) async fn enrich_graph_status(
             }
         };
 
-        issue.graph_status = match board_labels {
-            Some(board) => labels
-                .iter()
-                .find(|l| board.iter().any(|b| b == *l))
-                .cloned()
-                .unwrap_or_else(|| issue.state.clone()),
-            None => String::new(),
-        };
+        issue.graph_status = graph_status_from(board_labels.as_deref(), &labels, &issue.state);
 
         out.push(issue);
     }
 
     out
+}
+
+/// The board-derived `graph_status` for an issue: the first of its labels that
+/// appears in the project's board lists, the issue's state when none matches,
+/// or empty when the board labels are unknown. Shared by the assigned-issues
+/// enrichment above and the `Search` reply mapping.
+pub(crate) fn graph_status_from(
+    board_labels: Option<&[String]>,
+    labels: &[String],
+    state: &str,
+) -> String {
+    match board_labels {
+        Some(board) => labels
+            .iter()
+            .find(|l| board.iter().any(|b| b == *l))
+            .cloned()
+            .unwrap_or_else(|| state.to_string()),
+        None => String::new(),
+    }
 }
 
 /// Fill `project_id` on a fetched timelog from the issue cache.

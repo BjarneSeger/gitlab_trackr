@@ -34,6 +34,29 @@ type FailedTask (
   failed_at: int
 )
 
+type MergeRequest (
+  id: int,
+  iid: int,
+  project_id: int,
+  title: string,
+  web_url: string,
+  state: string
+)
+
+type Project (
+  id: int,
+  name: string,
+  path: string,
+  web_url: string
+)
+
+type Group (
+  id: int,
+  name: string,
+  path: string,
+  web_url: string
+)
+
 error GitlabError (message: string)
 
 type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected, logged_out)
@@ -41,6 +64,8 @@ type NotAuthReason (no_credentials, keychain_error, unreachable, token_rejected,
 error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
+
+method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
 method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
 

@@ -12,10 +12,10 @@ use varlink::sansio::ServerEvent;
 use gitlab_trackr_api::{
     AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures,
     Call_CloseIssue, Call_DismissFailure, Call_GetAssignedIssues, Call_GetFailures,
-    Call_GetHistory, Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_UnassignSelf,
-    Call_WhoAmI, ClearCache_Args, CloseIssue_Args, DismissFailure_Args, GetAssignedIssues_Args,
-    GetHistory_Args, Login_Args, PostTime_Args, RetryFailure_Args, UnassignSelf_Args,
-    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_GetHistory, Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_Search,
+    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, CloseIssue_Args, DismissFailure_Args,
+    GetAssignedIssues_Args, GetHistory_Args, Login_Args, PostTime_Args, RetryFailure_Args,
+    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -222,6 +222,31 @@ async fn handle_trackrd(
                 .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, args.groups)
                 .await?;
         }
+        "org.thehoster.gitlab.trackrd.Search" => {
+            // `query` is required, so a missing `parameters` block is an error
+            // (the `PostTime` pattern, not the defaulting one).
+            let Some(args_val) = params else {
+                return Ok(Some(Reply::error(
+                    "org.varlink.service.InvalidParameter",
+                    Some(serde_json::json!({"parameter": "parameters"})),
+                )));
+            };
+            let args: Search_Args = serde_json::from_value(args_val).map_err(|e| {
+                varlink::Error(
+                    varlink::ErrorKind::InvalidParameter(e.to_string()),
+                    None,
+                    None,
+                )
+            })?;
+            handlers
+                .search(
+                    &mut call as &mut dyn Call_Search,
+                    args.query,
+                    args.kinds,
+                    args.limit,
+                )
+                .await?;
+        }
         "org.thehoster.gitlab.trackrd.PostTime" => {
             let Some(args_val) = params else {
                 return Ok(Some(Reply::error(
@@ -345,4 +370,31 @@ async fn handle_trackrd(
         }
     }
     Ok(call.take_reply())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the hand-written dispatch above: a method that exists in the
+    /// generated `VarlinkInterface` trait but has no arm in `handle_trackrd`
+    /// compiles fine and only fails at runtime as `MethodNotFound` — this
+    /// test turns that silent trap into a red test.
+    #[tokio::test]
+    async fn dispatch_has_an_arm_for_search() {
+        let (handlers, _dir) = crate::handlers::tests::dormant_handlers();
+        let reply = handle_trackrd(
+            "org.thehoster.gitlab.trackrd.Search",
+            Some(serde_json::json!({"query": "x"})),
+            &handlers,
+        )
+        .await
+        .unwrap()
+        .expect("a reply");
+        assert_ne!(
+            reply.error.as_deref(),
+            Some("org.varlink.service.MethodNotFound"),
+            "Search is missing its dispatch arm in handle_trackrd"
+        );
+    }
 }
