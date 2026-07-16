@@ -13,6 +13,7 @@ use gitlab::api::{AsyncQuery, UrlBase};
 use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
+use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
 use gitlab_trackr_api::Issue;
 
 pub struct GitlabClient {
@@ -91,6 +92,33 @@ pub trait GitlabApi: Send + Sync {
     async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()>;
 
     async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>>;
+
+    /// Issues for the search cache. `project = None` hits the global endpoint
+    /// with `scope=all`; `Some(id)` hits `/projects/:id/issues` (member
+    /// population). No state filter — closed issues stay searchable, and the
+    /// incremental sync sees close transitions as ordinary updates.
+    async fn fetch_issues_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchIssue>>;
+
+    /// Merge requests for the search cache; same shape as
+    /// [`GitlabApi::fetch_issues_for_search`].
+    async fn fetch_merge_requests_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchMr>>;
+
+    /// All projects the user is a member of (`membership=true`), always the
+    /// full list — the membership set is small and has no reliable delta
+    /// filter (renames don't bump `last_activity_at`).
+    async fn fetch_member_projects(&self) -> Result<Vec<SearchProject>>;
+
+    /// All groups the user is a member of (`min_access_level=guest`; a bare
+    /// `GET /groups` would also include public non-member groups).
+    async fn fetch_member_groups(&self) -> Result<Vec<SearchGroup>>;
 }
 
 impl GitlabClient {
@@ -424,6 +452,154 @@ impl GitlabApi for GitlabClient {
         }
         Ok(labels)
     }
+
+    #[instrument(skip(self))]
+    async fn fetch_issues_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchIssue>> {
+        use gitlab::api::issues::{IssueScope, Issues, ProjectIssues};
+        use gitlab::api::{Pagination, paged};
+
+        let raw = if let Some(project_id) = project {
+            let mut builder = ProjectIssues::builder();
+            builder.project(project_id as u64);
+            if let Some(after) = updated_after {
+                builder.updated_after(after);
+            }
+            let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_paged_query(
+                &self.inner,
+                "fetch search issues",
+                paged(query, Pagination::All),
+            )
+            .await?
+        } else {
+            let mut builder = Issues::builder();
+            builder.scope(IssueScope::All);
+            if let Some(after) = updated_after {
+                builder.updated_after(after);
+            }
+            let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_paged_query(
+                &self.inner,
+                "fetch search issues",
+                paged(query, Pagination::All),
+            )
+            .await?
+        };
+
+        let issues: Vec<SearchIssue> = raw
+            .iter()
+            .map(search_issue_from_json)
+            .filter(|i| i.id > 0)
+            .collect();
+        info!(count = issues.len(), "fetched search issues from GitLab");
+        Ok(issues)
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_merge_requests_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Vec<SearchMr>> {
+        use gitlab::api::merge_requests::{MergeRequestScope, MergeRequests};
+        use gitlab::api::projects::merge_requests::MergeRequests as ProjectMergeRequests;
+        use gitlab::api::{Pagination, paged};
+
+        let raw = if let Some(project_id) = project {
+            let mut builder = ProjectMergeRequests::builder();
+            builder.project(project_id as u64);
+            if let Some(after) = updated_after {
+                builder.updated_after(after);
+            }
+            let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_paged_query(
+                &self.inner,
+                "fetch search MRs",
+                paged(query, Pagination::All),
+            )
+            .await?
+        } else {
+            let mut builder = MergeRequests::builder();
+            builder.scope(MergeRequestScope::All);
+            if let Some(after) = updated_after {
+                builder.updated_after(after);
+            }
+            let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+            run_paged_query(
+                &self.inner,
+                "fetch search MRs",
+                paged(query, Pagination::All),
+            )
+            .await?
+        };
+
+        let mrs: Vec<SearchMr> = raw
+            .iter()
+            .map(search_mr_from_json)
+            .filter(|m| m.id > 0)
+            .collect();
+        info!(
+            count = mrs.len(),
+            "fetched search merge requests from GitLab"
+        );
+        Ok(mrs)
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_member_projects(&self) -> Result<Vec<SearchProject>> {
+        use gitlab::api::projects::Projects;
+        use gitlab::api::{Pagination, paged};
+
+        let mut builder = Projects::builder();
+        builder.membership(true).simple(true);
+        let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+        let raw = run_paged_query(
+            &self.inner,
+            "fetch member projects",
+            paged(query, Pagination::All),
+        )
+        .await?;
+
+        let projects: Vec<SearchProject> = raw
+            .iter()
+            .map(search_project_from_json)
+            .filter(|p| p.id > 0)
+            .collect();
+        info!(
+            count = projects.len(),
+            "fetched member projects from GitLab"
+        );
+        Ok(projects)
+    }
+
+    #[instrument(skip(self))]
+    async fn fetch_member_groups(&self) -> Result<Vec<SearchGroup>> {
+        use gitlab::api::common::AccessLevel;
+        use gitlab::api::groups::Groups;
+        use gitlab::api::{Pagination, paged};
+
+        let mut builder = Groups::builder();
+        builder.min_access_level(AccessLevel::Guest);
+        let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+        let raw = run_paged_query(
+            &self.inner,
+            "fetch member groups",
+            paged(query, Pagination::All),
+        )
+        .await?;
+
+        let groups: Vec<SearchGroup> = raw
+            .iter()
+            .map(search_group_from_json)
+            .filter(|g| g.id > 0)
+            .collect();
+        info!(count = groups.len(), "fetched member groups from GitLab");
+        Ok(groups)
+    }
 }
 
 /// Run `query` against `client`, retrying transient errors with exponential
@@ -432,13 +608,26 @@ async fn run_issues_query<Q>(client: &gitlab::AsyncGitlab, query: Q) -> Result<V
 where
     Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
 {
-    let raw = retry_transient("fetch issues", || async {
-        query.query_async(client).await.map_err(classify)
-    })
-    .await?;
+    let raw = run_paged_query(client, "fetch issues", query).await?;
     let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
     info!(count = issues.len(), "fetched issues from GitLab");
     Ok(issues)
+}
+
+/// Run a paged list `query` against `client` into raw JSON, retrying transient
+/// errors with exponential back-off (see [`retry_transient`]).
+async fn run_paged_query<Q>(
+    client: &gitlab::AsyncGitlab,
+    op: &str,
+    query: Q,
+) -> Result<Vec<serde_json::Value>>
+where
+    Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
+{
+    retry_transient(op, || async {
+        query.query_async(client).await.map_err(classify)
+    })
+    .await
 }
 
 /// Map a GitLab API error to [`Error::Transient`] for network failures and
@@ -482,14 +671,7 @@ fn classify_build(e: gitlab::GitlabError) -> Error {
 /// does not crash the whole list. `graph_status` is left empty here — the
 /// handler fills it after consulting the board cache.
 fn issue_with_labels(v: &serde_json::Value) -> IssueWithLabels {
-    let labels = v["labels"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| l.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let labels = labels_from(v);
 
     IssueWithLabels {
         issue: Issue {
@@ -507,6 +689,83 @@ fn issue_with_labels(v: &serde_json::Value) -> IssueWithLabels {
             graph_status: String::new(),
         },
         labels,
+    }
+}
+
+/// Extract the `labels` string array; missing or malformed → empty.
+fn labels_from(v: &serde_json::Value) -> Vec<String> {
+    v["labels"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse an RFC 3339 timestamp value into unix seconds; missing or malformed
+/// → 0 (sorts oldest, never blocks storing the entry).
+fn rfc3339_secs(v: &serde_json::Value) -> u64 {
+    v.as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp().max(0) as u64)
+        .unwrap_or(0)
+}
+
+/// Convert a raw issues-API value into a [`SearchIssue`], in the same
+/// defensive style as [`issue_with_labels`]. Callers drop entries whose `id`
+/// parsed to 0.
+fn search_issue_from_json(v: &serde_json::Value) -> SearchIssue {
+    SearchIssue {
+        id: v["id"].as_i64().unwrap_or(0),
+        iid: v["iid"].as_i64().unwrap_or(0),
+        project_id: v["project_id"].as_i64().unwrap_or(0),
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        web_url: v["web_url"].as_str().unwrap_or("").to_string(),
+        state: v["state"].as_str().unwrap_or("").to_string(),
+        labels: labels_from(v),
+        parent: v["epic"]["url"].as_str().unwrap_or("").to_string(),
+        total_time: v["time_stats"]["human_total_time_spent"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        updated_at_secs: rfc3339_secs(&v["updated_at"]),
+    }
+}
+
+/// Convert a raw merge-requests-API value into a [`SearchMr`].
+fn search_mr_from_json(v: &serde_json::Value) -> SearchMr {
+    SearchMr {
+        id: v["id"].as_i64().unwrap_or(0),
+        iid: v["iid"].as_i64().unwrap_or(0),
+        project_id: v["project_id"].as_i64().unwrap_or(0),
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        web_url: v["web_url"].as_str().unwrap_or("").to_string(),
+        state: v["state"].as_str().unwrap_or("").to_string(),
+        labels: labels_from(v),
+        updated_at_secs: rfc3339_secs(&v["updated_at"]),
+    }
+}
+
+/// Convert a raw projects-API value (`simple=true` fields) into a
+/// [`SearchProject`].
+fn search_project_from_json(v: &serde_json::Value) -> SearchProject {
+    SearchProject {
+        id: v["id"].as_i64().unwrap_or(0),
+        name: v["name"].as_str().unwrap_or("").to_string(),
+        path: v["path_with_namespace"].as_str().unwrap_or("").to_string(),
+        web_url: v["web_url"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// Convert a raw groups-API value into a [`SearchGroup`].
+fn search_group_from_json(v: &serde_json::Value) -> SearchGroup {
+    SearchGroup {
+        id: v["id"].as_i64().unwrap_or(0),
+        name: v["name"].as_str().unwrap_or("").to_string(),
+        path: v["full_path"].as_str().unwrap_or("").to_string(),
+        web_url: v["web_url"].as_str().unwrap_or("").to_string(),
     }
 }
 

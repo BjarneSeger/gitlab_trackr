@@ -378,6 +378,30 @@ mod tests {
         async fn fetch_board_list_labels(&self, _p: i64) -> crate::error::Result<Vec<String>> {
             unimplemented!()
         }
+        async fn fetch_issues_for_search(
+            &self,
+            _p: Option<i64>,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> crate::error::Result<Vec<crate::search::SearchIssue>> {
+            unimplemented!()
+        }
+        async fn fetch_merge_requests_for_search(
+            &self,
+            _p: Option<i64>,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> crate::error::Result<Vec<crate::search::SearchMr>> {
+            unimplemented!()
+        }
+        async fn fetch_member_projects(
+            &self,
+        ) -> crate::error::Result<Vec<crate::search::SearchProject>> {
+            unimplemented!()
+        }
+        async fn fetch_member_groups(
+            &self,
+        ) -> crate::error::Result<Vec<crate::search::SearchGroup>> {
+            unimplemented!()
+        }
     }
 
     fn unreachable_slot() -> SessionSlot {

@@ -21,6 +21,7 @@ use crate::error::{DormancyReason, Result as TrackrResult};
 use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
 use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
+use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
 
 fn issue(project_id: i64, iid: i64, title: &str, web_url: &str) -> Issue {
     Issue {
@@ -139,11 +140,24 @@ enum FetchErr {
 struct FakeGitlab {
     board_labels: Mutex<HashMap<i64, TrackrResult<Vec<String>>>>,
     board_calls: AtomicUsize,
-    /// When set, `fetch_assigned_issues` / `fetch_my_timelogs` fail this way.
+    /// When set, `fetch_assigned_issues` / `fetch_my_timelogs` and the search
+    /// fetches fail this way.
     fetch_err: Option<FetchErr>,
     /// When set, `add_spent_time` fails this way (drives the write-handler
     /// deferral path).
     write_err: Option<FetchErr>,
+    /// Canned results for the search-sync fetches.
+    search_issues: Mutex<Vec<SearchIssue>>,
+    search_mrs: Mutex<Vec<SearchMr>>,
+    search_projects: Mutex<Vec<SearchProject>>,
+    search_groups: Mutex<Vec<SearchGroup>>,
+    /// Per-call argument log of `fetch_issues_for_search` /
+    /// `fetch_merge_requests_for_search`, so sync tests can assert the
+    /// population mode (project) and the incremental cursor (updated_after).
+    search_issue_calls: Mutex<Vec<(Option<i64>, Option<chrono::DateTime<chrono::Utc>>)>>,
+    search_mr_calls: Mutex<Vec<(Option<i64>, Option<chrono::DateTime<chrono::Utc>>)>>,
+    project_list_calls: AtomicUsize,
+    group_list_calls: AtomicUsize,
 }
 
 impl FakeGitlab {
@@ -252,6 +266,48 @@ impl GitlabApi for FakeGitlab {
             Some(Err(e)) => Err(e),
             None => Ok(vec![]),
         }
+    }
+    async fn fetch_issues_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> TrackrResult<Vec<SearchIssue>> {
+        self.search_issue_calls
+            .lock()
+            .unwrap()
+            .push((project, updated_after));
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        Ok(self.search_issues.lock().unwrap().clone())
+    }
+    async fn fetch_merge_requests_for_search(
+        &self,
+        project: Option<i64>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> TrackrResult<Vec<SearchMr>> {
+        self.search_mr_calls
+            .lock()
+            .unwrap()
+            .push((project, updated_after));
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        Ok(self.search_mrs.lock().unwrap().clone())
+    }
+    async fn fetch_member_projects(&self) -> TrackrResult<Vec<SearchProject>> {
+        self.project_list_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        Ok(self.search_projects.lock().unwrap().clone())
+    }
+    async fn fetch_member_groups(&self) -> TrackrResult<Vec<SearchGroup>> {
+        self.group_list_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        Ok(self.search_groups.lock().unwrap().clone())
     }
 }
 

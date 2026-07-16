@@ -749,6 +749,26 @@ mod tests {
         async fn fetch_board_list_labels(&self, _p: i64) -> TrackrResult<Vec<String>> {
             unimplemented!()
         }
+        async fn fetch_issues_for_search(
+            &self,
+            _p: Option<i64>,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> TrackrResult<Vec<crate::search::SearchIssue>> {
+            unimplemented!()
+        }
+        async fn fetch_merge_requests_for_search(
+            &self,
+            _p: Option<i64>,
+            _after: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> TrackrResult<Vec<crate::search::SearchMr>> {
+            unimplemented!()
+        }
+        async fn fetch_member_projects(&self) -> TrackrResult<Vec<crate::search::SearchProject>> {
+            unimplemented!()
+        }
+        async fn fetch_member_groups(&self) -> TrackrResult<Vec<crate::search::SearchGroup>> {
+            unimplemented!()
+        }
     }
 
     /// Spawn the worker with one task on the channel, close the sender so the
