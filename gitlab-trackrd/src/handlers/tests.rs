@@ -824,3 +824,266 @@ async fn get_assigned_issues_empty_cache_dormant_is_not_authenticated() {
         "cold cache + no session → honest auth error"
     );
 }
+
+// ── search sync engine ─────────────────────────────────────────────────
+
+use crate::config::SearchPopulation;
+use crate::search::SyncStamps;
+
+fn search_issue(id: i64, title: &str) -> SearchIssue {
+    SearchIssue {
+        id,
+        iid: id * 10,
+        project_id: 1,
+        title: title.to_string(),
+        web_url: format!("https://gl/team/api/-/issues/{}", id * 10),
+        state: "opened".to_string(),
+        labels: vec![],
+        parent: String::new(),
+        total_time: String::new(),
+        updated_at_secs: 100,
+    }
+}
+
+fn search_mr(id: i64, title: &str) -> SearchMr {
+    SearchMr {
+        id,
+        iid: id * 10,
+        project_id: 1,
+        title: title.to_string(),
+        web_url: format!("https://gl/team/api/-/merge_requests/{}", id * 10),
+        state: "opened".to_string(),
+        labels: vec![],
+        updated_at_secs: 100,
+    }
+}
+
+fn search_project(id: i64, path: &str) -> SearchProject {
+    SearchProject {
+        id,
+        name: path.rsplit('/').next().unwrap().to_string(),
+        path: path.to_string(),
+        web_url: format!("https://gl/{path}"),
+    }
+}
+
+fn search_group(id: i64, path: &str) -> SearchGroup {
+    SearchGroup {
+        id,
+        name: path.to_string(),
+        path: path.to_string(),
+        web_url: format!("https://gl/{path}"),
+    }
+}
+
+/// A `FakeGitlab` with one canned entry per search kind.
+fn canned_search_fake() -> FakeGitlab {
+    let fake = FakeGitlab::default();
+    *fake.search_issues.lock().unwrap() = vec![search_issue(1, "canned issue")];
+    *fake.search_mrs.lock().unwrap() = vec![search_mr(1, "canned mr")];
+    *fake.search_projects.lock().unwrap() = vec![search_project(1, "team/api")];
+    *fake.search_groups.lock().unwrap() = vec![search_group(1, "team")];
+    fake
+}
+
+/// Like `connected_handlers`, but keeps the fake reachable for post-sync
+/// assertions on its call logs.
+fn connected_handlers_shared(fake: Arc<FakeGitlab>) -> (Handlers, tempfile::TempDir) {
+    handlers_with(ConnState::Connected(Session {
+        gitlab: fake,
+        host: "gitlab.example.com".into(),
+        user_id: 1,
+    }))
+}
+
+#[tokio::test]
+async fn search_sync_throttled_while_stamps_fresh() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now,
+            last_full_sync_secs: now,
+        })
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    assert_eq!(
+        fake.project_list_calls.load(Ordering::SeqCst),
+        0,
+        "fresh stamps → no GitLab traffic (the restart-storm guard)"
+    );
+    assert!(fake.search_issue_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn search_sync_cold_cache_runs_full_and_stamps_both() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    assert_eq!(h.search.all_issues().unwrap().len(), 1);
+    assert_eq!(h.search.all_mrs().unwrap().len(), 1);
+    assert_eq!(h.search.all_projects().unwrap().len(), 1);
+    assert_eq!(h.search.all_groups().unwrap().len(), 1);
+
+    let stamps = h.search.stamps().unwrap();
+    assert!(stamps.last_partial_sync_secs > 0, "partial stamp set");
+    assert_eq!(
+        stamps.last_partial_sync_secs, stamps.last_full_sync_secs,
+        "a full sync advances both stamps together"
+    );
+
+    let issue_calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(
+        issue_calls.as_slice(),
+        &[(None, None)],
+        "population=all + full sync → one global fetch, no cursor"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_full_drops_entries_gitlab_no_longer_returns() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.search
+        .upsert_issues(&[search_issue(99, "deleted upstream")])
+        .unwrap();
+    h.search
+        .upsert_mrs(&[search_mr(99, "deleted upstream")])
+        .unwrap();
+
+    h.sync_search_cache().await; // zero stamps → full sync
+
+    let ids: Vec<i64> = h
+        .search
+        .all_issues()
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(ids, vec![1], "issue 99 reconciled away by the full sync");
+    let ids: Vec<i64> = h.search.all_mrs().unwrap().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![1], "mr 99 reconciled away by the full sync");
+}
+
+#[tokio::test]
+async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // Partial overdue (default interval 1800s), full still fresh.
+    let stamps = SyncStamps {
+        last_partial_sync_secs: now - 10_000,
+        last_full_sync_secs: now - 100,
+    };
+    h.search.set_stamps(&stamps).unwrap();
+    // An entry GitLab no longer returns: an incremental sync must keep it.
+    h.search
+        .upsert_issues(&[search_issue(99, "stale but kept")])
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    let issue_calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(issue_calls.len(), 1);
+    let (project, cursor) = issue_calls[0];
+    assert_eq!(project, None);
+    assert_eq!(
+        cursor
+            .expect("incremental sync passes a cursor")
+            .timestamp() as u64,
+        stamps.last_partial_sync_secs - 300,
+        "cursor is the last partial sync minus the overlap margin"
+    );
+
+    let fresh = h.search.stamps().unwrap();
+    assert!(
+        fresh.last_partial_sync_secs >= now,
+        "partial stamp advanced"
+    );
+    assert_eq!(
+        fresh.last_full_sync_secs, stamps.last_full_sync_secs,
+        "incremental sync leaves the full stamp alone"
+    );
+
+    let mut ids: Vec<i64> = h
+        .search
+        .all_issues()
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 99], "incremental sync upserts without pruning");
+}
+
+#[tokio::test]
+async fn search_sync_transient_failure_leaves_stamps_and_demotes() {
+    let fake = Arc::new(FakeGitlab::failing(FetchErr::Transient));
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(
+        (stamps.last_partial_sync_secs, stamps.last_full_sync_secs),
+        (0, 0),
+        "failed sync must not advance the stamps — next tick retries"
+    );
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Dormant(_)),
+        "transient fetch failure demotes the session"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), h.reconnect_signal.notified())
+            .await
+            .is_ok(),
+        "demotion wakes the reconnect supervisor"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_permanent_failure_does_not_demote() {
+    let fake = Arc::new(FakeGitlab::failing(FetchErr::Permanent));
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    assert_eq!(h.search.stamps().unwrap().last_partial_sync_secs, 0);
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Connected(_)),
+        "a permanent GitLab error is logged, not a connectivity problem"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+            .await
+            .is_err(),
+        "no reconnect signal for a permanent error"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_member_population_fetches_per_project() {
+    let fake = Arc::new(canned_search_fake());
+    *fake.search_projects.lock().unwrap() =
+        vec![search_project(1, "team/api"), search_project(2, "team/web")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::Member;
+
+    h.sync_search_cache().await;
+
+    let issue_calls = fake.search_issue_calls.lock().unwrap();
+    let projects: Vec<Option<i64>> = issue_calls.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        projects,
+        vec![Some(1), Some(2)],
+        "member population → one issues fetch per member project"
+    );
+    let mr_calls = fake.search_mr_calls.lock().unwrap();
+    let projects: Vec<Option<i64>> = mr_calls.iter().map(|(p, _)| *p).collect();
+    assert_eq!(projects, vec![Some(1), Some(2)]);
+}

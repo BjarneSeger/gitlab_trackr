@@ -6,6 +6,7 @@
 //!
 //! Split across submodules to keep each file readable:
 //! - [`refresh`] — the background cache/history warm-up and refresh cascade.
+//! - [`search_sync`] — the stamp-gated background sync of the search cache.
 //! - [`varlink`] — the [`VarlinkInterface`](gitlab_trackr_api::VarlinkInterface)
 //!   method impls plus the write-path deferral helpers they use.
 //!
@@ -29,6 +30,7 @@ use crate::queue::RetryQueue;
 use crate::search::SearchCache;
 
 mod refresh;
+mod search_sync;
 mod varlink;
 
 #[cfg(test)]

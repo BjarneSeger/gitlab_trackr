@@ -86,12 +86,15 @@ impl Handlers {
 
     /// Warm the caches from scratch: refresh issues/boards, then backfill the
     /// full history window. Order matters — history enrichment reads project IDs
-    /// from the issue cache, so issues must land first. Both steps are no-ops
+    /// from the issue cache, so issues must land first. All steps are no-ops
     /// while dormant. Shared by the startup warm-up, the post-reconnect recovery,
-    /// and the full cache-clear refill.
+    /// and the full cache-clear refill. The search sync is additionally
+    /// stamp-gated (see `search_sync`), so a warm-up shortly after the last
+    /// sync — a restart, a reconnect flap — does not re-poll GitLab for it.
     pub async fn warm_up(&self) {
         self.refresh_cache().await;
         self.backfill_history().await;
+        self.sync_search_cache().await;
     }
 
     /// Pull the user's GitLab timelogs spanning `window` back from now, enrich

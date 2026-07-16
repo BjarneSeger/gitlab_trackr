@@ -188,6 +188,22 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Search cache: incremental sync on the partial cadence, escalating to a
+    // full resync when the full-interval stamp expires. The sync gates itself
+    // on the persisted stamps, so this tick is cheap when nothing is due.
+    {
+        let handlers_ref = Arc::clone(&handlers);
+        let config = Arc::clone(&config);
+        tokio::spawn(async move {
+            loop {
+                let interval = config.read().unwrap().search.partial_interval();
+                tokio::time::sleep(interval).await;
+                info!("search cache sync triggered");
+                handlers_ref.sync_search_cache().await;
+            }
+        });
+    }
+
     let serve = server::serve(Arc::new(ServiceHandler::new(handlers)), listener);
 
     use tokio::signal::unix::{SignalKind, signal};
