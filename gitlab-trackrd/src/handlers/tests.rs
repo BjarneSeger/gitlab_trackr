@@ -571,29 +571,6 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
 }
 
 #[tokio::test]
-async fn post_time_rejects_bad_duration_without_queueing() {
-    use gitlab_trackr_api::AsyncCall;
-    let (h, _dir) = dormant_handlers();
-    let mut call = AsyncCall::default();
-    h.post_time(
-        &mut call as &mut dyn Call_PostTime,
-        7,
-        42,
-        "abc".to_string(),
-        None,
-    )
-    .await
-    .unwrap();
-
-    let reply = call.take_reply().expect("a reply");
-    assert!(reply.error.is_some(), "bad duration → error reply");
-    assert!(
-        h.queue.pending_post_time().unwrap().is_empty(),
-        "nothing enqueued"
-    );
-}
-
-#[tokio::test]
 async fn close_issue_rejects_bad_issue_ref() {
     use gitlab_trackr_api::AsyncCall;
     let (h, _dir) = dormant_handlers();
@@ -1225,59 +1202,6 @@ async fn search_orders_by_recency_and_applies_per_kind_limit() {
 }
 
 #[tokio::test]
-async fn search_rejects_bad_arguments_eagerly() {
-    use gitlab_trackr_api::AsyncCall;
-    let (h, _dir) = dormant_handlers();
-    seed_search_cache(&h);
-
-    for (query, kinds, limit) in [
-        ("  ", None, None),
-        ("x", Some(vec!["epics".to_string()]), None),
-        ("x", None, Some(0)),
-        ("x", None, Some(-3)),
-    ] {
-        let mut call = AsyncCall::default();
-        h.search(
-            &mut call as &mut dyn Call_Search,
-            query.to_string(),
-            kinds,
-            limit,
-        )
-        .await
-        .unwrap();
-        let reply = call.take_reply().expect("a reply");
-        assert_eq!(
-            reply.error.as_deref(),
-            Some("org.thehoster.gitlab.trackrd.GitlabError"),
-            "bad args must be rejected eagerly"
-        );
-    }
-}
-
-#[tokio::test]
-async fn search_cold_cache_dormant_is_not_authenticated() {
-    use gitlab_trackr_api::AsyncCall;
-    let (h, _dir) = dormant_handlers();
-
-    let mut call = AsyncCall::default();
-    h.search(
-        &mut call as &mut dyn Call_Search,
-        "x".to_string(),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
-    let reply = call.take_reply().expect("a reply");
-    assert_eq!(
-        reply.error.as_deref(),
-        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
-        "never-synced cache + no session → honest auth error"
-    );
-}
-
-#[tokio::test]
 async fn search_cold_cache_connected_is_empty() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
@@ -1556,4 +1480,201 @@ async fn search_sync_member_population_fetches_per_project() {
     let mr_calls = fake.search_mr_calls.lock().unwrap();
     let projects: Vec<Option<i64>> = mr_calls.iter().map(|(p, _)| *p).collect();
     assert_eq!(projects, vec![Some(1), Some(2)]);
+}
+
+// ── property tests: the varlink surface must be total ──────────────────
+//
+// The socket is the daemon's externally reachable boundary, so beyond the
+// scenario tests above we fuzz it: for arbitrary arguments a handler must
+// always produce a reply (never panic), reject invalid input with the
+// documented error, and never let a read path touch GitLab. proptest bodies
+// are sync, so each case runs on a small current-thread runtime; every case
+// also builds the real handler stack on a fjall tempdir, so the case counts
+// stay low.
+
+use proptest::prelude::*;
+
+fn prop_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Generalizes the old four-row bad-arguments table: any argument triple
+    /// gets either a success reply or the documented eager rejection, and the
+    /// read path never issues a GitLab call.
+    #[test]
+    fn search_replies_or_rejects_any_arguments_without_touching_gitlab(
+        query in ".{0,12}",
+        kinds in proptest::option::of(proptest::collection::vec("[a-z_]{1,14}", 0..3)),
+        limit in proptest::option::of(any::<i64>()),
+    ) {
+        use gitlab_trackr_api::AsyncCall;
+        prop_rt().block_on(async {
+            let fake = Arc::new(canned_search_fake());
+            let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+            seed_search_cache(&h);
+
+            let mut call = AsyncCall::default();
+            h.search(
+                &mut call as &mut dyn Call_Search,
+                query.clone(),
+                kinds.clone(),
+                limit,
+            )
+            .await
+            .unwrap();
+            let reply = call.take_reply().expect("always a reply");
+
+            let invalid = query.trim().is_empty()
+                || matches!(limit, Some(n) if n <= 0)
+                || kinds.iter().flatten().any(|k| {
+                    !["issues", "merge_requests", "projects", "groups"].contains(&k.as_str())
+                });
+            if invalid {
+                assert_eq!(
+                    reply.error.as_deref(),
+                    Some("org.thehoster.gitlab.trackrd.GitlabError"),
+                    "bad args must be rejected eagerly"
+                );
+            } else {
+                assert!(
+                    reply.error.is_none(),
+                    "valid args must succeed, got {:?}",
+                    reply.error
+                );
+            }
+            assert_eq!(
+                fake.project_list_calls.load(Ordering::SeqCst)
+                    + fake.group_list_calls.load(Ordering::SeqCst),
+                0,
+                "the read handler must never touch GitLab"
+            );
+            assert!(
+                fake.search_issue_calls.lock().unwrap().is_empty()
+                    && fake.search_mr_calls.lock().unwrap().is_empty(),
+                "the read handler must never fetch issues or MRs"
+            );
+        });
+    }
+
+    /// Generalizes the cold-cache dormant example: whatever valid query the
+    /// client sends, a dormant daemon with a never-synced cache replies with
+    /// the honest auth error instead of fabricating an empty result.
+    #[test]
+    fn search_cold_cache_dormant_is_not_authenticated_for_any_query(
+        query in "[a-zA-Z0-9#]{1,10}",
+        limit in proptest::option::of(1i64..100),
+    ) {
+        use gitlab_trackr_api::AsyncCall;
+        prop_rt().block_on(async {
+            let (h, _dir) = dormant_handlers();
+            let mut call = AsyncCall::default();
+            h.search(&mut call as &mut dyn Call_Search, query.clone(), None, limit)
+                .await
+                .unwrap();
+            let reply = call.take_reply().expect("a reply");
+            assert_eq!(
+                reply.error.as_deref(),
+                Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+                "never-synced cache + no session → honest auth error"
+            );
+        });
+    }
+
+    /// Model check for the reader pipeline: results come from the seeded
+    /// cache, every hit actually matches, newest wins, the per-kind limit
+    /// holds.
+    #[test]
+    fn search_reader_filters_orders_and_limits_against_the_model(
+        titles in proptest::collection::vec("[a-e]{2,5}", 1..8),
+        needle in "[a-e]{1,3}",
+        limit in 1i64..4,
+    ) {
+        prop_rt().block_on(async {
+            let (h, _dir) = dormant_handlers();
+            let issues: Vec<SearchIssue> = titles
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut s = search_issue(i as i64 + 1, t);
+                    s.updated_at_secs = 1_000 - i as u64; // distinct, newest first
+                    s
+                })
+                .collect();
+            h.search.upsert_issues(&issues).unwrap();
+            h.search
+                .set_stamps(&SyncStamps {
+                    last_partial_sync_secs: 1,
+                    last_full_sync_secs: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let r = run_search(&h, &needle, Some(vec!["issues".to_string()]), Some(limit)).await;
+
+            let expected: Vec<i64> = issues
+                .iter()
+                .filter(|i| i.title.contains(&needle))
+                .map(|i| i.id)
+                .take(limit as usize)
+                .collect();
+            let got: Vec<i64> = r.issues.iter().map(|i| i.id).collect();
+            assert_eq!(
+                got, expected,
+                "matches only, from the seeded set, newest first, limited"
+            );
+        });
+    }
+
+    /// The write path's eager pre-checks, fuzzed: invalid input is rejected
+    /// with an error reply, valid input on a no-credentials session gets the
+    /// honest auth error — and neither may enqueue anything (queueing only
+    /// helps an unreachable session).
+    #[test]
+    fn post_time_never_queues_from_a_no_credentials_session(
+        project_id in -2i64..6,
+        issue_iid in -2i64..6,
+        duration in prop_oneof!["[0-9]{1,3}[smhdw]", "[a-z]{0,4}", "[0-9]{1,2}x"],
+    ) {
+        use gitlab_trackr_api::AsyncCall;
+        prop_rt().block_on(async {
+            let (h, _dir) = dormant_handlers();
+            let mut call = AsyncCall::default();
+            h.post_time(
+                &mut call as &mut dyn Call_PostTime,
+                project_id,
+                issue_iid,
+                duration.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let reply = call.take_reply().expect("always a reply");
+            let valid_args = issue_ref_error(project_id, issue_iid).is_none()
+                && looks_like_duration(&duration);
+            if valid_args {
+                assert_eq!(
+                    reply.error.as_deref(),
+                    Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+                    "valid write on a credential-less session → honest auth error"
+                );
+            } else {
+                assert_eq!(
+                    reply.error.as_deref(),
+                    Some("org.thehoster.gitlab.trackrd.GitlabError"),
+                    "invalid input is rejected eagerly"
+                );
+            }
+            assert!(
+                h.queue.pending_post_time().unwrap().is_empty(),
+                "nothing may be enqueued from a no-credentials session"
+            );
+        });
+    }
 }

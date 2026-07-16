@@ -461,6 +461,7 @@ pub fn template() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn reconnect_defaults_are_short_and_enabled() {
@@ -470,24 +471,22 @@ mod tests {
         assert_eq!(c.reconnect.max_delay(), Duration::from_secs(60));
     }
 
-    #[test]
-    fn next_backoff_doubles_caps_and_saturates() {
-        let max = Duration::from_secs(60);
-        assert_eq!(
-            next_backoff(Duration::from_secs(2), max),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            next_backoff(Duration::from_secs(30), max),
-            Duration::from_secs(60)
-        );
-        // Already at the cap: stays capped rather than growing.
-        assert_eq!(
-            next_backoff(Duration::from_secs(60), max),
-            Duration::from_secs(60)
-        );
-        // Doubling would overflow `Duration`: saturate to the cap, don't panic.
-        assert_eq!(next_backoff(Duration::from_secs(u64::MAX), max), max);
+    proptest! {
+        #[test]
+        fn next_backoff_doubles_saturating_and_never_exceeds_the_cap(
+            current_secs in any::<u64>(),
+            max_secs in any::<u64>(),
+        ) {
+            let current = Duration::from_secs(current_secs);
+            let max = Duration::from_secs(max_secs);
+            let next = next_backoff(current, max);
+            prop_assert!(next <= max);
+            match current.checked_mul(2) {
+                Some(doubled) => prop_assert_eq!(next, doubled.min(max)),
+                // Doubling would overflow `Duration`: saturate, don't panic.
+                None => prop_assert_eq!(next, max),
+            }
+        }
     }
 
     #[test]
@@ -498,47 +497,43 @@ mod tests {
         assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
     }
 
-    #[test]
-    fn normalize_search_floors_partial_and_orders_full() {
-        let mut s = defaults().search;
-        s.partial_interval_secs = 0;
-        s.full_interval_secs = 10;
-        normalize_search(&mut s);
-        assert_eq!(
-            (s.partial_interval_secs, s.full_interval_secs),
-            (60, 60),
-            "zero partial floored to a minute, inverted full raised to it"
-        );
+    proptest! {
+        #[test]
+        fn normalize_backoff_floors_the_base_and_orders_the_pair(
+            base_in in any::<u64>(),
+            max_in in any::<u64>(),
+        ) {
+            let (mut base, mut max) = (base_in, max_in);
+            normalize_backoff(&mut base, &mut max, "test");
+            prop_assert!(base >= 1);
+            prop_assert!(max >= base);
+            if base_in >= 1 && max_in >= base_in {
+                prop_assert_eq!(
+                    (base, max),
+                    (base_in, max_in),
+                    "in-range values are left untouched"
+                );
+            }
+        }
 
-        let mut s = defaults().search;
-        normalize_search(&mut s);
-        assert_eq!(
-            (s.partial_interval_secs, s.full_interval_secs),
-            (1800, 604800),
-            "defaults are left untouched"
-        );
-    }
-
-    #[test]
-    fn normalize_backoff_floors_zero_and_orders() {
-        let (mut base, mut max) = (0u64, 0u64);
-        normalize_backoff(&mut base, &mut max, "test");
-        assert_eq!(
-            (base, max),
-            (1, 1),
-            "a zero base is floored and max raised to it"
-        );
-
-        let (mut base, mut max) = (2u64, 60u64);
-        normalize_backoff(&mut base, &mut max, "test");
-        assert_eq!((base, max), (2, 60), "in-range values are left untouched");
-
-        let (mut base, mut max) = (5u64, 3u64);
-        normalize_backoff(&mut base, &mut max, "test");
-        assert_eq!(
-            (base, max),
-            (5, 5),
-            "a max below base is raised to the base"
-        );
+        #[test]
+        fn normalize_search_floors_the_partial_and_orders_the_pair(
+            partial_in in any::<u64>(),
+            full_in in any::<u64>(),
+        ) {
+            let mut s = defaults().search;
+            s.partial_interval_secs = partial_in;
+            s.full_interval_secs = full_in;
+            normalize_search(&mut s);
+            prop_assert!(s.partial_interval_secs >= 60);
+            prop_assert!(s.full_interval_secs >= s.partial_interval_secs);
+            if partial_in >= 60 && full_in >= partial_in {
+                prop_assert_eq!(
+                    (s.partial_interval_secs, s.full_interval_secs),
+                    (partial_in, full_in),
+                    "in-range values are left untouched"
+                );
+            }
+        }
     }
 }

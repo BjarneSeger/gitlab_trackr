@@ -35,6 +35,9 @@ security-framework = "3.7"
 security-framework-sys = "2.17"
 oo7 = { version = "0.6", features = ["tracing"] }
 
+# Testing
+proptest = "1"
+
 # CLI
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 inquire = "0.9"

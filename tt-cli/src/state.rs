@@ -117,3 +117,47 @@ pub fn save(state: &State) -> Result<()> {
         .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Anchors the exact GitLab time-tracking grammar (distinct from the
+    /// daemon's `"1h 30m"` display style); the shape over all inputs is
+    /// covered by `format_duration_renders_whole_minutes_of_any_input`.
+    #[test]
+    fn format_duration_pins_the_gitlab_time_tracking_grammar() {
+        assert_eq!(format_duration(0), "1m", "sub-minute floors to 1m");
+        assert_eq!(format_duration(29 * 60), "29m");
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(4500), "1h15m");
+    }
+
+    /// Split a `"1h15m"`-style rendering back into (hours, minutes).
+    fn parse_h_m(s: &str) -> (u64, u64) {
+        match s.split_once('h') {
+            Some((h, rest)) => {
+                let m = rest
+                    .strip_suffix('m')
+                    .map(|m| m.parse().unwrap())
+                    .unwrap_or(0);
+                (h.parse().unwrap(), m)
+            }
+            None => (0, s.strip_suffix('m').unwrap().parse().unwrap()),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn format_duration_renders_whole_minutes_of_any_input(secs in any::<u64>()) {
+            let out = format_duration(secs);
+            let (hours, mins) = parse_h_m(&out);
+            prop_assert_eq!(hours * 60 + mins, (secs / 60).max(1), "whole minutes, floored to 1m");
+            prop_assert!(hours > 0 || mins > 0, "never an empty suggestion");
+            if hours > 0 {
+                prop_assert!(mins < 60, "minutes stay below an hour once hours exist");
+            }
+        }
+    }
+}

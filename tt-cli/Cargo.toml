@@ -13,6 +13,9 @@ clap.workspace = true
 clap_complete.workspace = true
 carapace_spec_clap.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true

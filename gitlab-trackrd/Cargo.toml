@@ -31,5 +31,6 @@ security-framework-sys = { workspace = true, features = ["OSX_10_15"] }
 oo7 = { workspace = true }
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

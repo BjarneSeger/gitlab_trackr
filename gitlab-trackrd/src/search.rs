@@ -237,6 +237,7 @@ pub fn text_matches(needle_lower: &str, hay: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn issue(id: i64, title: &str) -> SearchIssue {
         SearchIssue {
@@ -419,20 +420,53 @@ mod tests {
     }
 
     #[test]
-    fn parse_iid_query_accepts_only_hash_number() {
-        assert_eq!(parse_iid_query("#123"), Some(123));
-        assert_eq!(parse_iid_query("  #7 "), Some(7));
-        assert_eq!(parse_iid_query("123"), None);
-        assert_eq!(parse_iid_query("#12x"), None);
+    fn parse_iid_query_rejects_a_bare_hash() {
         assert_eq!(parse_iid_query("#"), None);
-        assert_eq!(parse_iid_query(""), None);
-        assert_eq!(parse_iid_query("#-1"), None);
     }
 
-    #[test]
-    fn text_matches_is_case_insensitive() {
-        assert!(text_matches("auth", "OAuth token refresh"));
-        assert!(text_matches("team/back", "Team/Backend"));
-        assert!(!text_matches("missing", "nothing here"));
+    proptest! {
+        #[test]
+        fn parse_iid_query_roundtrips_any_padded_reference(
+            n in 0..=i64::MAX,
+            pad_left in " {0,3}",
+            pad_right in " {0,3}",
+        ) {
+            prop_assert_eq!(parse_iid_query(&format!("{pad_left}#{n}{pad_right}")), Some(n));
+        }
+
+        #[test]
+        fn parse_iid_query_rejects_anything_without_a_leading_hash(s in "[^#]*") {
+            prop_assert_eq!(parse_iid_query(&s), None);
+        }
+
+        #[test]
+        fn parse_iid_query_rejects_non_digit_tails(
+            digits in "[0-9]{0,4}",
+            junk in "[a-z#-]{1,3}",
+            more in "[0-9]{0,3}",
+        ) {
+            prop_assert_eq!(parse_iid_query(&format!("#{digits}{junk}{more}")), None);
+        }
+
+        #[test]
+        fn text_matches_finds_an_inserted_needle_in_any_case(
+            needle in "[a-zA-Z]{1,6}",
+            prefix in "[a-zA-Z0-9 ]{0,8}",
+            suffix in "[a-zA-Z0-9 ]{0,8}",
+        ) {
+            let needle_lower = needle.to_lowercase();
+            let hay = format!("{prefix}{needle}{suffix}");
+            prop_assert!(text_matches(&needle_lower, &hay));
+            prop_assert!(text_matches(&needle_lower, &hay.to_uppercase()));
+            prop_assert!(text_matches(&needle_lower, &hay.to_lowercase()));
+        }
+
+        #[test]
+        fn text_matches_rejects_a_needle_absent_from_the_haystack(
+            needle in "[a-z]{2,6}",
+            hay in "[0-9 ]{0,10}",
+        ) {
+            prop_assert!(!text_matches(&needle, &hay));
+        }
     }
 }

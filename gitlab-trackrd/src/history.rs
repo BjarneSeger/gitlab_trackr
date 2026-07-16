@@ -94,6 +94,7 @@ impl HistoryCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn entry(timelog_id: u64, spent_at: u64, title: &str) -> StoredTimelog {
         StoredTimelog {
@@ -160,45 +161,37 @@ mod tests {
         assert_eq!(remaining[0].timelog_id, 2);
     }
 
-    #[test]
-    fn prune_on_empty_store_returns_zero() {
-        let (h, _td) = cache();
-        assert_eq!(h.prune(100).unwrap(), 0);
-    }
+    proptest! {
+        // Each case opens a real fjall tempdir, so keep the count low.
+        #![proptest_config(ProptestConfig::with_cases(24))]
 
-    #[test]
-    fn clear_between_is_half_open() {
-        let (h, _td) = cache();
-        h.upsert(&[
-            entry(1, 100, "below"),
-            entry(2, 200, "min-inclusive"),
-            entry(3, 250, "inside"),
-            entry(4, 300, "max-exclusive"),
-            entry(5, 400, "above"),
-        ])
-        .unwrap();
+        /// One window property instead of hand-picked boundary cases: exactly
+        /// the entries with `spent_at_secs` in the half-open `[min, max)` go
+        /// (including the empty store and the `max = u64::MAX` active band),
+        /// everything else survives.
+        #[test]
+        fn clear_between_removes_exactly_the_half_open_window(
+            spent_ats in proptest::collection::vec(0u64..500, 0..10),
+            min in 0u64..500,
+            span in prop_oneof![0u64..500, Just(u64::MAX)],
+        ) {
+            let (h, _td) = cache();
+            let entries: Vec<StoredTimelog> = spent_ats
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| entry(i as u64 + 1, s, "e"))
+                .collect();
+            h.upsert(&entries).unwrap();
 
-        let removed = h.clear_between(200, 300).unwrap();
-        assert_eq!(removed, 2, "200 and 250 fall in [200, 300)");
+            let max = min.saturating_add(span);
+            let in_window = |s: u64| s >= min && s < max;
+            let removed = h.clear_between(min, max).unwrap();
+            prop_assert_eq!(removed, spent_ats.iter().filter(|&&s| in_window(s)).count());
 
-        let remaining: Vec<u64> = h
-            .all_since(0)
-            .unwrap()
-            .iter()
-            .map(|e| e.timelog_id)
-            .collect();
-        assert_eq!(remaining, vec![5, 4, 1], "100, 300 and 400 survive");
-    }
-
-    #[test]
-    fn clear_between_open_top_clears_active_band() {
-        let (h, _td) = cache();
-        h.upsert(&[entry(1, 100, "old"), entry(2, 500, "recent")])
-            .unwrap();
-        assert_eq!(h.clear_between(200, u64::MAX).unwrap(), 1);
-        let remaining = h.all_since(0).unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].timelog_id, 1);
+            let survivors = h.all_since(0).unwrap();
+            prop_assert_eq!(survivors.len(), entries.len() - removed);
+            prop_assert!(survivors.iter().all(|e| !in_window(e.spent_at_secs)));
+        }
     }
 
     #[test]

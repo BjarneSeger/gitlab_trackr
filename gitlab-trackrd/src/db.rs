@@ -151,3 +151,33 @@ impl<V: Serialize + DeserializeOwned> KvStore<u64, V> {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// [`KvStore::scan`] decodes keys with `from_be_bytes` and fjall
+        /// iterates in byte order, so the encoding must round-trip and byte
+        /// order must equal numeric order — the [`KeyBytes`] doc-comment
+        /// claim.
+        #[test]
+        fn u64_keys_roundtrip_and_sort_like_their_bytes(a in any::<u64>(), b in any::<u64>()) {
+            prop_assert_eq!(u64::from_be_bytes(a.to_key_bytes()), a);
+            prop_assert_eq!(a.cmp(&b), a.to_key_bytes().cmp(&b.to_key_bytes()));
+        }
+
+        /// Only non-negative `i64` keys order correctly — negative keys
+        /// mis-sort and no `i64` store iterates (see the trait doc).
+        #[test]
+        fn i64_keys_roundtrip_and_nonnegatives_sort_like_their_bytes(
+            any_key in any::<i64>(),
+            a in 0i64..,
+            b in 0i64..,
+        ) {
+            prop_assert_eq!(i64::from_be_bytes(any_key.to_key_bytes()), any_key);
+            prop_assert_eq!(a.cmp(&b), a.to_key_bytes().cmp(&b.to_key_bytes()));
+        }
+    }
+}

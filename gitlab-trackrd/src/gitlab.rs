@@ -1051,68 +1051,62 @@ impl gitlab::api::Endpoint for ListBoardLists {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
+    /// Anchors the exact output grammar; the shape over all inputs is covered
+    /// by `format_duration_renders_whole_minutes_of_any_input`.
     #[test]
-    fn format_duration_zero() {
+    fn format_duration_pins_the_gitlab_style_grammar() {
+        assert_eq!(format_duration(5400), "1h 30m");
+        assert_eq!(format_duration(45), "45s");
         assert_eq!(format_duration(0), "0m");
     }
 
-    #[test]
-    fn format_duration_sub_minute() {
-        assert_eq!(format_duration(45), "45s");
+    /// Split a `"2h 5m"`-style rendering back into (hours, minutes).
+    fn parse_h_m(s: &str) -> (u64, u64) {
+        let (mut hours, mut mins) = (0, 0);
+        for part in s.split(' ') {
+            if let Some(h) = part.strip_suffix('h') {
+                hours = h.parse().unwrap();
+            } else if let Some(m) = part.strip_suffix('m') {
+                mins = m.parse().unwrap();
+            } else {
+                panic!("unexpected part {part:?} in {s:?}");
+            }
+        }
+        (hours, mins)
     }
 
-    #[test]
-    fn format_duration_exact_minute() {
-        assert_eq!(format_duration(60), "1m");
-    }
+    proptest! {
+        #[test]
+        fn format_duration_renders_whole_minutes_of_any_input(secs in any::<u64>()) {
+            let out = format_duration(secs);
+            prop_assert!(!out.is_empty());
+            if secs == 0 {
+                prop_assert_eq!(out, "0m");
+            } else if secs < 60 {
+                prop_assert_eq!(out, format!("{secs}s"));
+            } else {
+                // Past a minute the seconds remainder is dropped, never shown.
+                let (hours, mins) = parse_h_m(&out);
+                prop_assert!(mins < 60);
+                prop_assert_eq!(hours * 3600 + mins * 60, secs - secs % 60);
+            }
+        }
 
-    #[test]
-    fn format_duration_drops_sub_minute_when_minutes_present() {
-        // 90s is 1m 30s, but the formatter only emits seconds when both
-        // hours and minutes are zero — anything past a minute rounds down.
-        assert_eq!(format_duration(90), "1m");
-    }
+        #[test]
+        fn parse_gid_roundtrips_any_id(n in any::<u64>()) {
+            prop_assert_eq!(parse_gid(&format!("gid://gitlab/Timelog/{n}")), Some(n));
+            prop_assert_eq!(parse_gid(&n.to_string()), Some(n));
+        }
 
-    #[test]
-    fn format_duration_exact_hour() {
-        assert_eq!(format_duration(3600), "1h");
-    }
-
-    #[test]
-    fn format_duration_hours_and_minutes() {
-        assert_eq!(format_duration(5400), "1h 30m");
-    }
-
-    #[test]
-    fn format_duration_large() {
-        // 100h 1m
-        assert_eq!(format_duration(360_060), "100h 1m");
-    }
-
-    #[test]
-    fn parse_gid_full_form() {
-        assert_eq!(parse_gid("gid://gitlab/Timelog/42"), Some(42));
-    }
-
-    #[test]
-    fn parse_gid_bare_number() {
-        assert_eq!(parse_gid("42"), Some(42));
-    }
-
-    #[test]
-    fn parse_gid_empty() {
-        assert_eq!(parse_gid(""), None);
-    }
-
-    #[test]
-    fn parse_gid_non_numeric_tail() {
-        assert_eq!(parse_gid("gid://gitlab/Timelog/abc"), None);
-    }
-
-    #[test]
-    fn parse_gid_trailing_slash() {
-        assert_eq!(parse_gid("gid://gitlab/Timelog/"), None);
+        #[test]
+        fn parse_gid_rejects_non_numeric_tails(tail in "[a-zA-Z ]{0,6}") {
+            // The empty tail also covers the trailing-slash and empty-input
+            // forms.
+            prop_assert_eq!(parse_gid(&format!("gid://gitlab/Timelog/{tail}")), None);
+            prop_assert_eq!(parse_gid(&tail), None);
+        }
     }
 
     #[test]
@@ -1159,37 +1153,47 @@ mod tests {
         assert!(r.labels.is_empty());
     }
 
-    #[test]
-    fn compute_new_assignees_add_when_absent() {
-        assert_eq!(compute_new_assignees(&[1, 2], 5, true), Some(vec![1, 2, 5]));
-    }
+    proptest! {
+        #[test]
+        fn compute_new_assignees_add_appends_exactly_when_absent(
+            current in proptest::collection::vec(0i64..20, 0..8),
+            self_id in 0i64..20,
+        ) {
+            match compute_new_assignees(&current, self_id, true) {
+                None => prop_assert!(current.contains(&self_id), "no-op only when already assigned"),
+                Some(new) => {
+                    prop_assert!(!current.contains(&self_id));
+                    prop_assert_eq!(*new.last().unwrap(), self_id);
+                    prop_assert_eq!(new[..new.len() - 1].to_vec(), current);
+                }
+            }
+        }
 
-    #[test]
-    fn compute_new_assignees_add_when_already_present_is_noop() {
-        assert_eq!(compute_new_assignees(&[1, 5, 2], 5, true), None);
-    }
+        #[test]
+        fn compute_new_assignees_remove_drops_exactly_the_self_id(
+            current in proptest::collection::vec(0i64..20, 0..8),
+            self_id in 0i64..20,
+        ) {
+            match compute_new_assignees(&current, self_id, false) {
+                None => prop_assert!(!current.contains(&self_id), "no-op only when not assigned"),
+                Some(new) => {
+                    prop_assert!(current.contains(&self_id));
+                    let expected: Vec<i64> =
+                        current.iter().copied().filter(|id| *id != self_id).collect();
+                    prop_assert_eq!(new, expected);
+                }
+            }
+        }
 
-    #[test]
-    fn compute_new_assignees_remove_when_present() {
-        assert_eq!(
-            compute_new_assignees(&[1, 5, 2], 5, false),
-            Some(vec![1, 2])
-        );
-    }
-
-    #[test]
-    fn compute_new_assignees_remove_when_absent_is_noop() {
-        assert_eq!(compute_new_assignees(&[1, 2], 5, false), None);
-    }
-
-    #[test]
-    fn compute_new_assignees_remove_from_empty_is_noop() {
-        assert_eq!(compute_new_assignees(&[], 5, false), None);
-    }
-
-    #[test]
-    fn compute_new_assignees_add_to_empty() {
-        assert_eq!(compute_new_assignees(&[], 5, true), Some(vec![5]));
+        #[test]
+        fn compute_new_assignees_add_then_remove_restores_the_original(
+            current in proptest::collection::vec(0i64..20, 0..8),
+            self_id in 20i64..40, // guaranteed absent from `current`
+        ) {
+            let added = compute_new_assignees(&current, self_id, true).expect("absent → change");
+            let removed = compute_new_assignees(&added, self_id, false).expect("present → change");
+            prop_assert_eq!(removed, current);
+        }
     }
 
     #[test]

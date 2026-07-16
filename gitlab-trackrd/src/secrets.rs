@@ -97,6 +97,25 @@ mod platform {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn encode_decode_roundtrips_any_credentials(host in ".*", token in ".*") {
+            let creds = Credentials {
+                host: host.clone(),
+                token: token.clone(),
+            };
+            let back = decode(&encode(&creds).unwrap()).unwrap();
+            prop_assert_eq!(back.host, host);
+            prop_assert_eq!(back.token, token);
+        }
+    }
+}
+
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use std::collections::HashMap;

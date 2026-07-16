@@ -148,6 +148,7 @@ fn in_group(namespace: &str, group: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn issue_at(web_url: &str, iid: i64, title: &str) -> Issue {
         Issue {
@@ -177,28 +178,33 @@ mod tests {
     }
 
     #[test]
-    fn namespace_of_parses_group_path() {
-        assert_eq!(namespace_of("https://gl/team/proj/-/issues/5"), "team/proj");
-        assert_eq!(
-            namespace_of("https://gl/team/sub/proj/-/issues/5"),
-            "team/sub/proj"
-        );
-    }
-
-    #[test]
     fn namespace_of_empty_without_path() {
         assert_eq!(namespace_of("https://gl"), "");
         assert_eq!(namespace_of(""), "");
     }
 
-    #[test]
-    fn in_group_matches_exact_and_descendants_only() {
-        assert!(in_group("team/proj", "team"));
-        assert!(in_group("team/sub/proj", "team/sub"));
-        assert!(in_group("team", "team"));
-        assert!(!in_group("teamfoo/proj", "team"), "not a prefix boundary");
-        assert!(!in_group("other/proj", "team"));
-        assert!(!in_group("team/proj", ""), "empty filter matches nothing");
+    proptest! {
+        #[test]
+        fn namespace_of_roundtrips_any_constructed_issue_url(
+            ns in "[a-z0-9]{1,8}(/[a-z0-9]{1,8}){0,3}",
+            iid in 1u64..100_000,
+        ) {
+            prop_assert_eq!(namespace_of(&format!("https://gl/{ns}/-/issues/{iid}")), ns);
+        }
+
+        #[test]
+        fn in_group_matches_the_group_and_descendants_on_segment_boundaries(
+            group in "[a-z]{1,6}(/[a-z]{1,6}){0,2}",
+            child in "[a-z]{1,6}",
+        ) {
+            prop_assert!(in_group(&group, &group), "exact match");
+            prop_assert!(in_group(&format!("{group}/{child}"), &group), "descendant");
+            prop_assert!(
+                !in_group(&format!("{group}{child}"), &group),
+                "shared prefix without a segment boundary is not a descendant"
+            );
+            prop_assert!(!in_group(&group, ""), "empty filter matches nothing");
+        }
     }
 
     #[test]
