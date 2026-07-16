@@ -146,6 +146,10 @@ struct FakeGitlab {
     /// When set, `add_spent_time` fails this way (drives the write-handler
     /// deferral path).
     write_err: Option<FetchErr>,
+    /// When set, only the *global* (`project = None`) search issue/MR fetches
+    /// fail this way — per-project fetches still serve the canned data.
+    /// Drives the auto-population degrade path.
+    global_search_err: Option<FetchErr>,
     /// Canned results for the search-sync fetches.
     search_issues: Mutex<Vec<SearchIssue>>,
     search_mrs: Mutex<Vec<SearchMr>>,
@@ -201,10 +205,7 @@ impl FakeGitlab {
 
     fn fetch_result<T>(&self) -> TrackrResult<Vec<T>> {
         match self.fetch_err {
-            Some(FetchErr::Transient) => Err(crate::error::Error::Transient("offline".into())),
-            Some(FetchErr::Permanent) => {
-                Err(crate::error::Error::Gitlab("500 Server Error".into()))
-            }
+            Some(err) => err_result(err),
             None => unimplemented!("fetch not configured for this fake"),
         }
     }
@@ -215,6 +216,13 @@ impl FakeGitlab {
             Some(FetchErr::Permanent) => Err(crate::error::Error::Gitlab("400 Bad Request".into())),
             None => Ok(()),
         }
+    }
+}
+
+fn err_result<T>(err: FetchErr) -> TrackrResult<Vec<T>> {
+    match err {
+        FetchErr::Transient => Err(crate::error::Error::Transient("offline".into())),
+        FetchErr::Permanent => Err(crate::error::Error::Gitlab("500 Server Error".into())),
     }
 }
 
@@ -279,6 +287,11 @@ impl GitlabApi for FakeGitlab {
         if self.fetch_err.is_some() {
             return self.fetch_result();
         }
+        if project.is_none()
+            && let Some(err) = self.global_search_err
+        {
+            return err_result(err);
+        }
         Ok(self.search_issues.lock().unwrap().clone())
     }
     async fn fetch_merge_requests_for_search(
@@ -292,6 +305,11 @@ impl GitlabApi for FakeGitlab {
             .push((project, updated_after));
         if self.fetch_err.is_some() {
             return self.fetch_result();
+        }
+        if project.is_none()
+            && let Some(err) = self.global_search_err
+        {
+            return err_result(err);
         }
         Ok(self.search_mrs.lock().unwrap().clone())
     }
@@ -890,9 +908,18 @@ fn canned_search_fake() -> FakeGitlab {
 /// Like `connected_handlers`, but keeps the fake reachable for post-sync
 /// assertions on its call logs.
 fn connected_handlers_shared(fake: Arc<FakeGitlab>) -> (Handlers, tempfile::TempDir) {
+    connected_handlers_with_host(fake, "gitlab.example.com")
+}
+
+/// [`connected_handlers_shared`] with an explicit session host, for the
+/// auto-population host rule.
+fn connected_handlers_with_host(
+    fake: Arc<FakeGitlab>,
+    host: &str,
+) -> (Handlers, tempfile::TempDir) {
     handlers_with(ConnState::Connected(Session {
         gitlab: fake,
-        host: "gitlab.example.com".into(),
+        host: host.into(),
         user_id: 1,
     }))
 }
@@ -906,6 +933,7 @@ async fn search_sync_throttled_while_stamps_fresh() {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now,
             last_full_sync_secs: now,
+            ..Default::default()
         })
         .unwrap();
 
@@ -980,6 +1008,7 @@ async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
     let stamps = SyncStamps {
         last_partial_sync_secs: now - 10_000,
         last_full_sync_secs: now - 100,
+        ..Default::default()
     };
     h.search.set_stamps(&stamps).unwrap();
     // An entry GitLab no longer returns: an incremental sync must keep it.
@@ -1120,6 +1149,7 @@ fn seed_search_cache(h: &Handlers) {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
+            ..Default::default()
         })
         .unwrap();
 }
@@ -1185,6 +1215,7 @@ async fn search_orders_by_recency_and_applies_per_kind_limit() {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -1281,6 +1312,7 @@ async fn search_graph_status_comes_from_cached_boards_only() {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -1346,6 +1378,162 @@ async fn clear_cache_search_scope_triggers_full_resync_when_connected() {
         "cache repopulated from the canned full sync"
     );
     assert!(h.search.stamps().unwrap().last_full_sync_secs > 0);
+}
+
+#[tokio::test]
+async fn search_sync_auto_on_gitlab_com_never_tries_the_global_fetch() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_with_host(Arc::clone(&fake), "gitlab.com");
+
+    h.sync_search_cache().await;
+
+    let issue_calls = fake.search_issue_calls.lock().unwrap();
+    assert!(!issue_calls.is_empty());
+    assert!(
+        issue_calls.iter().all(|(p, _)| p.is_some()),
+        "gitlab.com resolves auto to member fetches only: {issue_calls:?}"
+    );
+    assert!(
+        !h.search.stamps().unwrap().degraded_to_member,
+        "the host rule is not the degrade flag"
+    );
+    assert_eq!(h.search.all_issues().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn search_sync_auto_degrades_to_member_on_global_rejection() {
+    let mut fake = canned_search_fake();
+    fake.global_search_err = Some(FetchErr::Permanent);
+    let fake = Arc::new(fake);
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    {
+        let calls = fake.search_issue_calls.lock().unwrap();
+        assert_eq!(calls[0].0, None, "the global fetch is attempted first");
+        assert!(
+            calls.len() > 1 && calls[1..].iter().all(|(p, _)| p.is_some()),
+            "rejection falls back to member fetches in the same sync: {calls:?}"
+        );
+    }
+    let stamps = h.search.stamps().unwrap();
+    assert!(stamps.degraded_to_member, "fallback is recorded sticky");
+    assert!(
+        stamps.last_full_sync_secs > 0,
+        "the degraded sync still stamps"
+    );
+    assert_eq!(
+        h.search.all_issues().unwrap().len(),
+        1,
+        "cache populated via the member path"
+    );
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Connected(_)),
+        "a permanent rejection must not demote"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_auto_does_not_degrade_on_transient_global_failure() {
+    let mut fake = canned_search_fake();
+    fake.global_search_err = Some(FetchErr::Transient);
+    let fake = Arc::new(fake);
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    assert_eq!(
+        fake.search_issue_calls.lock().unwrap().len(),
+        1,
+        "a network blip is not a scope problem — no member retry"
+    );
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(
+        stamps.last_partial_sync_secs, 0,
+        "failed sync leaves stamps"
+    );
+    assert!(!stamps.degraded_to_member);
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Dormant(_)),
+        "transient failure demotes as usual"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // Partial overdue, full fresh, degraded set by an earlier rejection.
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 10_000,
+            last_full_sync_secs: now - 100,
+            degraded_to_member: true,
+        })
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    {
+        let calls = fake.search_issue_calls.lock().unwrap();
+        assert!(
+            calls.iter().all(|(p, _)| p.is_some()),
+            "incremental honors the degrade flag: {calls:?}"
+        );
+    }
+    assert!(
+        h.search.stamps().unwrap().degraded_to_member,
+        "flag survives incremental syncs"
+    );
+
+    // Force the full cadence; the global fetch works now (no injected error),
+    // so the full sync recovers to all-population and clears the flag.
+    h.search
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 10_000,
+            last_full_sync_secs: 1,
+            degraded_to_member: true,
+        })
+        .unwrap();
+    fake.search_issue_calls.lock().unwrap().clear();
+
+    h.sync_search_cache().await;
+
+    assert_eq!(
+        fake.search_issue_calls.lock().unwrap()[0].0,
+        None,
+        "a due full sync retries the global fetch"
+    );
+    assert!(
+        !h.search.stamps().unwrap().degraded_to_member,
+        "recovery clears the flag"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_explicit_all_is_never_degraded() {
+    let mut fake = canned_search_fake();
+    fake.global_search_err = Some(FetchErr::Permanent);
+    let fake = Arc::new(fake);
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
+
+    h.sync_search_cache().await;
+
+    let calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[(None, None)],
+        "an explicit all is respected — no member fallback"
+    );
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(
+        stamps.last_partial_sync_secs, 0,
+        "rejected sync does not stamp"
+    );
+    assert!(!stamps.degraded_to_member);
 }
 
 #[tokio::test]

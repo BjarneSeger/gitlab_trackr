@@ -72,6 +72,12 @@ pub struct SearchGroup {
 pub struct SyncStamps {
     pub last_partial_sync_secs: u64,
     pub last_full_sync_secs: u64,
+    /// Set when `population = "auto"` fell back to member-project fetches
+    /// because the instance rejected the global `scope=all` fetch; honored by
+    /// incremental syncs and retried (cleared on success) at the next full
+    /// sync. `serde(default)` keeps stamps written before this field readable.
+    #[serde(default)]
+    pub degraded_to_member: bool,
 }
 
 const SEARCH_ISSUES_KEYSPACE: &str = "search_issues_v1";
@@ -346,11 +352,23 @@ mod tests {
         c.set_stamps(&SyncStamps {
             last_partial_sync_secs: 123,
             last_full_sync_secs: 45,
+            degraded_to_member: true,
         })
         .unwrap();
         let s = c.stamps().unwrap();
         assert_eq!(s.last_partial_sync_secs, 123);
         assert_eq!(s.last_full_sync_secs, 45);
+        assert!(s.degraded_to_member);
+    }
+
+    #[test]
+    fn stamps_without_degraded_field_still_parse() {
+        // Stamps written before `degraded_to_member` existed must stay
+        // readable: the field defaults to false.
+        let s: SyncStamps =
+            serde_json::from_str(r#"{"last_partial_sync_secs": 7, "last_full_sync_secs": 7}"#)
+                .unwrap();
+        assert!(!s.degraded_to_member);
     }
 
     #[test]
@@ -363,6 +381,7 @@ mod tests {
         c.set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
+            ..Default::default()
         })
         .unwrap();
 
@@ -389,6 +408,7 @@ mod tests {
             c.set_stamps(&SyncStamps {
                 last_partial_sync_secs: 7,
                 last_full_sync_secs: 7,
+                ..Default::default()
             })
             .unwrap();
         }

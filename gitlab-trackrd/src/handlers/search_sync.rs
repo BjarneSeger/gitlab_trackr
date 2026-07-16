@@ -31,6 +31,38 @@ use super::{Handlers, now_secs};
 /// the overlap only costs a little re-download.
 const UPDATED_AFTER_OVERLAP: Duration = Duration::from_secs(300);
 
+/// Issue count after a full `all`-population sync above which we warn that
+/// `population = "member"` is probably the better fit. Near gitlab.com's
+/// offset-pagination cap; a corpus this size works but strains the instance
+/// and the initial sync.
+const LARGE_CORPUS_WARN: usize = 50_000;
+
+/// What `SearchPopulation` resolved to for one sync run — `Auto` is gone by
+/// the time fetches happen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Population {
+    All,
+    Member,
+}
+
+/// How one [`Handlers::sync_all_kinds`] run ended.
+#[derive(PartialEq)]
+enum Outcome {
+    Ok,
+    Failed,
+    /// The *global* (`scope=all`) issues/MR fetch was rejected outright
+    /// (permanent error, e.g. gitlab.com's 500 on unfiltered `scope=all`).
+    /// Under `population = "auto"` the caller retries the sync with
+    /// [`Population::Member`].
+    GlobalRejected,
+}
+
+/// gitlab.com rejects the unfiltered global `scope=all` fetch outright, so
+/// `population = "auto"` never attempts it there.
+fn is_gitlab_com(host: &str) -> bool {
+    host.eq_ignore_ascii_case("gitlab.com")
+}
+
 impl Handlers {
     /// Sync the search cache if a cadence is due. Self-gating: no-ops when
     /// throttled (neither cadence due — the restart-storm guard), dormant, or
@@ -62,16 +94,42 @@ impl Handlers {
             debug!("search sync throttled; last sync is fresh");
             return;
         }
-        let gitlab = match self.gitlab().await {
-            Ok(g) => g,
+        let session = match self.current_session().await {
+            Ok(s) => s,
             Err(_) => {
                 debug!("dormant; skipping search sync");
                 return;
             }
         };
+        let gitlab = session.gitlab;
         let Ok(_gate) = self.search_sync_gate.try_lock() else {
             debug!("search sync already in flight; skipping");
             return;
+        };
+
+        // Resolve `auto` against the host and the sticky degrade flag. The
+        // flag is honored between full syncs only — a due full sync retries
+        // the global fetch, so a recovered instance heals automatically.
+        let auto = population == SearchPopulation::Auto;
+        let mut degraded = false;
+        let mut effective = match population {
+            SearchPopulation::All => Population::All,
+            SearchPopulation::Member => Population::Member,
+            SearchPopulation::Auto => {
+                if is_gitlab_com(&session.host) {
+                    debug!("population=auto on gitlab.com; using member fetches");
+                    Population::Member
+                } else if !full_due && stamps.degraded_to_member {
+                    debug!(
+                        "population=auto is degraded to member fetches; \
+                         the global fetch is retried at the next full sync"
+                    );
+                    degraded = true;
+                    Population::Member
+                } else {
+                    Population::All
+                }
+            }
         };
 
         // Captured before any fetch so the next incremental cursor overlaps
@@ -85,10 +143,25 @@ impl Handlers {
                 .unwrap_or_else(chrono::Utc::now)
         });
 
-        if !self
-            .sync_all_kinds(&gitlab, population, updated_after)
-            .await
-        {
+        let mut outcome = self.sync_all_kinds(&gitlab, effective, updated_after).await;
+        if outcome == Outcome::GlobalRejected {
+            if auto {
+                warn!(
+                    "instance rejected the global scope=all fetch; degrading to \
+                     member-project fetches until the next full sync \
+                     (set [search] population explicitly to silence this)"
+                );
+                degraded = true;
+                effective = Population::Member;
+                outcome = self.sync_all_kinds(&gitlab, effective, updated_after).await;
+            } else {
+                warn!(
+                    "instance rejected the global scope=all fetch; \
+                     consider [search] population = \"member\""
+                );
+            }
+        }
+        if outcome != Outcome::Ok {
             return;
         }
 
@@ -99,6 +172,7 @@ impl Handlers {
             } else {
                 stamps.last_full_sync_secs
             },
+            degraded_to_member: degraded,
         };
         if let Err(e) = self.search.set_stamps(&fresh) {
             warn!(error = %e, "search sync: stamp write failed");
@@ -112,15 +186,18 @@ impl Handlers {
     /// full membership lists — they are small and have no reliable delta
     /// filter — so they stay exact on every sync.
     ///
-    /// Returns `false` on any fetch failure; already-landed upserts are
-    /// idempotent and harmless, and each kind's deletion diff runs only after
-    /// its own successful fetch.
+    /// A permanent rejection of a *global* (`Population::All`) issue/MR fetch
+    /// returns [`Outcome::GlobalRejected`] so the auto-population caller can
+    /// retry with member fetches; any other fetch failure is
+    /// [`Outcome::Failed`]. Already-landed upserts are idempotent and
+    /// harmless, and each kind's deletion diff runs only after its own
+    /// successful fetch.
     async fn sync_all_kinds(
         &self,
         gitlab: &Arc<dyn GitlabApi>,
-        population: SearchPopulation,
+        population: Population,
         updated_after: Option<chrono::DateTime<chrono::Utc>>,
-    ) -> bool {
+    ) -> Outcome {
         let full = updated_after.is_none();
 
         let projects = match gitlab.fetch_member_projects().await {
@@ -140,13 +217,19 @@ impl Handlers {
         log_retain("groups", self.search.retain_groups(&keep));
 
         let issues = match population {
-            SearchPopulation::All => {
-                match gitlab.fetch_issues_for_search(None, updated_after).await {
-                    Ok(i) => i,
-                    Err(e) => return self.fail_search_fetch(gitlab, "issues", &e).await,
+            Population::All => match gitlab.fetch_issues_for_search(None, updated_after).await {
+                Ok(i) => i,
+                Err(e) => {
+                    let rejected = matches!(e, Error::Gitlab(_));
+                    self.fail_search_fetch(gitlab, "issues", &e).await;
+                    return if rejected {
+                        Outcome::GlobalRejected
+                    } else {
+                        Outcome::Failed
+                    };
                 }
-            }
-            SearchPopulation::Member => {
+            },
+            Population::Member => {
                 let mut acc = Vec::new();
                 for p in &projects {
                     match gitlab
@@ -167,16 +250,24 @@ impl Handlers {
         }
 
         let mrs = match population {
-            SearchPopulation::All => {
+            Population::All => {
                 match gitlab
                     .fetch_merge_requests_for_search(None, updated_after)
                     .await
                 {
                     Ok(m) => m,
-                    Err(e) => return self.fail_search_fetch(gitlab, "merge requests", &e).await,
+                    Err(e) => {
+                        let rejected = matches!(e, Error::Gitlab(_));
+                        self.fail_search_fetch(gitlab, "merge requests", &e).await;
+                        return if rejected {
+                            Outcome::GlobalRejected
+                        } else {
+                            Outcome::Failed
+                        };
+                    }
                 }
             }
-            SearchPopulation::Member => {
+            Population::Member => {
                 let mut acc = Vec::new();
                 for p in &projects {
                     match gitlab
@@ -206,17 +297,28 @@ impl Handlers {
             groups = groups.len(),
             "search sync complete"
         );
-        true
+        if full && population == Population::All && issues.len() > LARGE_CORPUS_WARN {
+            warn!(
+                count = issues.len(),
+                "search corpus is very large; consider [search] population = \"member\""
+            );
+        }
+        Outcome::Ok
     }
 
     /// Log a failed search fetch and route it into the session state (a
     /// transient error demotes and wakes the reconnect supervisor, see
-    /// [`Handlers::note_gitlab_error`]). Always `false`, so fetch arms can
-    /// `return self.fail_search_fetch(..).await`.
-    async fn fail_search_fetch(&self, gitlab: &Arc<dyn GitlabApi>, kind: &str, e: &Error) -> bool {
+    /// [`Handlers::note_gitlab_error`]). Always [`Outcome::Failed`], so fetch
+    /// arms can `return self.fail_search_fetch(..).await`.
+    async fn fail_search_fetch(
+        &self,
+        gitlab: &Arc<dyn GitlabApi>,
+        kind: &str,
+        e: &Error,
+    ) -> Outcome {
         warn!(error = %e, kind, "search sync: GitLab fetch failed");
         self.note_gitlab_error(gitlab, e).await;
-        false
+        Outcome::Failed
     }
 }
 

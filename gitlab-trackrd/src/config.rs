@@ -292,9 +292,13 @@ pub struct SearchConfig {
     /// What the search cache holds for issues and merge requests: `"all"`
     /// syncs everything your token can see (GitLab `scope=all`; on very large
     /// instances the initial sync can be huge — prefer `"member"` there),
-    /// `"member"` only what is in projects you are a member of. Projects and
-    /// groups themselves are always membership-scoped.
-    #[config(default = "all")]
+    /// `"member"` only what is in projects you are a member of. The default
+    /// `"auto"` picks for you: `"member"` on gitlab.com (which rejects the
+    /// global fetch outright), `"all"` on self-hosted instances — falling back
+    /// to `"member"` until the next full resync if the instance rejects the
+    /// global fetch too. Projects and groups themselves are always
+    /// membership-scoped.
+    #[config(default = "auto")]
     pub population: SearchPopulation,
 
     /// Minimum seconds between incremental search-cache syncs. (30 min by
@@ -313,6 +317,10 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchPopulation {
+    /// Resolve per host: `Member` on gitlab.com, otherwise `All` with an
+    /// automatic fallback to `Member` when the instance rejects the global
+    /// fetch (see `handlers/search_sync.rs`).
+    Auto,
     /// Everything the token can see (`scope=all` on the global endpoints).
     All,
     /// Only projects the user is a member of (one fetch per project).
@@ -485,7 +493,7 @@ mod tests {
     #[test]
     fn search_defaults() {
         let c = defaults();
-        assert_eq!(c.search.population, SearchPopulation::All);
+        assert_eq!(c.search.population, SearchPopulation::Auto);
         assert_eq!(c.search.partial_interval(), Duration::from_secs(1800));
         assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
     }

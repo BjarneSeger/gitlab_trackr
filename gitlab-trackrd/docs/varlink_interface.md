@@ -144,8 +144,11 @@ and MRs come newest-updated first, projects and groups sorted by path. An empty 
 whitespace-only `query` is an eager `GitlabError`.
 
 What the corpus contains depends on the `[search]` daemon config: issues and MRs
-from everything the token can see (`population = "all"`, the default) or only from
-member projects (`"member"`); projects and groups are always membership-scoped.
+from everything the token can see (`population = "all"`) or only from member
+projects (`"member"`); the default `"auto"` resolves to `"member"` on gitlab.com
+(which rejects the global fetch) and `"all"` elsewhere, falling back to `"member"`
+until the next full resync if the instance rejects the global fetch too. Projects
+and groups are always membership-scoped.
 Issue `graph_status` is filled best-effort from already-cached board labels and is
 empty for projects the board cache has never seen. When the cache has never been
 synced: replies with empty arrays if a session exists (first sync pending),
