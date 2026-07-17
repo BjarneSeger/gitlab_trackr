@@ -5,9 +5,15 @@
 //! Freshness is owned by the background sync (`handlers/search_sync`), which
 //! gates itself on the cache-global [`SyncStamps`]: an incremental
 //! `updated_after` poll advances `last_partial_sync_secs`, a periodic full
-//! resync (which also reconciles deletions via [`SearchCache::retain_issues`]
+//! resync (which also reconciles deletions via [`SyncGuard::retain_issues`]
 //! and friends) advances both stamps. Zeroed stamps mean "never synced", so
-//! [`SearchCache::clear`] wiping them makes the next sync a full one.
+//! [`SyncGuard::clear`] wiping them makes the next sync a full one.
+//!
+//! Mutations are only reachable through a [`SyncGuard`], handed out by the
+//! cache's internal sync gate — see [`SearchCache::try_begin_sync`] — so the
+//! compiler enforces that every write path is serialized against the others.
+//! Reads take no lock: fjall is thread-safe per operation, and readers are
+//! pure cache readers that tolerate a mid-sync corpus.
 //!
 //! Also home to the pure text matchers the `Search` handler uses, kept here so
 //! they are unit-testable without handler scaffolding.
@@ -16,6 +22,7 @@ use std::collections::HashSet;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::db::KvStore;
 use crate::error::Result;
@@ -67,7 +74,7 @@ pub struct SearchGroup {
 }
 
 /// Cache-global sync bookkeeping. `0` means "never" — both for a fresh cache
-/// and after [`SearchCache::clear`] — which forces the next sync to be full.
+/// and after [`SyncGuard::clear`] — which forces the next sync to be full.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct SyncStamps {
     pub last_partial_sync_secs: u64,
@@ -109,6 +116,19 @@ pub struct SearchCache {
     projects: KvStore<u64, SearchProject>,
     groups: KvStore<u64, SearchGroup>,
     meta: KvStore<&'static str, SyncStamps>,
+    /// Serializes mutations: warm-up, the periodic loop, and `ClearCache` can
+    /// all race. Sync losers [`SearchCache::try_begin_sync`] and skip — a
+    /// second concurrent sync would only duplicate work — while `ClearCache`'s
+    /// clear [`SearchCache::begin_sync`]s to wait out an in-flight sync.
+    sync_gate: Mutex<()>,
+}
+
+/// Exclusive write permission for the search cache, held for the duration of
+/// one sync (or clear). All mutations live here; reads stay lock-free on
+/// [`SearchCache`] itself.
+pub struct SyncGuard<'a> {
+    cache: &'a SearchCache,
+    _gate: MutexGuard<'a, ()>,
 }
 
 impl SearchCache {
@@ -119,31 +139,29 @@ impl SearchCache {
             projects: KvStore::open(db, SEARCH_PROJECTS_KEYSPACE)?,
             groups: KvStore::open(db, SEARCH_GROUPS_KEYSPACE)?,
             meta: KvStore::open(db, SEARCH_META_KEYSPACE)?,
+            sync_gate: Mutex::new(()),
         })
+    }
+
+    /// Non-blocking gate acquisition — the sync path's losers-skip semantics.
+    pub fn try_begin_sync(&self) -> Option<SyncGuard<'_>> {
+        Some(SyncGuard {
+            cache: self,
+            _gate: self.sync_gate.try_lock().ok()?,
+        })
+    }
+
+    /// Awaiting gate acquisition — for callers that must not skip, like
+    /// `ClearCache` waiting out an in-flight sync.
+    pub async fn begin_sync(&self) -> SyncGuard<'_> {
+        SyncGuard {
+            cache: self,
+            _gate: self.sync_gate.lock().await,
+        }
     }
 
     pub fn stamps(&self) -> Result<SyncStamps> {
         Ok(self.meta.get(STAMPS_KEY)?.unwrap_or_default())
-    }
-
-    pub fn set_stamps(&self, stamps: &SyncStamps) -> Result<()> {
-        self.meta.put(STAMPS_KEY, stamps)
-    }
-
-    pub fn upsert_issues(&self, items: &[SearchIssue]) -> Result<()> {
-        upsert(&self.issues, items)
-    }
-
-    pub fn upsert_mrs(&self, items: &[SearchMr]) -> Result<()> {
-        upsert(&self.mrs, items)
-    }
-
-    pub fn upsert_projects(&self, items: &[SearchProject]) -> Result<()> {
-        upsert(&self.projects, items)
-    }
-
-    pub fn upsert_groups(&self, items: &[SearchGroup]) -> Result<()> {
-        upsert(&self.groups, items)
     }
 
     pub fn all_issues(&self) -> Result<Vec<SearchIssue>> {
@@ -161,31 +179,53 @@ impl SearchCache {
     pub fn all_groups(&self) -> Result<Vec<SearchGroup>> {
         self.groups.scan(|_, v| Ok(v))
     }
+}
+
+impl SyncGuard<'_> {
+    pub fn set_stamps(&self, stamps: &SyncStamps) -> Result<()> {
+        self.cache.meta.put(STAMPS_KEY, stamps)
+    }
+
+    pub fn upsert_issues(&self, items: &[SearchIssue]) -> Result<()> {
+        upsert(&self.cache.issues, items)
+    }
+
+    pub fn upsert_mrs(&self, items: &[SearchMr]) -> Result<()> {
+        upsert(&self.cache.mrs, items)
+    }
+
+    pub fn upsert_projects(&self, items: &[SearchProject]) -> Result<()> {
+        upsert(&self.cache.projects, items)
+    }
+
+    pub fn upsert_groups(&self, items: &[SearchGroup]) -> Result<()> {
+        upsert(&self.cache.groups, items)
+    }
 
     pub fn retain_issues(&self, keep: &HashSet<u64>) -> Result<usize> {
-        retain(&self.issues, keep)
+        retain(&self.cache.issues, keep)
     }
 
     pub fn retain_mrs(&self, keep: &HashSet<u64>) -> Result<usize> {
-        retain(&self.mrs, keep)
+        retain(&self.cache.mrs, keep)
     }
 
     pub fn retain_projects(&self, keep: &HashSet<u64>) -> Result<usize> {
-        retain(&self.projects, keep)
+        retain(&self.cache.projects, keep)
     }
 
     pub fn retain_groups(&self, keep: &HashSet<u64>) -> Result<usize> {
-        retain(&self.groups, keep)
+        retain(&self.cache.groups, keep)
     }
 
     /// Drop every entry of every kind *and* the sync stamps, so the next sync
     /// runs full.
     pub fn clear(&self) -> Result<()> {
-        self.issues.clear()?;
-        self.mrs.clear()?;
-        self.projects.clear()?;
-        self.groups.clear()?;
-        self.meta.clear()
+        self.cache.issues.clear()?;
+        self.cache.mrs.clear()?;
+        self.cache.projects.clear()?;
+        self.cache.groups.clear()?;
+        self.cache.meta.clear()
     }
 }
 
@@ -296,8 +336,9 @@ mod tests {
     #[test]
     fn upsert_dedupes_by_id() {
         let (c, _td) = cache();
-        c.upsert_issues(&[issue(1, "old")]).unwrap();
-        c.upsert_issues(&[issue(1, "new")]).unwrap();
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_issues(&[issue(1, "old")]).unwrap();
+        g.upsert_issues(&[issue(1, "new")]).unwrap();
         let all = c.all_issues().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].title, "new");
@@ -306,10 +347,11 @@ mod tests {
     #[test]
     fn each_kind_roundtrips_independently() {
         let (c, _td) = cache();
-        c.upsert_issues(&[issue(1, "i")]).unwrap();
-        c.upsert_mrs(&[mr(1, "m")]).unwrap();
-        c.upsert_projects(&[project(1, "team/p")]).unwrap();
-        c.upsert_groups(&[group(1, "team")]).unwrap();
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_issues(&[issue(1, "i")]).unwrap();
+        g.upsert_mrs(&[mr(1, "m")]).unwrap();
+        g.upsert_projects(&[project(1, "team/p")]).unwrap();
+        g.upsert_groups(&[group(1, "team")]).unwrap();
 
         assert_eq!(c.all_issues().unwrap()[0].title, "i");
         assert_eq!(c.all_mrs().unwrap()[0].title, "m");
@@ -320,10 +362,11 @@ mod tests {
     #[test]
     fn retain_removes_exactly_the_missing_keys() {
         let (c, _td) = cache();
-        c.upsert_issues(&[issue(1, "keep"), issue(2, "drop"), issue(3, "keep")])
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_issues(&[issue(1, "keep"), issue(2, "drop"), issue(3, "keep")])
             .unwrap();
 
-        let removed = c.retain_issues(&HashSet::from([1, 3])).unwrap();
+        let removed = g.retain_issues(&HashSet::from([1, 3])).unwrap();
         assert_eq!(removed, 1);
 
         let mut ids: Vec<i64> = c.all_issues().unwrap().iter().map(|i| i.id).collect();
@@ -334,9 +377,19 @@ mod tests {
     #[test]
     fn retain_with_empty_keep_empties_the_kind() {
         let (c, _td) = cache();
-        c.upsert_mrs(&[mr(1, "a"), mr(2, "b")]).unwrap();
-        assert_eq!(c.retain_mrs(&HashSet::new()).unwrap(), 2);
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_mrs(&[mr(1, "a"), mr(2, "b")]).unwrap();
+        assert_eq!(g.retain_mrs(&HashSet::new()).unwrap(), 2);
         assert!(c.all_mrs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_gate_is_exclusive_until_dropped() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        assert!(c.try_begin_sync().is_none());
+        drop(g);
+        assert!(c.try_begin_sync().is_some());
     }
 
     #[test]
@@ -350,12 +403,14 @@ mod tests {
     #[test]
     fn stamps_roundtrip() {
         let (c, _td) = cache();
-        c.set_stamps(&SyncStamps {
-            last_partial_sync_secs: 123,
-            last_full_sync_secs: 45,
-            degraded_to_member: true,
-        })
-        .unwrap();
+        c.try_begin_sync()
+            .unwrap()
+            .set_stamps(&SyncStamps {
+                last_partial_sync_secs: 123,
+                last_full_sync_secs: 45,
+                degraded_to_member: true,
+            })
+            .unwrap();
         let s = c.stamps().unwrap();
         assert_eq!(s.last_partial_sync_secs, 123);
         assert_eq!(s.last_full_sync_secs, 45);
@@ -375,18 +430,19 @@ mod tests {
     #[test]
     fn clear_wipes_all_kinds_and_resets_stamps() {
         let (c, _td) = cache();
-        c.upsert_issues(&[issue(1, "i")]).unwrap();
-        c.upsert_mrs(&[mr(1, "m")]).unwrap();
-        c.upsert_projects(&[project(1, "team/p")]).unwrap();
-        c.upsert_groups(&[group(1, "team")]).unwrap();
-        c.set_stamps(&SyncStamps {
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_issues(&[issue(1, "i")]).unwrap();
+        g.upsert_mrs(&[mr(1, "m")]).unwrap();
+        g.upsert_projects(&[project(1, "team/p")]).unwrap();
+        g.upsert_groups(&[group(1, "team")]).unwrap();
+        g.set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
             ..Default::default()
         })
         .unwrap();
 
-        c.clear().unwrap();
+        g.clear().unwrap();
 
         assert!(c.all_issues().unwrap().is_empty());
         assert!(c.all_mrs().unwrap().is_empty());
@@ -405,8 +461,9 @@ mod tests {
         {
             let db = fjall::Database::builder(&path).open().unwrap();
             let c = SearchCache::open(&db).unwrap();
-            c.upsert_issues(&[issue(1, "persisted")]).unwrap();
-            c.set_stamps(&SyncStamps {
+            let g = c.try_begin_sync().unwrap();
+            g.upsert_issues(&[issue(1, "persisted")]).unwrap();
+            g.set_stamps(&SyncStamps {
                 last_partial_sync_secs: 7,
                 last_full_sync_secs: 7,
                 ..Default::default()

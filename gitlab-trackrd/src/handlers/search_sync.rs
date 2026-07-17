@@ -10,7 +10,9 @@
 //! (zeroed stamps) is automatically a full one.
 //!
 //! [`Handlers::sync_search_cache`] is entirely self-gating, so the warm-up,
-//! the periodic loop, and `ClearCache` can all call it unconditionally.
+//! the periodic loop, and `ClearCache` can all call it unconditionally. The
+//! gate lives in [`SearchCache`](crate::search::SearchCache) itself: every
+//! mutation requires a [`SyncGuard`], so no write path can bypass it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -21,7 +23,7 @@ use tracing::{debug, info, warn};
 use crate::config::SearchPopulation;
 use crate::error::Error;
 use crate::gitlab::GitlabApi;
-use crate::search::SyncStamps;
+use crate::search::{SyncGuard, SyncStamps};
 
 use super::{Handlers, now_secs};
 
@@ -69,6 +71,10 @@ impl Handlers {
     /// when another sync is already in flight. Errors are logged and not
     /// propagated; a failed sync leaves the stamps untouched so the next tick
     /// retries.
+    ///
+    /// The gate is taken before the stamps are read, so a concurrent
+    /// `ClearCache` can't zero the stamps between the read and the sync — a
+    /// due sync always sees the stamps it will overwrite.
     pub async fn sync_search_cache(&self) {
         let (partial_secs, full_secs, population) = {
             let c = self.config.read().unwrap();
@@ -77,6 +83,10 @@ impl Handlers {
                 c.search.full_interval().as_secs(),
                 c.search.population,
             )
+        };
+        let Some(guard) = self.search.try_begin_sync() else {
+            debug!("search sync already in flight; skipping");
+            return;
         };
         let stamps = match self.search.stamps() {
             Ok(s) => s,
@@ -102,10 +112,6 @@ impl Handlers {
             }
         };
         let gitlab = session.gitlab;
-        let Ok(_gate) = self.search_sync_gate.try_lock() else {
-            debug!("search sync already in flight; skipping");
-            return;
-        };
 
         // Resolve `auto` against the host and the sticky degrade flag. The
         // flag is honored between full syncs only — a due full sync retries
@@ -143,7 +149,9 @@ impl Handlers {
                 .unwrap_or_else(chrono::Utc::now)
         });
 
-        let mut outcome = self.sync_all_kinds(&gitlab, effective, updated_after).await;
+        let mut outcome = self
+            .sync_all_kinds(&guard, &gitlab, effective, updated_after)
+            .await;
         if outcome == Outcome::GlobalRejected {
             if auto {
                 warn!(
@@ -153,7 +161,9 @@ impl Handlers {
                 );
                 degraded = true;
                 effective = Population::Member;
-                outcome = self.sync_all_kinds(&gitlab, effective, updated_after).await;
+                outcome = self
+                    .sync_all_kinds(&guard, &gitlab, effective, updated_after)
+                    .await;
             } else {
                 warn!(
                     "instance rejected the global scope=all fetch; \
@@ -174,7 +184,7 @@ impl Handlers {
             },
             degraded_to_member: degraded,
         };
-        if let Err(e) = self.search.set_stamps(&fresh) {
+        if let Err(e) = guard.set_stamps(&fresh) {
             warn!(error = %e, "search sync: stamp write failed");
         }
     }
@@ -194,6 +204,7 @@ impl Handlers {
     /// successful fetch.
     async fn sync_all_kinds(
         &self,
+        guard: &SyncGuard<'_>,
         gitlab: &Arc<dyn GitlabApi>,
         population: Population,
         updated_after: Option<chrono::DateTime<chrono::Utc>>,
@@ -204,17 +215,17 @@ impl Handlers {
             Ok(p) => p,
             Err(e) => return self.fail_search_fetch(gitlab, "projects", &e).await,
         };
-        log_store("projects", self.search.upsert_projects(&projects));
+        log_store("projects", guard.upsert_projects(&projects));
         let keep: HashSet<u64> = projects.iter().map(|p| p.id as u64).collect();
-        log_retain("projects", self.search.retain_projects(&keep));
+        log_retain("projects", guard.retain_projects(&keep));
 
         let groups = match gitlab.fetch_member_groups().await {
             Ok(g) => g,
             Err(e) => return self.fail_search_fetch(gitlab, "groups", &e).await,
         };
-        log_store("groups", self.search.upsert_groups(&groups));
+        log_store("groups", guard.upsert_groups(&groups));
         let keep: HashSet<u64> = groups.iter().map(|g| g.id as u64).collect();
-        log_retain("groups", self.search.retain_groups(&keep));
+        log_retain("groups", guard.retain_groups(&keep));
 
         let issues = match population {
             Population::All => match gitlab.fetch_issues_for_search(None, updated_after).await {
@@ -243,10 +254,10 @@ impl Handlers {
                 acc
             }
         };
-        log_store("issues", self.search.upsert_issues(&issues));
+        log_store("issues", guard.upsert_issues(&issues));
         if full {
             let keep: HashSet<u64> = issues.iter().map(|i| i.id as u64).collect();
-            log_retain("issues", self.search.retain_issues(&keep));
+            log_retain("issues", guard.retain_issues(&keep));
         }
 
         let mrs = match population {
@@ -283,10 +294,10 @@ impl Handlers {
                 acc
             }
         };
-        log_store("merge requests", self.search.upsert_mrs(&mrs));
+        log_store("merge requests", guard.upsert_mrs(&mrs));
         if full {
             let keep: HashSet<u64> = mrs.iter().map(|m| m.id as u64).collect();
-            log_retain("merge requests", self.search.retain_mrs(&keep));
+            log_retain("merge requests", guard.retain_mrs(&keep));
         }
 
         info!(

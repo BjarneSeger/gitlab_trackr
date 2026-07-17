@@ -322,7 +322,12 @@ impl VarlinkInterface for Handlers {
         }
 
         if want("search") {
-            if let Err(e) = self.search.clear() {
+            // begin_sync waits out an in-flight sync, so its final
+            // set_stamps can't stamp "synced" over the half-wiped corpus.
+            // The guard must drop before the refill sync below, whose
+            // try_begin_sync would otherwise lose and silently skip.
+            let guard = self.search.begin_sync().await;
+            if let Err(e) = guard.clear() {
                 warn!("search cache clear failed: {e}");
             } else {
                 info!("search cache cleared; next sync will be full");

@@ -112,7 +112,6 @@ async fn main() -> Result<()> {
         boards,
         history,
         search,
-        search_sync_gate: tokio::sync::Mutex::new(()),
         queue,
         config: Arc::clone(&config),
         reconnect_signal,

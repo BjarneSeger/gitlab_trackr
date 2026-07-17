@@ -467,7 +467,6 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             boards,
             history,
             search,
-            search_sync_gate: tokio::sync::Mutex::new(()),
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
@@ -907,6 +906,8 @@ async fn search_sync_throttled_while_stamps_fresh() {
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
     let now = now_secs();
     h.search
+        .try_begin_sync()
+        .unwrap()
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now,
             last_full_sync_secs: now,
@@ -955,12 +956,12 @@ async fn search_sync_cold_cache_runs_full_and_stamps_both() {
 async fn search_sync_full_drops_entries_gitlab_no_longer_returns() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
-    h.search
-        .upsert_issues(&[search_issue(99, "deleted upstream")])
-        .unwrap();
-    h.search
-        .upsert_mrs(&[search_mr(99, "deleted upstream")])
-        .unwrap();
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.upsert_issues(&[search_issue(99, "deleted upstream")])
+            .unwrap();
+        g.upsert_mrs(&[search_mr(99, "deleted upstream")]).unwrap();
+    }
 
     h.sync_search_cache().await; // zero stamps → full sync
 
@@ -987,11 +988,13 @@ async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
         last_full_sync_secs: now - 100,
         ..Default::default()
     };
-    h.search.set_stamps(&stamps).unwrap();
-    // An entry GitLab no longer returns: an incremental sync must keep it.
-    h.search
-        .upsert_issues(&[search_issue(99, "stale but kept")])
-        .unwrap();
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.set_stamps(&stamps).unwrap();
+        // An entry GitLab no longer returns: an incremental sync must keep it.
+        g.upsert_issues(&[search_issue(99, "stale but kept")])
+            .unwrap();
+    }
 
     h.sync_search_cache().await;
 
@@ -1108,27 +1111,24 @@ async fn run_search(
     reply_search(&mut call)
 }
 
-/// Seed all four search kinds and stamp the cache as synced.
+/// Seed all four search kinds and stamp the cache as synced. The sync guard
+/// drops on return, so callers are free to drive syncs or `clear_cache`.
 fn seed_search_cache(h: &Handlers) {
+    let g = h.search.try_begin_sync().unwrap();
     let mut labeled = search_issue(2, "unrelated title");
     labeled.labels = vec!["Backend".to_string()];
-    h.search
-        .upsert_issues(&[search_issue(1, "OAuth token refresh"), labeled])
+    g.upsert_issues(&[search_issue(1, "OAuth token refresh"), labeled])
         .unwrap();
-    h.search
-        .upsert_mrs(&[search_mr(3, "Fix oauth flow")])
+    g.upsert_mrs(&[search_mr(3, "Fix oauth flow")]).unwrap();
+    g.upsert_projects(&[search_project(4, "team/auth-service")])
         .unwrap();
-    h.search
-        .upsert_projects(&[search_project(4, "team/auth-service")])
-        .unwrap();
-    h.search.upsert_groups(&[search_group(5, "team")]).unwrap();
-    h.search
-        .set_stamps(&SyncStamps {
-            last_partial_sync_secs: 1,
-            last_full_sync_secs: 1,
-            ..Default::default()
-        })
-        .unwrap();
+    g.upsert_groups(&[search_group(5, "team")]).unwrap();
+    g.set_stamps(&SyncStamps {
+        last_partial_sync_secs: 1,
+        last_full_sync_secs: 1,
+        ..Default::default()
+    })
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1187,14 +1187,16 @@ async fn search_orders_by_recency_and_applies_per_kind_limit() {
     old.updated_at_secs = 100;
     let mut new = search_issue(2, "match new");
     new.updated_at_secs = 200;
-    h.search.upsert_issues(&[old, new]).unwrap();
-    h.search
-        .set_stamps(&SyncStamps {
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.upsert_issues(&[old, new]).unwrap();
+        g.set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
             ..Default::default()
         })
         .unwrap();
+    }
 
     let r = run_search(&h, "match", None, Some(1)).await;
     assert_eq!(r.issues.len(), 1, "per-kind limit applied");
@@ -1229,16 +1231,16 @@ async fn search_graph_status_comes_from_cached_boards_only() {
     off_board.labels = vec!["random".to_string()];
     let mut foreign = search_issue(3, "match foreign project");
     foreign.project_id = 99;
-    h.search
-        .upsert_issues(&[on_board, off_board, foreign])
-        .unwrap();
-    h.search
-        .set_stamps(&SyncStamps {
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.upsert_issues(&[on_board, off_board, foreign]).unwrap();
+        g.set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
             ..Default::default()
         })
         .unwrap();
+    }
 
     let r = run_search(&h, "match", None, None).await;
     let by_id: HashMap<i64, &Issue> = r.issues.iter().map(|i| (i.id, i)).collect();
@@ -1275,6 +1277,34 @@ async fn clear_cache_search_scope_empties_and_resets_stamps() {
         "stamps reset so the next sync runs full"
     );
     // Dormant → no re-fetch; history untouched by the search scope.
+}
+
+#[tokio::test]
+async fn clear_cache_search_scope_waits_out_an_in_flight_sync() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    // Simulate a sync in flight: while its guard is held, the clear must
+    // block instead of wiping the corpus under the sync's feet.
+    let guard = h.search.try_begin_sync().unwrap();
+    let mut call = AsyncCall::default();
+    let clear = h.clear_cache(
+        &mut call as &mut dyn Call_ClearCache,
+        Some(vec!["search".to_string()]),
+    );
+    let mut clear = std::pin::pin!(clear);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), clear.as_mut())
+            .await
+            .is_err(),
+        "clear waits while a sync holds the gate"
+    );
+
+    drop(guard);
+    clear.await.unwrap();
+    assert!(h.search.all_issues().unwrap().is_empty());
+    assert_eq!(h.search.stamps().unwrap().last_partial_sync_secs, 0);
 }
 
 #[tokio::test]
@@ -1391,6 +1421,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
     let now = now_secs();
     // Partial overdue, full fresh, degraded set by an earlier rejection.
     h.search
+        .try_begin_sync()
+        .unwrap()
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: now - 100,
@@ -1415,6 +1447,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
     // Force the full cadence; the global fetch works now (no injected error),
     // so the full sync recovers to all-population and clears the flag.
     h.search
+        .try_begin_sync()
+        .unwrap()
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: 1,
@@ -1606,14 +1640,16 @@ proptest! {
                     s
                 })
                 .collect();
-            h.search.upsert_issues(&issues).unwrap();
-            h.search
-                .set_stamps(&SyncStamps {
+            {
+                let g = h.search.try_begin_sync().unwrap();
+                g.upsert_issues(&issues).unwrap();
+                g.set_stamps(&SyncStamps {
                     last_partial_sync_secs: 1,
                     last_full_sync_secs: 1,
                     ..Default::default()
                 })
                 .unwrap();
+            }
 
             let r = run_search(&h, &needle, Some(vec!["issues".to_string()]), Some(limit)).await;
 
