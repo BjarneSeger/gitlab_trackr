@@ -5,6 +5,13 @@
 //! [`Handlers::warm_up`]) are driven by the background loops in `main.rs` and
 //! the reconnect supervisor; the read handlers stay pure cache readers because
 //! this owns freshness.
+//!
+//! Each tier is self-gating on the persisted [`RefreshStamps`] (the pattern
+//! [`super::search_sync`] established): a stamp advances only after a
+//! successful run, so callers invoke unconditionally, a restart inside an
+//! interval costs GitLab nothing, and a failed or dormant run leaves the
+//! stamp untouched for the next tick — or the post-reconnect warm-up — to
+//! retry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,13 +24,28 @@ use gitlab_trackr_api::Issue;
 use crate::boards::BoardCache;
 use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
 use crate::history::StoredTimelog;
+use crate::refresh_meta::RefreshStamps;
 
 use super::{Handlers, now_secs};
 
 impl Handlers {
-    /// Unconditionally fetch issues and boards from GitLab and update both caches.
-    /// Called by the background refresh task; errors are logged and not propagated.
+    /// Fetch issues and boards from GitLab and update both caches, if the
+    /// quick cadence is due. Self-gating (see the module doc); errors are
+    /// logged and not propagated.
     pub async fn refresh_cache(&self) {
+        let quick_secs = self
+            .config
+            .read()
+            .unwrap()
+            .refresh
+            .quick
+            .interval()
+            .as_secs();
+        if !self.refresh_due("quick refresh", |s, now| {
+            s.last_quick_sync_secs == 0 || now.saturating_sub(s.last_quick_sync_secs) >= quick_secs
+        }) {
+            return;
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => {
@@ -32,14 +54,17 @@ impl Handlers {
             }
         };
 
+        // Captured before any fetch, so nothing updated during the run is
+        // stamped over.
+        let started = now_secs();
         match gitlab.fetch_assigned_issues(None).await {
             Ok(raw) => {
                 let issues = enrich_graph_status(&*gitlab, &self.boards, raw).await;
                 if let Err(e) = self.cache.put(&issues) {
                     warn!(error = %e, "background cache write failed");
-                } else {
-                    info!(count = issues.len(), "background cache refresh complete");
+                    return;
                 }
+                info!(count = issues.len(), "background cache refresh complete");
             }
             Err(e) => {
                 warn!(error = %e, "background cache refresh: GitLab fetch failed");
@@ -49,13 +74,28 @@ impl Handlers {
         }
 
         let quick_window = self.config.read().unwrap().refresh.quick.window();
-        self.refresh_history_window(&gitlab, quick_window).await;
+        if self.refresh_history_window(&gitlab, quick_window).await {
+            self.stamp(|s| s.last_quick_sync_secs = started);
+        }
     }
 
     /// Slow-tier refresh of the bulk history window followed by a prune of
-    /// anything past the retention horizon. Acquires the session itself; no-op
-    /// when dormant. Called by the daily background loop.
+    /// anything past the retention horizon, if the slow cadence is due.
+    /// Self-gating; no-op when dormant. Called by the daily background loop.
     pub async fn refresh_history_daily(&self) {
+        let slow_secs = self
+            .config
+            .read()
+            .unwrap()
+            .refresh
+            .slow
+            .interval()
+            .as_secs();
+        if !self.refresh_due("daily history refresh", |s, now| {
+            s.last_slow_sync_secs == 0 || now.saturating_sub(s.last_slow_sync_secs) >= slow_secs
+        }) {
+            return;
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => {
@@ -63,15 +103,36 @@ impl Handlers {
                 return;
             }
         };
+        let started = now_secs();
         let slow_window = self.config.read().unwrap().refresh.slow.window();
-        self.refresh_history_window(&gitlab, slow_window).await;
+        if self.refresh_history_window(&gitlab, slow_window).await {
+            self.stamp(|s| s.last_slow_sync_secs = started);
+        }
         self.prune_history();
     }
 
-    /// One-time backfill of the full retention window (up to 90d) so the older,
-    /// never-refreshed history is populated. Acquires the session itself; no-op
-    /// when dormant. Called once at startup and after a full cache clear.
+    /// Backfill of the full retention window (up to 90d) so the older,
+    /// never-refreshed history is populated. Shares the slow stamp with
+    /// [`Self::refresh_history_daily`] — the windows overlap and upserts
+    /// dedupe — but additionally runs when the configured retention outgrew
+    /// the widest window ever backfilled. Self-gating; no-op when dormant.
+    /// Called at startup and after a full cache clear.
     pub async fn backfill_history(&self) {
+        let (slow_secs, retention_hours, retention) = {
+            let c = self.config.read().unwrap();
+            (
+                c.refresh.slow.interval().as_secs(),
+                c.history.retention_hours,
+                c.history.retention(),
+            )
+        };
+        if !self.refresh_due("history backfill", |s, now| {
+            s.last_slow_sync_secs == 0
+                || now.saturating_sub(s.last_slow_sync_secs) >= slow_secs
+                || s.backfilled_retention_hours < retention_hours
+        }) {
+            return;
+        }
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(_) => {
@@ -79,33 +140,71 @@ impl Handlers {
                 return;
             }
         };
-        let retention = self.config.read().unwrap().history.retention();
-        self.refresh_history_window(&gitlab, retention).await;
+        let started = now_secs();
+        if self.refresh_history_window(&gitlab, retention).await {
+            self.stamp(|s| {
+                s.last_slow_sync_secs = started;
+                s.backfilled_retention_hours = retention_hours;
+            });
+        }
         self.prune_history();
     }
 
     /// Warm the caches from scratch: refresh issues/boards, then backfill the
     /// full history window. Order matters — history enrichment reads project IDs
-    /// from the issue cache, so issues must land first. All steps are no-ops
-    /// while dormant. Shared by the startup warm-up, the post-reconnect recovery,
-    /// and the full cache-clear refill. The search sync is additionally
-    /// stamp-gated (see `search_sync`), so a warm-up shortly after the last
-    /// sync — a restart, a reconnect flap — does not re-poll GitLab for it.
+    /// from the issue cache, so issues must land first; when the stamp-gated
+    /// refresh skips, enrichment reads the *persisted* issue cache, so the
+    /// guarantee holds across restarts (a first boot has zero stamps and runs
+    /// everything). All steps are no-ops while dormant and gate on their
+    /// persisted stamps, so a warm-up shortly after the last run — a restart,
+    /// a reconnect flap — does not re-poll GitLab. Shared by the startup
+    /// warm-up, the post-reconnect recovery, and the full cache-clear refill
+    /// (which zeroes the stamps first).
     pub async fn warm_up(&self) {
         self.refresh_cache().await;
         self.backfill_history().await;
         self.sync_search_cache().await;
     }
 
+    /// The shared due-check prologue: read the persisted stamps and evaluate
+    /// `due(stamps, now)`. A stamp-read failure or a fresh stamp means "don't
+    /// run" — the caller returns without fetching or stamping.
+    fn refresh_due(&self, what: &str, due: impl FnOnce(&RefreshStamps, u64) -> bool) -> bool {
+        let stamps = match self.refresh_meta.stamps() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, what, "stamp read failed");
+                return false;
+            }
+        };
+        if due(&stamps, now_secs()) {
+            true
+        } else {
+            debug!("{what} throttled; last run is fresh");
+            false
+        }
+    }
+
+    /// Advance the persisted stamps after a successful run; a write failure
+    /// only costs one redundant refetch, so it is logged and swallowed.
+    fn stamp(&self, f: impl FnOnce(&mut RefreshStamps)) {
+        if let Err(e) = self.refresh_meta.update(f) {
+            warn!(error = %e, "refresh stamp write failed");
+        }
+    }
+
     /// Pull the user's GitLab timelogs spanning `window` back from now, enrich
     /// with cached issue data, and store. Best-effort — each step's failure is
-    /// logged and swallowed. Pruning is a separate step (see [`Self::prune_history`])
-    /// so the frequent quick refresh doesn't scan the whole table every time.
+    /// logged and swallowed; the `bool` reports success so the stamp-gated
+    /// callers know whether to advance their stamp. Pruning is a separate step
+    /// (see [`Self::prune_history`]) so the frequent quick refresh doesn't
+    /// scan the whole table every time.
+    #[must_use]
     pub(crate) async fn refresh_history_window(
         &self,
         gitlab: &Arc<dyn GitlabApi>,
         window: Duration,
-    ) {
+    ) -> bool {
         let now = now_secs();
         let cutoff = now.saturating_sub(window.as_secs());
         let since = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff as i64, 0)
@@ -116,7 +215,7 @@ impl Handlers {
             Err(e) => {
                 warn!(error = %e, "timelog refresh: GitLab fetch failed");
                 self.note_gitlab_error(gitlab, &e).await;
-                return;
+                return false;
             }
         };
 
@@ -134,12 +233,14 @@ impl Handlers {
 
         if let Err(e) = self.history.upsert(&stored) {
             warn!(error = %e, "history upsert failed");
+            false
         } else {
             info!(
                 count = stored.len(),
                 window_secs = window.as_secs(),
                 "history refresh complete"
             );
+            true
         }
     }
 

@@ -40,6 +40,7 @@ impl GitlabClient {
 /// Issue plus the raw data we still need after the GitLab fetch — labels for
 /// matching against the project's board lists. Dropped after `graph_status`
 /// is filled in.
+#[derive(Clone)]
 pub struct IssueWithLabels {
     pub issue: Issue,
     pub labels: Vec<String>,
@@ -47,6 +48,7 @@ pub struct IssueWithLabels {
 
 /// A timelog entry as returned by GraphQL `currentUser.timelogs`. The handler
 /// fills in `project_id` from the issue cache before persisting.
+#[derive(Clone)]
 pub struct FetchedTimelog {
     pub timelog_id: u64,
     pub spent_at_secs: u64,

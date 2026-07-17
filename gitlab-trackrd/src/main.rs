@@ -15,6 +15,7 @@ mod handlers;
 mod history;
 mod queue;
 mod reconnect;
+mod refresh_meta;
 mod reload;
 mod search;
 mod secrets;
@@ -28,6 +29,7 @@ use gitlab::GitlabClient;
 use handlers::{ConnState, Handlers, Session, SessionSlot};
 use history::HistoryCache;
 use queue::RetryQueue;
+use refresh_meta::RefreshMeta;
 use search::SearchCache;
 use service::ServiceHandler;
 
@@ -101,6 +103,7 @@ async fn main() -> Result<()> {
     let boards = Arc::new(BoardCache::open(&db)?);
     let history = Arc::new(HistoryCache::open(&db)?);
     let search = Arc::new(SearchCache::open(&db)?);
+    let refresh_meta = Arc::new(RefreshMeta::open(&db)?);
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config))?;
     // Woken when a runtime GitLab failure demotes the session to
     // `Dormant(Unreachable)`, so the reconnect supervisor re-engages mid-run and
@@ -112,6 +115,7 @@ async fn main() -> Result<()> {
         boards,
         history,
         search,
+        refresh_meta,
         queue,
         config: Arc::clone(&config),
         reconnect_signal,
@@ -147,7 +151,9 @@ async fn main() -> Result<()> {
     // One-shot startup warm-up: refresh issues/boards/active first so the
     // issue cache is populated, then backfill the full stale history window so
     // the older, never-refreshed tiers are filled. Order matters — history
-    // enrichment reads project IDs from the issue cache.
+    // enrichment reads project IDs from the issue cache. Every step gates
+    // itself on persisted stamps, so a restart inside the intervals serves the
+    // persisted caches instead of re-polling GitLab.
     {
         let handlers_ref = Arc::clone(&handlers);
         tokio::spawn(async move {
@@ -158,7 +164,9 @@ async fn main() -> Result<()> {
 
     // Quick tier: refresh issues, boards, and the recent history window every
     // `refresh.quick.interval_secs`. The interval is re-read each tick so a
-    // config reload takes effect after the current sleep.
+    // config reload takes effect after the current sleep. The refresh gates
+    // itself on the persisted quick stamp, so a tick is cheap when nothing is
+    // due.
     {
         let handlers_ref = Arc::clone(&handlers);
         let config = Arc::clone(&config);
@@ -173,7 +181,7 @@ async fn main() -> Result<()> {
     }
 
     // Slow tier: re-poll the bulk history window once a day and prune anything
-    // past the retention horizon.
+    // past the retention horizon. Gates itself on the persisted slow stamp.
     {
         let handlers_ref = Arc::clone(&handlers);
         let config = Arc::clone(&config);

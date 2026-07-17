@@ -27,6 +27,7 @@ use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabApi, GitlabClient};
 use crate::history::HistoryCache;
 use crate::queue::RetryQueue;
+use crate::refresh_meta::RefreshMeta;
 use crate::search::SearchCache;
 
 mod refresh;
@@ -86,6 +87,9 @@ pub struct Handlers {
     pub boards: Arc<BoardCache>,
     pub history: Arc<HistoryCache>,
     pub search: Arc<SearchCache>,
+    /// Persisted last-run stamps the refresh tiers gate on, so a restart
+    /// inside an interval serves the caches instead of re-polling GitLab.
+    pub refresh_meta: Arc<RefreshMeta>,
     pub queue: RetryQueue,
     /// Live daemon config; history windows are read from `config.history` at use
     /// time so a hot reload takes effect without a restart.

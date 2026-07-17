@@ -319,6 +319,12 @@ impl VarlinkInterface for Handlers {
             } else {
                 info!("board cache cleared");
             }
+            // Zeroed so the next quick tick actually refetches — a fresh stamp
+            // would serve the just-cleared cache as stale-empty until the
+            // interval elapses.
+            if let Err(e) = self.refresh_meta.update(|s| s.last_quick_sync_secs = 0) {
+                warn!("refresh stamp reset failed: {e}");
+            }
         }
 
         if want("search") {
@@ -351,6 +357,9 @@ impl VarlinkInterface for Handlers {
             } else {
                 info!("history cleared");
             }
+            if let Err(e) = self.refresh_meta.clear() {
+                warn!("refresh stamp clear failed: {e}");
+            }
         } else {
             if want("quick") {
                 clear_band(&self.history, quick_start, u64::MAX, "quick");
@@ -360,6 +369,20 @@ impl VarlinkInterface for Handlers {
             }
             if want("stale") {
                 clear_band(&self.history, 0, slow_start, "stale");
+            }
+            if want("quick") || want("slow") || want("stale") {
+                // The refill below repopulates immediately when connected; the
+                // zeroed slow stamp covers the dormant case, so the cleared
+                // band is refetched at the next opportunity instead of being
+                // stamped over as fresh.
+                if let Err(e) = self.refresh_meta.update(|s| {
+                    s.last_slow_sync_secs = 0;
+                    if want("stale") {
+                        s.backfilled_retention_hours = 0;
+                    }
+                }) {
+                    warn!("refresh stamp reset failed: {e}");
+                }
             }
         }
 
@@ -373,14 +396,14 @@ impl VarlinkInterface for Handlers {
                 }
                 if want("stale") {
                     let retention = self.config.read().unwrap().history.retention();
-                    self.refresh_history_window(&gitlab, retention).await;
+                    let _ = self.refresh_history_window(&gitlab, retention).await;
                     self.prune_history();
                 } else if want("slow") {
                     let slow_window = self.config.read().unwrap().refresh.slow.window();
-                    self.refresh_history_window(&gitlab, slow_window).await;
+                    let _ = self.refresh_history_window(&gitlab, slow_window).await;
                 } else if want("quick") {
                     let quick_window = self.config.read().unwrap().refresh.quick.window();
-                    self.refresh_history_window(&gitlab, quick_window).await;
+                    let _ = self.refresh_history_window(&gitlab, quick_window).await;
                 }
             }
         }

@@ -140,6 +140,13 @@ enum FetchErr {
 struct FakeGitlab {
     board_labels: Mutex<HashMap<i64, TrackrResult<Vec<String>>>>,
     board_calls: AtomicUsize,
+    /// Canned results for `fetch_assigned_issues` / `fetch_my_timelogs`, so
+    /// the stamp-gating tests can drive a successful refresh. `None` keeps
+    /// the method `unimplemented!()` for tests that must never hit it.
+    assigned: Mutex<Option<Vec<IssueWithLabels>>>,
+    timelogs: Mutex<Option<Vec<FetchedTimelog>>>,
+    assigned_calls: AtomicUsize,
+    timelog_calls: AtomicUsize,
     /// When set, `fetch_assigned_issues` / `fetch_my_timelogs` and the search
     /// fetches fail this way.
     fetch_err: Option<FetchErr>,
@@ -232,7 +239,14 @@ impl GitlabApi for FakeGitlab {
         &self,
         _group: Option<String>,
     ) -> TrackrResult<Vec<IssueWithLabels>> {
-        self.fetch_result()
+        self.assigned_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        match &*self.assigned.lock().unwrap() {
+            Some(v) => Ok(v.clone()),
+            None => self.fetch_result(),
+        }
     }
     async fn add_spent_time(
         &self,
@@ -256,7 +270,14 @@ impl GitlabApi for FakeGitlab {
         &self,
         _since: chrono::DateTime<chrono::Utc>,
     ) -> TrackrResult<Vec<FetchedTimelog>> {
-        self.fetch_result()
+        self.timelog_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        match &*self.timelogs.lock().unwrap() {
+            Some(v) => Ok(v.clone()),
+            None => self.fetch_result(),
+        }
     }
     async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
         unimplemented!()
@@ -458,6 +479,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
     let boards = Arc::new(BoardCache::open(&db).unwrap());
     let history = Arc::new(HistoryCache::open(&db).unwrap());
     let search = Arc::new(crate::search::SearchCache::open(&db).unwrap());
+    let refresh_meta = Arc::new(crate::refresh_meta::RefreshMeta::open(&db).unwrap());
     let config: SharedConfig = Arc::new(std::sync::RwLock::new(crate::config::defaults()));
     let queue = RetryQueue::new(Arc::clone(&session), &db, Arc::clone(&config)).unwrap();
     (
@@ -467,6 +489,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             boards,
             history,
             search,
+            refresh_meta,
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
@@ -1713,4 +1736,217 @@ proptest! {
             );
         });
     }
+}
+
+// ── refresh stamp gating ───────────────────────────────────────────────
+
+/// A `FakeGitlab` whose assigned-issue and timelog fetches serve one canned
+/// entry each, so the stamp-gating tests can drive successful refreshes and
+/// count the traffic.
+fn canned_refresh_fake() -> FakeGitlab {
+    let fake = FakeGitlab::default();
+    *fake.assigned.lock().unwrap() = Some(vec![iwl(7, "opened", &["bug"])]);
+    *fake.timelogs.lock().unwrap() = Some(vec![FetchedTimelog {
+        timelog_id: 1,
+        // Recent, so the prune following the slow-tier refreshes keeps it.
+        spent_at_secs: now_secs(),
+        issue_iid: 1,
+        issue_title: "t".into(),
+        web_url: "u".into(),
+        duration: "1h".into(),
+        summary: String::new(),
+    }]);
+    fake
+}
+
+#[tokio::test]
+async fn quick_refresh_throttled_while_stamp_fresh() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.refresh_meta
+        .update(|s| s.last_quick_sync_secs = now_secs())
+        .unwrap();
+
+    h.refresh_cache().await;
+
+    assert_eq!(
+        fake.assigned_calls.load(Ordering::SeqCst),
+        0,
+        "fresh stamp → no GitLab traffic (the restart-storm guard)"
+    );
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn quick_refresh_runs_when_stale_and_stamps() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    // Past the default quick interval (300s).
+    let stale = now_secs() - 10_000;
+    h.refresh_meta
+        .update(|s| s.last_quick_sync_secs = stale)
+        .unwrap();
+
+    h.refresh_cache().await;
+
+    assert_eq!(fake.assigned_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.cache.get().unwrap().map(|v| v.len()),
+        Some(1),
+        "issue cache populated"
+    );
+    assert!(
+        h.refresh_meta.stamps().unwrap().last_quick_sync_secs > stale,
+        "successful refresh advances the quick stamp"
+    );
+}
+
+#[tokio::test]
+async fn quick_refresh_failure_leaves_stamp_unwritten() {
+    let (h, _dir) = connected_handlers(FakeGitlab::failing(FetchErr::Transient));
+
+    h.refresh_cache().await;
+
+    assert_eq!(
+        h.refresh_meta.stamps().unwrap().last_quick_sync_secs,
+        0,
+        "a failed refresh must not stamp, so the next tick retries"
+    );
+}
+
+#[tokio::test]
+async fn daily_refresh_throttled_while_slow_stamp_fresh() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.refresh_meta
+        .update(|s| s.last_slow_sync_secs = now_secs())
+        .unwrap();
+
+    h.refresh_history_daily().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn daily_refresh_runs_when_stale_and_stamps() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    // Past the default slow interval (86400s).
+    let stale = now_secs() - 100_000;
+    h.refresh_meta
+        .update(|s| s.last_slow_sync_secs = stale)
+        .unwrap();
+
+    h.refresh_history_daily().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        h.refresh_meta.stamps().unwrap().last_slow_sync_secs > stale,
+        "successful daily refresh advances the slow stamp"
+    );
+}
+
+#[tokio::test]
+async fn backfill_skips_when_slow_stamp_fresh_and_retention_covered() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let retention_hours = h.config.read().unwrap().history.retention_hours;
+    h.refresh_meta
+        .update(|s| {
+            s.last_slow_sync_secs = now_secs();
+            s.backfilled_retention_hours = retention_hours;
+        })
+        .unwrap();
+
+    h.backfill_history().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn backfill_reruns_when_retention_grew() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let retention_hours = h.config.read().unwrap().history.retention_hours;
+    // Slow stamp fresh, but the recorded backfill width is narrower than the
+    // configured retention → one re-backfill is due.
+    h.refresh_meta
+        .update(|s| {
+            s.last_slow_sync_secs = now_secs();
+            s.backfilled_retention_hours = retention_hours - 1;
+        })
+        .unwrap();
+
+    h.backfill_history().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.refresh_meta.stamps().unwrap().backfilled_retention_hours,
+        retention_hours,
+        "the widened backfill is recorded"
+    );
+}
+
+#[tokio::test]
+async fn dormant_refresh_writes_no_stamp() {
+    let (h, _dir) = dormant_handlers();
+
+    h.refresh_cache().await;
+    h.refresh_history_daily().await;
+    h.backfill_history().await;
+
+    let s = h.refresh_meta.stamps().unwrap();
+    assert_eq!(
+        s.last_quick_sync_secs, 0,
+        "a dormant skip must not stamp — the post-reconnect warm-up must run"
+    );
+    assert_eq!(s.last_slow_sync_secs, 0);
+}
+
+#[tokio::test]
+async fn clear_cache_zeroes_refresh_stamps() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    h.refresh_meta
+        .update(|s| {
+            s.last_quick_sync_secs = 5;
+            s.last_slow_sync_secs = 5;
+            s.backfilled_retention_hours = 5;
+        })
+        .unwrap();
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(&mut call as &mut dyn Call_ClearCache, None)
+        .await
+        .unwrap();
+
+    let s = h.refresh_meta.stamps().unwrap();
+    assert_eq!(s.last_quick_sync_secs, 0);
+    assert_eq!(s.last_slow_sync_secs, 0);
+    assert_eq!(s.backfilled_retention_hours, 0);
+}
+
+#[tokio::test]
+async fn clear_cache_issues_scope_zeroes_only_quick_stamp() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    h.refresh_meta
+        .update(|s| {
+            s.last_quick_sync_secs = 5;
+            s.last_slow_sync_secs = 5;
+        })
+        .unwrap();
+
+    let mut call = AsyncCall::default();
+    h.clear_cache(
+        &mut call as &mut dyn Call_ClearCache,
+        Some(vec!["issues".to_string()]),
+    )
+    .await
+    .unwrap();
+
+    let s = h.refresh_meta.stamps().unwrap();
+    assert_eq!(s.last_quick_sync_secs, 0, "issues scope zeroes quick");
+    assert_eq!(s.last_slow_sync_secs, 5, "history stamps untouched");
 }
