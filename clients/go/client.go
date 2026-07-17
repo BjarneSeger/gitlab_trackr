@@ -76,6 +76,23 @@ func (c *Client) GetAssignedIssues(ctx context.Context, groups *[]string) ([]Iss
 	return GetAssignedIssues().Call(ctx, c.conn, groups)
 }
 
+// SearchResults groups the per-kind result sets of Search.
+type SearchResults struct {
+	Issues        []Issue
+	MergeRequests []MergeRequest
+	Projects      []Project
+	Groups        []Group
+}
+
+// Search searches the daemon's locally cached corpus (no GitLab round-trip).
+// kinds optionally restricts the reply to a subset of "issues", "merge_requests",
+// "projects", "groups" (nil = all four); limit caps each result set separately
+// (nil = daemon default of 50).
+func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limit *int64) (SearchResults, error) {
+	issues, mrs, projects, groups, err := Search().Call(ctx, c.conn, query, kinds, limit)
+	return SearchResults{issues, mrs, projects, groups}, err
+}
+
 // PostTime logs a time-tracking entry on an issue. summary is optional (nil to omit).
 func (c *Client) PostTime(ctx context.Context, projectID, issueIID int64, duration string, summary *string) error {
 	return PostTime().Call(ctx, c.conn, projectID, issueIID, duration, summary)

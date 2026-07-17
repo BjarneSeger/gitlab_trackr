@@ -33,4 +33,12 @@ func Example() {
 	for _, is := range issues {
 		fmt.Printf("#%d %s\n", is.Iid, is.Title)
 	}
+
+	res, err := c.Search(ctx, "billing", nil, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, is := range res.Issues {
+		fmt.Printf("#%d %s\n", is.Iid, is.Title)
+	}
 }

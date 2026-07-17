@@ -68,7 +68,8 @@ Daemon-side errors surface as typed values you match with `errors.As`:
 ### Optional parameters
 
 Optional varlink parameters are pointers; pass `nil` to omit them
-(e.g. `c.GetHistory(ctx, nil)` for the daemon's default window, or
+(e.g. `c.GetHistory(ctx, nil)` for the daemon's default window,
+`c.Search(ctx, "query", nil, nil)` for all kinds with the default limit, or
 `c.PostTime(ctx, pid, iid, "1h", &summary)`).
 
 ## Regenerating
