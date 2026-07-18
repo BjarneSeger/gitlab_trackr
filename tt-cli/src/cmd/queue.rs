@@ -76,7 +76,7 @@ async fn list(client: &VarlinkClient, output: OutputFormat) -> Result<()> {
                 };
                 println!(
                     "[{}] {} #{}{}  —  {}  ({})",
-                    f.id, f.op, f.issue_iid, detail, f.error, when
+                    f.id, f.op, f.iid, detail, f.error, when
                 );
             }
             println!(

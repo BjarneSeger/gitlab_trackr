@@ -31,7 +31,7 @@ pub async fn run(output: OutputFormat, days: u32) -> Result<()> {
                     .unwrap_or_else(|| e.timestamp.to_string());
                 println!(
                     "{ts}  {:<8}  #{:<5}  {:<6}  {}",
-                    e.source, e.issue_iid, e.duration, e.issue_title
+                    e.source, e.iid, e.duration, e.title
                 );
             }
         }

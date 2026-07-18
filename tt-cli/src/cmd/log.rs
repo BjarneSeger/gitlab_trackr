@@ -5,7 +5,7 @@
 //! `--project-id` — see [`resolve_project_id`] for the precedence rules.
 
 use anyhow::{Context, Result};
-use gitlab_trackr_api::VarlinkClientInterface;
+use gitlab_trackr_api::{IssuableKind, VarlinkClientInterface};
 
 use crate::cmd::project;
 use crate::{client, config, state};
@@ -26,7 +26,13 @@ pub async fn run(
 
     let client = client::connect(&socket).await?;
     client
-        .post_time(project_id, iid, duration.clone(), summary.clone())
+        .post_time(
+            project_id,
+            iid,
+            IssuableKind::issue,
+            duration.clone(),
+            summary.clone(),
+        )
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("PostTime", e))?;

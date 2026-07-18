@@ -10,8 +10,8 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use gitlab_trackr_api::{
-    Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_PostTime, Issue,
-    VarlinkInterface,
+    Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
+    Call_GetHistory, Call_PostTime, Call_UnassignSelf, IssuableKind, Issue, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
@@ -647,11 +647,11 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
 }
 
 #[tokio::test]
-async fn close_issue_rejects_bad_issue_ref() {
+async fn close_rejects_bad_issuable_ref() {
     use gitlab_trackr_api::AsyncCall;
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.close_issue(&mut call as &mut dyn Call_CloseIssue, 0, 42)
+    h.close(&mut call as &mut dyn Call_Close, 0, 42, IssuableKind::issue)
         .await
         .unwrap();
 
@@ -705,6 +705,7 @@ async fn post_time_queues_through_an_unreachable_outage() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -733,6 +734,7 @@ async fn post_time_rejects_when_dormant_but_not_unreachable() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -764,6 +766,7 @@ async fn post_time_transient_queues_without_demoting() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -1494,6 +1497,336 @@ async fn search_sync_auto_does_not_degrade_on_transient_global_failure() {
     );
 }
 
+// ── GetAssignedMergeRequests ────────────────────────────────────────────
+
+/// Seed the search corpus with MRs and stamps as one completed sync (user 1,
+/// current schema) would have left them. The assigned-MR view is cold until
+/// both rows AND stamps exist — zero stamps read as never-synced.
+fn seed_assigned_mrs(h: &Handlers) {
+    let g = h.search.try_begin_sync().unwrap();
+    let mut mine = search_mr(1, "mine"); // project 1, iid 10
+    mine.assignees = vec![crate::search::MrAssignee {
+        id: 1,
+        username: "me".into(),
+    }];
+    let mut mine_closed = search_mr(2, "mine but closed"); // iid 20
+    mine_closed.assignees = vec![crate::search::MrAssignee {
+        id: 1,
+        username: "me".into(),
+    }];
+    mine_closed.state = "closed".into();
+    let mut someone_elses = search_mr(3, "someone else's"); // iid 30
+    someone_elses.assignees = vec![crate::search::MrAssignee {
+        id: 9,
+        username: "them".into(),
+    }];
+    g.upsert_mrs(&[mine, mine_closed, someone_elses]).unwrap();
+    g.set_stamps(&SyncStamps {
+        last_partial_sync_secs: 100,
+        last_full_sync_secs: 100,
+        degraded_to_member: false,
+        schema_version: SEARCH_SCHEMA_VERSION,
+        synced_user_id: 1,
+    })
+    .unwrap();
+}
+
+fn reply_mrs(call: &mut gitlab_trackr_api::AsyncCall) -> Vec<gitlab_trackr_api::MergeRequest> {
+    let reply = call.take_reply().expect("a reply");
+    assert!(
+        reply.error.is_none(),
+        "expected success, got {:?}",
+        reply.error
+    );
+    let params: gitlab_trackr_api::GetAssignedMergeRequests_Reply =
+        serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply");
+    params.merge_requests
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_serves_open_assigned_from_cache_while_dormant() {
+    use gitlab_trackr_api::AsyncCall;
+    // Dormant on purpose: the view is a pure cache read.
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let mrs = reply_mrs(&mut call);
+    assert_eq!(mrs.len(), 1, "assigned-to-me AND opened only");
+    assert_eq!(mrs[0].iid, 10);
+    assert_eq!(mrs[0].assignees, vec!["me".to_string()]);
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_cold_cache_dormant_is_not_authenticated() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "never-synced while dormant → honest auth error, not fake-empty"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_cold_cache_connected_is_empty() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = connected_handlers(FakeGitlab::default());
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    assert!(
+        reply_mrs(&mut call).is_empty(),
+        "connected + first sync pending → empty reply"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_stale_schema_reads_as_cold() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h);
+    // Downgrade the stamps to the pre-assignee schema: rows exist but their
+    // assignee data can't be trusted yet.
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: 100,
+            last_full_sync_secs: 100,
+            degraded_to_member: false,
+            schema_version: 0,
+            synced_user_id: 0,
+        })
+        .unwrap();
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "stale schema while dormant → cold-cache behavior"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_group_filter_matches_namespace() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h); // web_urls live under gl/team/api/-/…
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(
+        &mut call as &mut dyn Call_GetAssignedMergeRequests,
+        Some(vec!["team".into()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply_mrs(&mut call).len(), 1, "subgroup-inclusive match");
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(
+        &mut call as &mut dyn Call_GetAssignedMergeRequests,
+        Some(vec!["other".into()]),
+    )
+    .await
+    .unwrap();
+    assert!(reply_mrs(&mut call).is_empty(), "non-matching group filter");
+}
+
+// ── MR write reflection in the search cache ─────────────────────────────
+
+#[tokio::test]
+async fn close_mr_while_unreachable_queues_and_updates_search_row() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+    seed_grouped_cache(&h); // issue cache must stay untouched by an MR close
+
+    let mut call = AsyncCall::default();
+    h.close(
+        &mut call as &mut dyn Call_Close,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert!(reply.error.is_none(), "unreachable → queued, success reply");
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert_eq!(row.state, "closed", "cached MR state flipped immediately");
+    assert_eq!(
+        h.cache.get().unwrap().unwrap().len(),
+        3,
+        "issue cache untouched by an MR close"
+    );
+}
+
+#[tokio::test]
+async fn unassign_mr_removes_synced_user_from_cached_assignees() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.unassign_self(
+        &mut call as &mut dyn Call_UnassignSelf,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert!(
+        row.assignees.is_empty(),
+        "synced user removed from the cached row"
+    );
+}
+
+#[tokio::test]
+async fn mr_cache_update_skips_when_sync_gate_is_held() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    // Simulate an in-flight sync: the write handler must not block on the
+    // gate — it skips the cache update and still replies success.
+    let _guard = h.search.try_begin_sync().unwrap();
+
+    let mut call = AsyncCall::default();
+    h.close(
+        &mut call as &mut dyn Call_Close,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert_eq!(
+        row.state, "opened",
+        "gate contended → cache update skipped, sync reconciles later"
+    );
+}
+
+#[tokio::test]
+async fn post_time_on_mr_defers_with_the_global_mr_id() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        1,
+        10,
+        IssuableKind::merge_request,
+        "30m".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let pending = h.queue.pending_post_time().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, crate::gitlab::Issuable::MergeRequest);
+}
+
+#[tokio::test]
+async fn get_history_joins_queued_mr_titles_from_search_corpus() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        1,
+        10,
+        IssuableKind::merge_request,
+        "30m".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    call.take_reply();
+
+    let mut call = AsyncCall::default();
+    h.get_history(&mut call as &mut dyn Call_GetHistory, None)
+        .await
+        .unwrap();
+    let reply = call.take_reply().expect("a reply");
+    assert!(reply.error.is_none());
+    let params: gitlab_trackr_api::GetHistory_Reply =
+        serde_json::from_value(reply.parameters.expect("parameters")).unwrap();
+    assert_eq!(params.events.len(), 1);
+    let e = &params.events[0];
+    assert_eq!(e.kind, IssuableKind::merge_request);
+    assert_eq!(e.iid, 10);
+    assert_eq!(e.title, "mine", "queued MR title joined from search corpus");
+    assert_eq!(e.source, "queued");
+}
+
 #[tokio::test]
 async fn search_sync_stale_schema_version_forces_full_resync() {
     let fake = Arc::new(canned_search_fake());
@@ -1807,6 +2140,7 @@ proptest! {
                 &mut call as &mut dyn Call_PostTime,
                 project_id,
                 issue_iid,
+                IssuableKind::issue,
                 duration.clone(),
                 None,
             )

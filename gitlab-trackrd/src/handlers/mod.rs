@@ -167,9 +167,9 @@ fn now_secs() -> u64 {
 /// Reject obviously-malformed issue references up front (eager pre-check), so a
 /// doomed request is never attempted or queued. Returns the error message when
 /// invalid.
-fn issue_ref_error(project_id: i64, issue_iid: i64) -> Option<String> {
-    (project_id <= 0 || issue_iid <= 0)
-        .then(|| format!("invalid issue reference (project {project_id}, iid {issue_iid})"))
+fn issue_ref_error(project_id: i64, iid: i64) -> Option<String> {
+    (project_id <= 0 || iid <= 0)
+        .then(|| format!("invalid issue/MR reference (project {project_id}, iid {iid})"))
 }
 
 /// Permissive sanity check for a GitLab time-tracking duration (`30m`,

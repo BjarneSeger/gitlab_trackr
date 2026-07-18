@@ -123,7 +123,7 @@ impl IssueCache {
 /// (`https://host/<namespace>/-/issues/<iid>`). Returns `""` when there is no
 /// namespace to parse — such issues still show in `tt list`, they just don't
 /// match any `tt list <group>` filter.
-fn namespace_of(web_url: &str) -> String {
+pub(crate) fn namespace_of(web_url: &str) -> String {
     web_url
         .split_once("://")
         .map(|(_, rest)| rest)
@@ -140,7 +140,7 @@ fn namespace_of(web_url: &str) -> String {
 
 /// Whether `namespace` falls under `group`, matching GitLab's subgroup-inclusive
 /// `.group(g)` filter: an exact match or a `group/…` descendant.
-fn in_group(namespace: &str, group: &str) -> bool {
+pub(crate) fn in_group(namespace: &str, group: &str) -> bool {
     let group = group.trim_matches('/');
     !group.is_empty() && (namespace == group || namespace.starts_with(&format!("{group}/")))
 }

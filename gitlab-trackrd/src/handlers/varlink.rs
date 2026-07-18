@@ -7,16 +7,18 @@ use std::collections::HashMap;
 use tracing::{debug, info, instrument, warn};
 
 use gitlab_trackr_api::{
-    Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_CloseIssue, Call_DismissFailure,
-    Call_GetAssignedIssues, Call_GetFailures, Call_GetHistory, Call_Login, Call_Logout,
-    Call_PostTime, Call_RetryFailure, Call_Search, Call_UnassignSelf, Call_WhoAmI, FailedTask,
-    Group, HistoryEvent, Issue, MergeRequest, Project, VarlinkInterface,
+    Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close, Call_DismissFailure,
+    Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures, Call_GetHistory,
+    Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_Search, Call_UnassignSelf,
+    Call_WhoAmI, FailedTask, Group, HistoryEvent, IssuableKind, Issue, MergeRequest, Project,
+    VarlinkInterface,
 };
 
+use crate::cache::{in_group, namespace_of};
 use crate::error::{DormancyReason, Error};
 use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
-use crate::search::{SearchIssue, parse_iid_query, text_matches};
+use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
 
 use super::refresh::graph_status_from;
@@ -31,12 +33,16 @@ const SEARCH_KINDS: [&str; 4] = ["issues", "merge_requests", "projects", "groups
 const DEFAULT_SEARCH_LIMIT: usize = 50;
 
 impl Handlers {
-    /// The global numeric issue ID (the one GraphQL embeds in
-    /// `gid://gitlab/Issue/<id>`) for a cached `(project, iid)`, so a queued
-    /// retry can use the GraphQL path. `None` when the issue isn't cached — the
-    /// queue then falls back to REST without a `spent_at`.
-    fn resolve_issue_id(&self, project_id: i64, issue_iid: i64) -> Option<i64> {
-        self.cache.issue_id(project_id, issue_iid).ok().flatten()
+    /// The global numeric issuable ID (the one GraphQL embeds in
+    /// `gid://gitlab/<Kind>/<id>`) for a cached `(project, iid)`, so a queued
+    /// retry can use the GraphQL path. Issues resolve via the assigned-issue
+    /// cache, MRs via the search corpus. `None` when not cached — the queue
+    /// then falls back to REST without a `spent_at`.
+    fn resolve_issuable_id(&self, kind: Issuable, project_id: i64, iid: i64) -> Option<i64> {
+        match kind {
+            Issuable::Issue => self.cache.issue_id(project_id, iid).ok().flatten(),
+            Issuable::MergeRequest => self.search.mr_id(project_id, iid).ok().flatten(),
+        }
     }
 
     /// Queue a `PostTime` write for retry when GitLab can't be reached right now
@@ -45,59 +51,105 @@ impl Handlers {
     /// arms of [`Self::post_time`].
     async fn defer_post_time(
         &self,
+        kind: Issuable,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
         duration: String,
         summary: Option<String>,
     ) {
-        let issue_id = self.resolve_issue_id(project_id, issue_iid);
+        let issuable_id = self.resolve_issuable_id(kind, project_id, iid);
         self.queue
-            .post_time(
-                Issuable::Issue,
-                project_id,
-                issue_iid,
-                duration,
-                summary,
-                issue_id,
-            )
+            .post_time(kind, project_id, iid, duration, summary, issuable_id)
             .await;
     }
 
-    /// Queue a `CloseIssue` write for retry and drop the issue from the cache so
-    /// `tt list` reflects it at once. Shared by both deferral arms of
-    /// [`Self::close_issue`].
-    async fn defer_close_issue(&self, project_id: i64, issue_iid: i64) {
-        self.queue
-            .close(Issuable::Issue, project_id, issue_iid)
-            .await;
-        self.forget_cached_issue(project_id, issue_iid);
+    /// Queue a `Close` write for retry and reflect it in the caches so the
+    /// assigned views do at once. Shared by both deferral arms of
+    /// [`Self::close`].
+    async fn defer_close(&self, kind: Issuable, project_id: i64, iid: i64) {
+        self.queue.close(kind, project_id, iid).await;
+        self.reflect_close(kind, project_id, iid);
     }
 
     /// Queue an `AssignSelf` write for retry. Shared by both deferral arms of
     /// [`Self::assign_self`].
-    async fn defer_assign_self(&self, project_id: i64, issue_iid: i64) {
-        self.queue
-            .assign_self(Issuable::Issue, project_id, issue_iid)
-            .await;
+    async fn defer_assign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
+        self.queue.assign_self(kind, project_id, iid).await;
     }
 
-    /// Queue an `UnassignSelf` write for retry and drop the issue from the cache.
+    /// Queue an `UnassignSelf` write for retry and reflect it in the caches.
     /// Shared by both deferral arms of [`Self::unassign_self`].
-    async fn defer_unassign_self(&self, project_id: i64, issue_iid: i64) {
-        self.queue
-            .unassign_self(Issuable::Issue, project_id, issue_iid)
-            .await;
-        self.forget_cached_issue(project_id, issue_iid);
+    async fn defer_unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) {
+        self.queue.unassign_self(kind, project_id, iid).await;
+        self.reflect_unassign(kind, project_id, iid);
+    }
+
+    /// Reflect a close in the caches immediately: drop the issue from the
+    /// assigned cache, or flip the cached MR's state so it leaves the
+    /// assigned-MR view. Best-effort — the next refresh/sync reconciles.
+    fn reflect_close(&self, kind: Issuable, project_id: i64, iid: i64) {
+        match kind {
+            Issuable::Issue => self.forget_cached_issue(project_id, iid),
+            Issuable::MergeRequest => self.update_cached_mr(project_id, iid, "close", |m| {
+                m.state = "closed".to_string();
+            }),
+        }
+    }
+
+    /// Reflect an unassign in the caches immediately: drop the issue, or
+    /// remove the synced user from the cached MR's assignees.
+    fn reflect_unassign(&self, kind: Issuable, project_id: i64, iid: i64) {
+        match kind {
+            Issuable::Issue => self.forget_cached_issue(project_id, iid),
+            Issuable::MergeRequest => {
+                let user = self
+                    .search
+                    .stamps()
+                    .map(|s| s.synced_user_id)
+                    .unwrap_or_default();
+                if user == 0 {
+                    return;
+                }
+                self.update_cached_mr(project_id, iid, "unassign", move |m| {
+                    m.assignees.retain(|a| a.id != user);
+                });
+            }
+        }
+    }
+
+    /// Apply a mutation to one cached search MR under the sync gate. Uses
+    /// `try_begin_sync` — a write handler must never wait out an in-flight
+    /// full resync; when the gate is contended the update is skipped, since
+    /// the running sync is fetching fresh data anyway.
+    fn update_cached_mr(
+        &self,
+        project_id: i64,
+        iid: i64,
+        what: &str,
+        f: impl FnOnce(&mut SearchMr),
+    ) {
+        let Some(guard) = self.search.try_begin_sync() else {
+            debug!(
+                project_id,
+                iid, what, "search sync in flight; skipping MR cache update"
+            );
+            return;
+        };
+        match guard.update_mr(project_id, iid, f) {
+            Ok(true) => debug!(project_id, iid, what, "cached MR updated"),
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, project_id, iid, what, "MR cache update failed"),
+        }
     }
 
     /// Drop an issue from the assigned-issues cache so a close/unassign is
     /// reflected in `tt list` immediately. Best-effort — a failure is logged
     /// and swallowed (the next refresh will reconcile the list anyway).
-    fn forget_cached_issue(&self, project_id: i64, issue_iid: i64) {
-        match self.cache.remove_issue(project_id, issue_iid) {
-            Ok(true) => debug!(project_id, issue_iid, "removed issue from cache"),
+    fn forget_cached_issue(&self, project_id: i64, iid: i64) {
+        match self.cache.remove_issue(project_id, iid) {
+            Ok(true) => debug!(project_id, iid, "removed issue from cache"),
             Ok(false) => {}
-            Err(e) => warn!(error = %e, project_id, issue_iid, "cache issue removal failed"),
+            Err(e) => warn!(error = %e, project_id, iid, "cache issue removal failed"),
         }
     }
 
@@ -129,6 +181,37 @@ fn read_or_empty<T>(result: crate::error::Result<Vec<T>>, kind: &str) -> Vec<T> 
         warn!(error = %e, kind, "search cache read failed, treating as empty");
         Vec::new()
     })
+}
+
+/// Wire → internal issuable kind. The only place the generated enum's
+/// lowercase variants are touched.
+fn internal_kind(kind: &IssuableKind) -> Issuable {
+    match kind {
+        IssuableKind::issue => Issuable::Issue,
+        IssuableKind::merge_request => Issuable::MergeRequest,
+    }
+}
+
+/// Internal → wire issuable kind.
+fn wire_kind(kind: Issuable) -> IssuableKind {
+    match kind {
+        Issuable::Issue => IssuableKind::issue,
+        Issuable::MergeRequest => IssuableKind::merge_request,
+    }
+}
+
+/// Map a cached search MR onto the wire `MergeRequest`; assignee usernames
+/// come from the pairs captured at sync time.
+fn wire_mr(m: SearchMr) -> MergeRequest {
+    MergeRequest {
+        id: m.id,
+        iid: m.iid,
+        project_id: m.project_id,
+        title: m.title,
+        web_url: m.web_url,
+        state: m.state,
+        assignees: m.assignees.into_iter().map(|a| a.username).collect(),
+    }
 }
 
 /// Whether an issue/MR matches the search: case-insensitive substring on the
@@ -184,6 +267,54 @@ impl VarlinkInterface for Handlers {
 
         debug!(count = issues.len(), "serving issues from cache");
         call.reply(issues)
+    }
+
+    #[instrument(skip(self, call))]
+    async fn get_assigned_merge_requests(
+        &self,
+        call: &mut dyn Call_GetAssignedMergeRequests,
+        groups: Option<Vec<String>>,
+    ) -> varlink::Result<()> {
+        // Cold cache — never synced, or synced under a pre-assignee schema
+        // (synced_user_id 0 covers both): mirror `get_assigned_issues` — an
+        // honest NotAuthenticated while dormant, an empty reply while the
+        // first (re)sync is pending.
+        let stamps = self.search.stamps().unwrap_or_else(|e| {
+            warn!("search stamp read failed, treating as never synced: {e}");
+            Default::default()
+        });
+        if stamps.last_partial_sync_secs == 0
+            || stamps.schema_version < SEARCH_SCHEMA_VERSION
+            || stamps.synced_user_id == 0
+        {
+            return match self.gitlab().await {
+                Ok(_) => call.reply(Vec::new()),
+                Err(e) => {
+                    let (reason, detail) = dormant_args(&e);
+                    call.reply_not_authenticated(reason, detail)
+                }
+            };
+        }
+
+        let mut mine: Vec<SearchMr> = read_or_empty(self.search.all_mrs(), "merge requests")
+            .into_iter()
+            .filter(|m| {
+                m.state == "opened" && m.assignees.iter().any(|a| a.id == stamps.synced_user_id)
+            })
+            .collect();
+        if let Some(groups) = groups
+            && !groups.is_empty()
+        {
+            mine.retain(|m| {
+                let ns = namespace_of(&m.web_url);
+                groups.iter().any(|g| in_group(&ns, g))
+            });
+        }
+        // The wire type carries no timestamp, so order for the picker here.
+        mine.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
+
+        debug!(count = mine.len(), "serving assigned MRs from search cache");
+        call.reply(mine.into_iter().map(wire_mr).collect())
     }
 
     #[instrument(skip(self, call))]
@@ -254,17 +385,7 @@ impl VarlinkInterface for Handlers {
             hits.retain(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid));
             hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
             hits.truncate(limit);
-            merge_requests = hits
-                .into_iter()
-                .map(|m| MergeRequest {
-                    id: m.id,
-                    iid: m.iid,
-                    project_id: m.project_id,
-                    title: m.title,
-                    web_url: m.web_url,
-                    state: m.state,
-                })
-                .collect();
+            merge_requests = hits.into_iter().map(wire_mr).collect();
         }
 
         let mut projects: Vec<Project> = Vec::new();
@@ -429,24 +550,28 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_PostTime,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
+        kind: IssuableKind,
         duration: String,
         summary: Option<String>,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+        if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
         if !looks_like_duration(&duration) {
             return call.reply_gitlab_error(format!("invalid duration: {duration:?}"));
         }
+        let kind = internal_kind(&kind);
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(DormancyReason::Unreachable { .. }) => {
                 info!(
                     project_id,
-                    issue_iid, "PostTime while unreachable, queuing for retry"
+                    iid,
+                    kind = ?kind,
+                    "PostTime while unreachable, queuing for retry"
                 );
-                self.defer_post_time(project_id, issue_iid, duration, summary)
+                self.defer_post_time(kind, project_id, iid, duration, summary)
                     .await;
                 return call.reply();
             }
@@ -456,22 +581,16 @@ impl VarlinkInterface for Handlers {
             }
         };
         match gitlab
-            .add_spent_time(
-                Issuable::Issue,
-                project_id,
-                issue_iid,
-                &duration,
-                summary.as_deref(),
-            )
+            .add_spent_time(kind, project_id, iid, &duration, summary.as_deref())
             .await
         {
             Ok(()) => {
-                info!(project_id, issue_iid, duration, "posted time");
+                info!(project_id, iid, kind = ?kind, duration, "posted time");
                 call.reply()
             }
             Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, issue_iid, "PostTime network error, queuing for retry");
-                self.defer_post_time(project_id, issue_iid, duration, summary)
+                warn!(error = %err, project_id, iid, "PostTime network error, queuing for retry");
+                self.defer_post_time(kind, project_id, iid, duration, summary)
                     .await;
                 call.reply()
             }
@@ -502,15 +621,41 @@ impl VarlinkInterface for Handlers {
 
         match self.queue.pending_post_time() {
             Ok(pending) => {
+                // Title/url joins for queued MR entries come from the search
+                // corpus; only scanned when an MR is actually pending.
+                let mrs = if pending.iter().any(|p| p.kind == Issuable::MergeRequest) {
+                    read_or_empty(self.search.all_mrs(), "merge requests")
+                } else {
+                    Vec::new()
+                };
+                let mr_by_key: HashMap<(i64, i64), &SearchMr> =
+                    mrs.iter().map(|m| ((m.project_id, m.iid), m)).collect();
+
                 for p in pending {
-                    let issue = by_key.get(&(p.project_id, p.iid));
+                    let (title, web_url) = match p.kind {
+                        Issuable::Issue => {
+                            let issue = by_key.get(&(p.project_id, p.iid));
+                            (
+                                issue.map(|i| i.title.clone()).unwrap_or_default(),
+                                issue.map(|i| i.web_url.clone()).unwrap_or_default(),
+                            )
+                        }
+                        Issuable::MergeRequest => {
+                            let mr = mr_by_key.get(&(p.project_id, p.iid));
+                            (
+                                mr.map(|m| m.title.clone()).unwrap_or_default(),
+                                mr.map(|m| m.web_url.clone()).unwrap_or_default(),
+                            )
+                        }
+                    };
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: "queued".to_string(),
+                        kind: wire_kind(p.kind),
                         project_id: p.project_id,
-                        issue_iid: p.iid,
-                        issue_title: issue.map(|i| i.title.clone()).unwrap_or_default(),
-                        web_url: issue.map(|i| i.web_url.clone()).unwrap_or_default(),
+                        iid: p.iid,
+                        title,
+                        web_url,
                         duration: p.duration,
                         summary: p.summary.unwrap_or_default(),
                     });
@@ -525,9 +670,10 @@ impl VarlinkInterface for Handlers {
                     events.push(HistoryEvent {
                         timestamp: e.spent_at_secs as i64,
                         source: "gitlab".to_string(),
+                        kind: wire_kind(e.kind),
                         project_id: e.project_id,
-                        issue_iid: e.iid,
-                        issue_title: e.title,
+                        iid: e.iid,
+                        title: e.title,
                         web_url: e.web_url,
                         duration: e.duration,
                         summary: e.summary,
@@ -554,8 +700,9 @@ impl VarlinkInterface for Handlers {
             .map(|f| FailedTask {
                 id: f.id as i64,
                 op: f.op_kind.to_string(),
+                kind: wire_kind(f.kind),
                 project_id: f.project_id,
-                issue_iid: f.iid,
+                iid: f.iid,
                 detail: f.detail,
                 error: f.error,
                 queued_at: f.queued_at_secs as i64,
@@ -614,23 +761,27 @@ impl VarlinkInterface for Handlers {
     }
 
     #[instrument(skip(self, call))]
-    async fn close_issue(
+    async fn close(
         &self,
-        call: &mut dyn Call_CloseIssue,
+        call: &mut dyn Call_Close,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
+        kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+        if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
+        let kind = internal_kind(&kind);
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(DormancyReason::Unreachable { .. }) => {
                 info!(
                     project_id,
-                    issue_iid, "CloseIssue while unreachable, queuing for retry"
+                    iid,
+                    kind = ?kind,
+                    "Close while unreachable, queuing for retry"
                 );
-                self.defer_close_issue(project_id, issue_iid).await;
+                self.defer_close(kind, project_id, iid).await;
                 return call.reply();
             }
             Err(e) => {
@@ -638,19 +789,19 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab.close(Issuable::Issue, project_id, issue_iid).await {
+        match gitlab.close(kind, project_id, iid).await {
             Ok(()) => {
-                info!(project_id, issue_iid, "closed issue");
-                self.forget_cached_issue(project_id, issue_iid);
+                info!(project_id, iid, kind = ?kind, "closed issuable");
+                self.reflect_close(kind, project_id, iid);
                 call.reply()
             }
             Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, issue_iid, "CloseIssue network error, queuing for retry");
-                self.defer_close_issue(project_id, issue_iid).await;
+                warn!(error = %err, project_id, iid, "Close network error, queuing for retry");
+                self.defer_close(kind, project_id, iid).await;
                 call.reply()
             }
             Err(e) => {
-                warn!(error = %e, "CloseIssue rejected by GitLab");
+                warn!(error = %e, "Close rejected by GitLab");
                 call.reply_gitlab_error(e.to_string())
             }
         }
@@ -661,19 +812,23 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_AssignSelf,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
+        kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+        if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
+        let kind = internal_kind(&kind);
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(DormancyReason::Unreachable { .. }) => {
                 info!(
                     project_id,
-                    issue_iid, "AssignSelf while unreachable, queuing for retry"
+                    iid,
+                    kind = ?kind,
+                    "AssignSelf while unreachable, queuing for retry"
                 );
-                self.defer_assign_self(project_id, issue_iid).await;
+                self.defer_assign_self(kind, project_id, iid).await;
                 return call.reply();
             }
             Err(e) => {
@@ -681,17 +836,14 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab
-            .assign_self(Issuable::Issue, project_id, issue_iid)
-            .await
-        {
+        match gitlab.assign_self(kind, project_id, iid).await {
             Ok(()) => {
-                info!(project_id, issue_iid, "assigned self");
+                info!(project_id, iid, kind = ?kind, "assigned self");
                 call.reply()
             }
             Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, issue_iid, "AssignSelf network error, queuing for retry");
-                self.defer_assign_self(project_id, issue_iid).await;
+                warn!(error = %err, project_id, iid, "AssignSelf network error, queuing for retry");
+                self.defer_assign_self(kind, project_id, iid).await;
                 call.reply()
             }
             Err(e) => {
@@ -706,19 +858,23 @@ impl VarlinkInterface for Handlers {
         &self,
         call: &mut dyn Call_UnassignSelf,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
+        kind: IssuableKind,
     ) -> varlink::Result<()> {
-        if let Some(msg) = issue_ref_error(project_id, issue_iid) {
+        if let Some(msg) = issue_ref_error(project_id, iid) {
             return call.reply_gitlab_error(msg);
         }
+        let kind = internal_kind(&kind);
         let gitlab = match self.gitlab().await {
             Ok(g) => g,
             Err(DormancyReason::Unreachable { .. }) => {
                 info!(
                     project_id,
-                    issue_iid, "UnassignSelf while unreachable, queuing for retry"
+                    iid,
+                    kind = ?kind,
+                    "UnassignSelf while unreachable, queuing for retry"
                 );
-                self.defer_unassign_self(project_id, issue_iid).await;
+                self.defer_unassign_self(kind, project_id, iid).await;
                 return call.reply();
             }
             Err(e) => {
@@ -726,18 +882,15 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab
-            .unassign_self(Issuable::Issue, project_id, issue_iid)
-            .await
-        {
+        match gitlab.unassign_self(kind, project_id, iid).await {
             Ok(()) => {
-                info!(project_id, issue_iid, "unassigned self");
-                self.forget_cached_issue(project_id, issue_iid);
+                info!(project_id, iid, kind = ?kind, "unassigned self");
+                self.reflect_unassign(kind, project_id, iid);
                 call.reply()
             }
             Err(err @ Error::Transient(_)) => {
-                warn!(error = %err, project_id, issue_iid, "UnassignSelf network error, queuing for retry");
-                self.defer_unassign_self(project_id, issue_iid).await;
+                warn!(error = %err, project_id, iid, "UnassignSelf network error, queuing for retry");
+                self.defer_unassign_self(kind, project_id, iid).await;
                 call.reply()
             }
             Err(e) => {

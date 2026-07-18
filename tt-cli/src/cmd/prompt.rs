@@ -11,7 +11,7 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
-use gitlab_trackr_api::{Issue, VarlinkClientInterface};
+use gitlab_trackr_api::{IssuableKind, Issue, VarlinkClientInterface};
 use inquire::{InquireError, Select, Text};
 
 use crate::{client, config, state};
@@ -119,7 +119,13 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     };
 
     client
-        .post_time(issue.project_id, issue.iid, duration.clone(), summary)
+        .post_time(
+            issue.project_id,
+            issue.iid,
+            IssuableKind::issue,
+            duration.clone(),
+            summary,
+        )
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("PostTime", e))?;

@@ -12,12 +12,15 @@ type Issue (
   graph_status: string
 )
 
+type IssuableKind (issue, merge_request)
+
 type HistoryEvent (
   timestamp: int,
   source: string,
+  kind: IssuableKind,
   project_id: int,
-  issue_iid: int,
-  issue_title: string,
+  iid: int,
+  title: string,
   web_url: string,
   duration: string,
   summary: string
@@ -26,8 +29,9 @@ type HistoryEvent (
 type FailedTask (
   id: int,
   op: string,
+  kind: IssuableKind,
   project_id: int,
-  issue_iid: int,
+  iid: int,
   detail: string,
   error: string,
   queued_at: int,
@@ -40,7 +44,8 @@ type MergeRequest (
   project_id: int,
   title: string,
   web_url: string,
-  state: string
+  state: string,
+  assignees: []string
 )
 
 type Project (
@@ -65,15 +70,17 @@ error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
+method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
+
 method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
-method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
+method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
-method CloseIssue(project_id: int, issue_iid: int) -> ()
+method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method AssignSelf(project_id: int, issue_iid: int) -> ()
+method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method UnassignSelf(project_id: int, issue_iid: int) -> ()
+method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method ClearCache(scope: ?[]string) -> ()
 

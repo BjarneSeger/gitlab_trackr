@@ -2,7 +2,7 @@
 //! Other assignees stay in place.
 
 use anyhow::Result;
-use gitlab_trackr_api::VarlinkClientInterface;
+use gitlab_trackr_api::{IssuableKind, VarlinkClientInterface};
 
 use crate::cmd::project;
 use crate::{client, config};
@@ -18,7 +18,7 @@ pub async fn run(iid: i64, project_id: Option<i64>) -> Result<()> {
 
     let client = client::connect(&socket).await?;
     client
-        .unassign_self(project_id, iid)
+        .unassign_self(project_id, iid, IssuableKind::issue)
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("UnassignSelf", e))?;

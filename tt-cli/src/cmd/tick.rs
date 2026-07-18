@@ -112,7 +112,7 @@ async fn notify_new_failures(st: &mut state::State) {
         };
         eprintln!(
             "⚠ tt: queued {} #{}{} failed — {}",
-            f.op, f.issue_iid, detail, f.error
+            f.op, f.iid, detail, f.error
         );
         high_water = high_water.max(id);
     }

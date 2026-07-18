@@ -2,7 +2,7 @@
 //! [`crate::cmd::project`] when not explicitly supplied.
 
 use anyhow::Result;
-use gitlab_trackr_api::VarlinkClientInterface;
+use gitlab_trackr_api::{IssuableKind, VarlinkClientInterface};
 
 use crate::cmd::project;
 use crate::{client, config};
@@ -18,7 +18,7 @@ pub async fn run(iid: i64, project_id: Option<i64>) -> Result<()> {
 
     let client = client::connect(&socket).await?;
     client
-        .close_issue(project_id, iid)
+        .close(project_id, iid, IssuableKind::issue)
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("CloseIssue", e))?;
