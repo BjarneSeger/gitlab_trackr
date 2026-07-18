@@ -13,7 +13,7 @@ use gitlab::api::{AsyncQuery, UrlBase};
 use tracing::{info, instrument, warn};
 
 use crate::error::{Error, Result};
-use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
+use crate::search::{MrAssignee, SearchGroup, SearchIssue, SearchMr, SearchProject};
 use gitlab_trackr_api::Issue;
 
 /// Which GitLab issuable an operation targets. Internal counterpart of the
@@ -786,8 +786,27 @@ fn search_mr_from_json(v: &serde_json::Value) -> SearchMr {
         web_url: v["web_url"].as_str().unwrap_or("").to_string(),
         state: v["state"].as_str().unwrap_or("").to_string(),
         labels: labels_from(v),
+        assignees: mr_assignees_from(v),
         updated_at_secs: rfc3339_secs(&v["updated_at"]),
     }
+}
+
+/// Extract `assignees[].{id, username}`; entries without a numeric id are
+/// dropped (they couldn't drive the assigned-to-me filter anyway).
+fn mr_assignees_from(v: &serde_json::Value) -> Vec<MrAssignee> {
+    v["assignees"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some(MrAssignee {
+                        id: a["id"].as_i64()?,
+                        username: a["username"].as_str().unwrap_or("").to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Convert a raw projects-API value (`simple=true` fields) into a
@@ -1314,6 +1333,36 @@ mod tests {
             let removed = compute_new_assignees(&added, self_id, false).expect("present → change");
             prop_assert_eq!(removed, current);
         }
+    }
+
+    #[test]
+    fn search_mr_from_json_captures_assignees() {
+        let v = serde_json::json!({
+            "id": 5, "iid": 2, "project_id": 9,
+            "title": "t", "web_url": "u", "state": "opened",
+            "assignees": [
+                { "id": 42, "username": "me" },
+                { "id": 43 },                       // missing username → kept, empty name
+                { "username": "ghost" },            // missing id → dropped
+            ],
+        });
+        let m = search_mr_from_json(&v);
+        assert_eq!(
+            m.assignees,
+            vec![
+                MrAssignee {
+                    id: 42,
+                    username: "me".into()
+                },
+                MrAssignee {
+                    id: 43,
+                    username: String::new()
+                },
+            ]
+        );
+
+        let bare = search_mr_from_json(&serde_json::json!({"id": 1}));
+        assert!(bare.assignees.is_empty(), "missing assignees array → empty");
     }
 
     #[test]

@@ -853,7 +853,7 @@ async fn get_assigned_issues_empty_cache_dormant_is_not_authenticated() {
 // ── search sync engine ─────────────────────────────────────────────────
 
 use crate::config::SearchPopulation;
-use crate::search::SyncStamps;
+use crate::search::{SEARCH_SCHEMA_VERSION, SyncStamps};
 
 fn search_issue(id: i64, title: &str) -> SearchIssue {
     SearchIssue {
@@ -879,6 +879,7 @@ fn search_mr(id: i64, title: &str) -> SearchMr {
         web_url: format!("https://gl/team/api/-/merge_requests/{}", id * 10),
         state: "opened".to_string(),
         labels: vec![],
+        assignees: vec![],
         updated_at_secs: 100,
     }
 }
@@ -941,6 +942,7 @@ async fn search_sync_throttled_while_stamps_fresh() {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now,
             last_full_sync_secs: now,
+            schema_version: SEARCH_SCHEMA_VERSION,
             ..Default::default()
         })
         .unwrap();
@@ -1016,6 +1018,7 @@ async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
     let stamps = SyncStamps {
         last_partial_sync_secs: now - 10_000,
         last_full_sync_secs: now - 100,
+        schema_version: SEARCH_SCHEMA_VERSION,
         ..Default::default()
     };
     {
@@ -1445,6 +1448,44 @@ async fn search_sync_auto_does_not_degrade_on_transient_global_failure() {
 }
 
 #[tokio::test]
+async fn search_sync_stale_schema_version_forces_full_resync() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // Perfectly fresh stamps, but written under entry-schema version 0 (rows
+    // predate assignee capture). Without the version check this sync would be
+    // throttled outright.
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 1,
+            last_full_sync_secs: now - 1,
+            degraded_to_member: false,
+            schema_version: 0,
+            synced_user_id: 0,
+        })
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    let calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[(None, None)],
+        "stale schema → treated as never synced → one full global fetch"
+    );
+    drop(calls);
+
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(stamps.schema_version, SEARCH_SCHEMA_VERSION);
+    assert_eq!(
+        stamps.synced_user_id, 1,
+        "session user id persisted for the assigned-MR filter"
+    );
+}
+
+#[tokio::test]
 async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
@@ -1457,6 +1498,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: now - 100,
             degraded_to_member: true,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
         })
         .unwrap();
 
@@ -1483,6 +1526,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: 1,
             degraded_to_member: true,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
         })
         .unwrap();
     fake.search_issue_calls.lock().unwrap().clear();
