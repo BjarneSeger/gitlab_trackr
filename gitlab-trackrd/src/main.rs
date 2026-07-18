@@ -5,33 +5,17 @@ use tokio::sync::{Notify, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-mod boards;
-mod cache;
-mod config;
-mod db;
-mod error;
-mod gitlab;
-mod handlers;
-mod history;
-mod queue;
-mod reconnect;
-mod refresh_meta;
-mod reload;
-mod search;
-mod secrets;
-mod server;
-mod service;
-
-use boards::BoardCache;
-use cache::IssueCache;
-use error::{DormancyReason, Result};
-use gitlab::GitlabClient;
-use handlers::{ConnState, Handlers, Session, SessionSlot};
-use history::HistoryCache;
-use queue::RetryQueue;
-use refresh_meta::RefreshMeta;
-use search::SearchCache;
-use service::ServiceHandler;
+use gitlab_trackrd::boards::BoardCache;
+use gitlab_trackrd::cache::IssueCache;
+use gitlab_trackrd::error::{DormancyReason, Result};
+use gitlab_trackrd::gitlab::GitlabClient;
+use gitlab_trackrd::handlers::{ConnState, Handlers, Session, SessionSlot};
+use gitlab_trackrd::history::HistoryCache;
+use gitlab_trackrd::queue::RetryQueue;
+use gitlab_trackrd::refresh_meta::RefreshMeta;
+use gitlab_trackrd::search::SearchCache;
+use gitlab_trackrd::service::ServiceHandler;
+use gitlab_trackrd::{config, reconnect, reload, secrets, server};
 
 #[tokio::main]
 async fn main() -> Result<()> {

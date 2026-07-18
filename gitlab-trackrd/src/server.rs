@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use varlink::AsyncConnectionHandler;
 
-use crate::Result;
+use crate::error::Result;
 
 /// Build a [`UnixListener`] from the systemd-passed socket FD (socket activation)
 /// or by binding a new socket at `path`.
