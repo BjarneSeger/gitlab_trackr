@@ -110,9 +110,13 @@ async fn notify_new_failures(st: &mut state::State) {
         } else {
             format!(" ({})", f.detail)
         };
+        let sigil = match f.kind {
+            gitlab_trackr_api::IssuableKind::merge_request => '!',
+            gitlab_trackr_api::IssuableKind::issue => '#',
+        };
         eprintln!(
-            "⚠ tt: queued {} #{}{} failed — {}",
-            f.op, f.issue_iid, detail, f.error
+            "⚠ tt: queued {} {sigil}{}{} failed — {}",
+            f.op, f.iid, detail, f.error
         );
         high_water = high_water.max(id);
     }

@@ -43,6 +43,14 @@ pub struct SearchIssue {
     pub updated_at_secs: u64,
 }
 
+/// One MR assignee, captured at sync time. The id drives the assigned-to-me
+/// filter; the username is what the wire `MergeRequest` exposes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MrAssignee {
+    pub id: i64,
+    pub username: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchMr {
     pub id: i64,
@@ -52,6 +60,11 @@ pub struct SearchMr {
     pub web_url: String,
     pub state: String,
     pub labels: Vec<String>,
+    /// `serde(default)` keeps rows written before assignee capture readable;
+    /// they read as unassigned until the schema-version bump's full resync
+    /// rewrites them (see [`SyncStamps::schema_version`]).
+    #[serde(default)]
+    pub assignees: Vec<MrAssignee>,
     pub updated_at_secs: u64,
 }
 
@@ -73,6 +86,13 @@ pub struct SearchGroup {
     pub web_url: String,
 }
 
+/// Bumped when the per-entry schema gains data that only a full resync can
+/// backfill (a delta sync rewrites only recently-updated entries, so an
+/// old row could otherwise keep its `serde(default)` value for up to a full
+/// sync interval). A stamp with an older version is treated as never-synced,
+/// forcing one full resync.
+pub const SEARCH_SCHEMA_VERSION: u32 = 1;
+
 /// Cache-global sync bookkeeping. `0` means "never" — both for a fresh cache
 /// and after [`SyncGuard::clear`] — which forces the next sync to be full.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -85,6 +105,17 @@ pub struct SyncStamps {
     /// sync. `serde(default)` keeps stamps written before this field readable.
     #[serde(default)]
     pub degraded_to_member: bool,
+    /// The entry-schema version the corpus was written under; see
+    /// [`SEARCH_SCHEMA_VERSION`]. Defaults to 0 for pre-existing stamps,
+    /// which reads as "stale schema".
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Numeric id of the user whose session ran the sync. Drives the
+    /// assigned-to-me MR filter at read time — a pure cache read that must
+    /// work while dormant, so the id is persisted here rather than taken
+    /// from the live session. `0` means "never synced under this schema".
+    #[serde(default)]
+    pub synced_user_id: i64,
 }
 
 const SEARCH_ISSUES_KEYSPACE: &str = "search_issues_v1";
@@ -172,6 +203,21 @@ impl SearchCache {
         self.mrs.scan(|_, v| Ok(v))
     }
 
+    /// The global numeric MR ID (the one GraphQL embeds in
+    /// `gid://gitlab/MergeRequest/<id>`) for a cached `(project, iid)` — the
+    /// MR counterpart of `IssueCache::issue_id`. `None` when the MR isn't in
+    /// the search corpus.
+    pub fn mr_id(&self, project_id: i64, iid: i64) -> Result<Option<i64>> {
+        Ok(self
+            .mrs
+            .scan(
+                |_, m: SearchMr| Ok((m.project_id == project_id && m.iid == iid).then_some(m.id)),
+            )?
+            .into_iter()
+            .flatten()
+            .next())
+    }
+
     pub fn all_projects(&self) -> Result<Vec<SearchProject>> {
         self.projects.scan(|_, v| Ok(v))
     }
@@ -216,6 +262,30 @@ impl SyncGuard<'_> {
 
     pub fn retain_groups(&self, keep: &HashSet<u64>) -> Result<usize> {
         retain(&self.cache.groups, keep)
+    }
+
+    /// Apply `f` to the cached MR at `(project_id, iid)`, if any. Returns
+    /// whether a row was updated. Used by the write handlers to reflect a
+    /// close/unassign immediately instead of waiting for the next sync.
+    pub fn update_mr(
+        &self,
+        project_id: i64,
+        iid: i64,
+        f: impl FnOnce(&mut SearchMr),
+    ) -> Result<bool> {
+        let Some(mut mr) = self
+            .cache
+            .mrs
+            .scan(|_, m: SearchMr| Ok((m.project_id == project_id && m.iid == iid).then_some(m)))?
+            .into_iter()
+            .flatten()
+            .next()
+        else {
+            return Ok(false);
+        };
+        f(&mut mr);
+        self.cache.mrs.put(mr.id as u64, &mr)?;
+        Ok(true)
     }
 
     /// Drop every entry of every kind *and* the sync stamps, so the next sync
@@ -303,6 +373,7 @@ mod tests {
             web_url: format!("https://gl/p/-/merge_requests/{id}"),
             state: "opened".to_string(),
             labels: vec![],
+            assignees: vec![],
             updated_at_secs: 100,
         }
     }
@@ -409,12 +480,16 @@ mod tests {
                 last_partial_sync_secs: 123,
                 last_full_sync_secs: 45,
                 degraded_to_member: true,
+                schema_version: SEARCH_SCHEMA_VERSION,
+                synced_user_id: 42,
             })
             .unwrap();
         let s = c.stamps().unwrap();
         assert_eq!(s.last_partial_sync_secs, 123);
         assert_eq!(s.last_full_sync_secs, 45);
         assert!(s.degraded_to_member);
+        assert_eq!(s.schema_version, SEARCH_SCHEMA_VERSION);
+        assert_eq!(s.synced_user_id, 42);
     }
 
     #[test]
@@ -425,6 +500,63 @@ mod tests {
             serde_json::from_str(r#"{"last_partial_sync_secs": 7, "last_full_sync_secs": 7}"#)
                 .unwrap();
         assert!(!s.degraded_to_member);
+        assert_eq!(s.schema_version, 0, "pre-versioned stamps read as stale");
+        assert_eq!(s.synced_user_id, 0);
+    }
+
+    #[test]
+    fn search_mr_without_assignees_field_still_parses() {
+        // Rows written before assignee capture must stay readable: they read
+        // as unassigned until the forced full resync rewrites them.
+        let m: SearchMr = serde_json::from_str(
+            r#"{"id":1,"iid":10,"project_id":1,"title":"t","web_url":"u",
+                "state":"opened","labels":[],"updated_at_secs":100}"#,
+        )
+        .unwrap();
+        assert!(m.assignees.is_empty());
+    }
+
+    #[test]
+    fn mr_id_resolves_cached_project_iid_pairs() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        g.upsert_mrs(&[mr(3, "a"), mr(4, "b")]).unwrap();
+        drop(g);
+
+        // mr() sets iid = id * 10 and project_id = 1.
+        assert_eq!(c.mr_id(1, 30).unwrap(), Some(3));
+        assert_eq!(c.mr_id(1, 40).unwrap(), Some(4));
+        assert_eq!(c.mr_id(1, 99).unwrap(), None, "unknown iid");
+        assert_eq!(c.mr_id(2, 30).unwrap(), None, "wrong project");
+    }
+
+    #[test]
+    fn update_mr_mutates_exactly_the_matching_row() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        let mut assigned = mr(3, "mine");
+        assigned.assignees = vec![MrAssignee {
+            id: 42,
+            username: "me".into(),
+        }];
+        g.upsert_mrs(&[assigned, mr(4, "other")]).unwrap();
+
+        assert!(
+            g.update_mr(1, 30, |m| {
+                m.state = "closed".into();
+                m.assignees.retain(|a| a.id != 42);
+            })
+            .unwrap()
+        );
+        assert!(!g.update_mr(1, 99, |_| ()).unwrap(), "missing row → false");
+        drop(g);
+
+        let mrs = c.all_mrs().unwrap();
+        let updated = mrs.iter().find(|m| m.id == 3).unwrap();
+        assert_eq!(updated.state, "closed");
+        assert!(updated.assignees.is_empty());
+        let untouched = mrs.iter().find(|m| m.id == 4).unwrap();
+        assert_eq!(untouched.state, "opened");
     }
 
     #[test]

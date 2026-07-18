@@ -34,6 +34,14 @@ func Example() {
 		fmt.Printf("#%d %s\n", is.Iid, is.Title)
 	}
 
+	mrs, err := c.GetAssignedMergeRequests(ctx, nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, mr := range mrs {
+		fmt.Printf("!%d %s %v\n", mr.Iid, mr.Title, mr.Assignees)
+	}
+
 	res, err := c.Search(ctx, "billing", nil, nil)
 	if err != nil {
 		log.Fatal(err)

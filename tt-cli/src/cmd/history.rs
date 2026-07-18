@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gitlab_trackr_api::VarlinkClientInterface;
+use gitlab_trackr_api::{IssuableKind, VarlinkClientInterface};
 
 use crate::cli::OutputFormat;
 use crate::{client, config};
@@ -29,9 +29,13 @@ pub async fn run(output: OutputFormat, days: u32) -> Result<()> {
                 let ts = DateTime::<Utc>::from_timestamp(e.timestamp, 0)
                     .map(|d| d.to_rfc3339())
                     .unwrap_or_else(|| e.timestamp.to_string());
+                let sigil = match e.kind {
+                    IssuableKind::merge_request => '!',
+                    IssuableKind::issue => '#',
+                };
                 println!(
-                    "{ts}  {:<8}  #{:<5}  {:<6}  {}",
-                    e.source, e.issue_iid, e.duration, e.issue_title
+                    "{ts}  {:<8}  {sigil}{:<5}  {:<6}  {}",
+                    e.source, e.iid, e.duration, e.title
                 );
             }
         }

@@ -23,35 +23,40 @@ type Issue struct {
 	Graph_status string `json:"graph_status"`
 }
 
+type IssuableKind string
+
 type HistoryEvent struct {
-	Timestamp   int64  `json:"timestamp"`
-	Source      string `json:"source"`
-	Project_id  int64  `json:"project_id"`
-	Issue_iid   int64  `json:"issue_iid"`
-	Issue_title string `json:"issue_title"`
-	Web_url     string `json:"web_url"`
-	Duration    string `json:"duration"`
-	Summary     string `json:"summary"`
+	Timestamp  int64        `json:"timestamp"`
+	Source     string       `json:"source"`
+	Kind       IssuableKind `json:"kind"`
+	Project_id int64        `json:"project_id"`
+	Iid        int64        `json:"iid"`
+	Title      string       `json:"title"`
+	Web_url    string       `json:"web_url"`
+	Duration   string       `json:"duration"`
+	Summary    string       `json:"summary"`
 }
 
 type FailedTask struct {
-	Id         int64  `json:"id"`
-	Op         string `json:"op"`
-	Project_id int64  `json:"project_id"`
-	Issue_iid  int64  `json:"issue_iid"`
-	Detail     string `json:"detail"`
-	Error      string `json:"error"`
-	Queued_at  int64  `json:"queued_at"`
-	Failed_at  int64  `json:"failed_at"`
+	Id         int64        `json:"id"`
+	Op         string       `json:"op"`
+	Kind       IssuableKind `json:"kind"`
+	Project_id int64        `json:"project_id"`
+	Iid        int64        `json:"iid"`
+	Detail     string       `json:"detail"`
+	Error      string       `json:"error"`
+	Queued_at  int64        `json:"queued_at"`
+	Failed_at  int64        `json:"failed_at"`
 }
 
 type MergeRequest struct {
-	Id         int64  `json:"id"`
-	Iid        int64  `json:"iid"`
-	Project_id int64  `json:"project_id"`
-	Title      string `json:"title"`
-	Web_url    string `json:"web_url"`
-	State      string `json:"state"`
+	Id         int64    `json:"id"`
+	Iid        int64    `json:"iid"`
+	Project_id int64    `json:"project_id"`
+	Title      string   `json:"title"`
+	Web_url    string   `json:"web_url"`
+	State      string   `json:"state"`
+	Assignees  []string `json:"assignees"`
 }
 
 type Project struct {
@@ -182,6 +187,67 @@ func (m GetAssignedIssues_methods) Upgrade(ctx context.Context, c *varlink.Conne
 	}, nil
 }
 
+type GetAssignedMergeRequests_methods struct{}
+
+func GetAssignedMergeRequests() GetAssignedMergeRequests_methods {
+	return GetAssignedMergeRequests_methods{}
+}
+
+func (m GetAssignedMergeRequests_methods) Call(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (merge_requests_out_ []MergeRequest, err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, groups_in_)
+	if err_ != nil {
+		return
+	}
+	merge_requests_out_, _, err_ = receive(ctx)
+	return
+}
+
+func (m GetAssignedMergeRequests_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, groups_in_ *[]string) (func(ctx context.Context) ([]MergeRequest, uint64, error), error) {
+	var in struct {
+		Groups *[]string `json:"groups,omitempty"`
+	}
+	in.Groups = groups_in_
+	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.GetAssignedMergeRequests", in, flags)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (merge_requests_out_ []MergeRequest, flags uint64, err error) {
+		var out struct {
+			Merge_requests []MergeRequest `json:"merge_requests"`
+		}
+		flags, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		merge_requests_out_ = []MergeRequest(out.Merge_requests)
+		return
+	}, nil
+}
+
+func (m GetAssignedMergeRequests_methods) Upgrade(ctx context.Context, c *varlink.Connection, groups_in_ *[]string) (func(ctx context.Context) (merge_requests_out_ []MergeRequest, flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+	var in struct {
+		Groups *[]string `json:"groups,omitempty"`
+	}
+	in.Groups = groups_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.GetAssignedMergeRequests", in)
+	if err != nil {
+		return nil, err
+	}
+	return func(context.Context) (merge_requests_out_ []MergeRequest, flags uint64, conn varlink.ReadWriterContext, err error) {
+		var out struct {
+			Merge_requests []MergeRequest `json:"merge_requests"`
+		}
+		flags, conn, err = receive(ctx, &out)
+		if err != nil {
+			err = Dispatch_Error(err)
+			return
+		}
+		merge_requests_out_ = []MergeRequest(out.Merge_requests)
+		return
+	}, nil
+}
+
 type Search_methods struct{}
 
 func Search() Search_methods { return Search_methods{} }
@@ -265,8 +331,8 @@ type PostTime_methods struct{}
 
 func PostTime() PostTime_methods { return PostTime_methods{} }
 
-func (m PostTime_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64, duration_in_ string, summary_in_ *string) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, issue_iid_in_, duration_in_, summary_in_)
+func (m PostTime_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_, duration_in_, summary_in_)
 	if err_ != nil {
 		return
 	}
@@ -274,15 +340,17 @@ func (m PostTime_methods) Call(ctx context.Context, c *varlink.Connection, proje
 	return
 }
 
-func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, issue_iid_in_ int64, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (uint64, error), error) {
+func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Project_id int64   `json:"project_id"`
-		Issue_iid  int64   `json:"issue_iid"`
-		Duration   string  `json:"duration"`
-		Summary    *string `json:"summary,omitempty"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
+		Duration   string       `json:"duration"`
+		Summary    *string      `json:"summary,omitempty"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	in.Duration = duration_in_
 	in.Summary = summary_in_
 	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.PostTime", in, flags)
@@ -299,15 +367,17 @@ func (m PostTime_methods) Send(ctx context.Context, c *varlink.Connection, flags
 	}, nil
 }
 
-func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind, duration_in_ string, summary_in_ *string) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id int64   `json:"project_id"`
-		Issue_iid  int64   `json:"issue_iid"`
-		Duration   string  `json:"duration"`
-		Summary    *string `json:"summary,omitempty"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
+		Duration   string       `json:"duration"`
+		Summary    *string      `json:"summary,omitempty"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	in.Duration = duration_in_
 	in.Summary = summary_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.PostTime", in)
@@ -324,12 +394,12 @@ func (m PostTime_methods) Upgrade(ctx context.Context, c *varlink.Connection, pr
 	}, nil
 }
 
-type CloseIssue_methods struct{}
+type Close_methods struct{}
 
-func CloseIssue() CloseIssue_methods { return CloseIssue_methods{} }
+func Close() Close_methods { return Close_methods{} }
 
-func (m CloseIssue_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, issue_iid_in_)
+func (m Close_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
@@ -337,14 +407,16 @@ func (m CloseIssue_methods) Call(ctx context.Context, c *varlink.Connection, pro
 	return
 }
 
-func (m CloseIssue_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (uint64, error), error) {
+func (m Close_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
-	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.CloseIssue", in, flags)
+	in.Iid = iid_in_
+	in.Kind = kind_in_
+	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.Close", in, flags)
 	if err != nil {
 		return nil, err
 	}
@@ -358,14 +430,16 @@ func (m CloseIssue_methods) Send(ctx context.Context, c *varlink.Connection, fla
 	}, nil
 }
 
-func (m CloseIssue_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m Close_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
-	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.CloseIssue", in)
+	in.Iid = iid_in_
+	in.Kind = kind_in_
+	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.Close", in)
 	if err != nil {
 		return nil, err
 	}
@@ -383,8 +457,8 @@ type AssignSelf_methods struct{}
 
 func AssignSelf() AssignSelf_methods { return AssignSelf_methods{} }
 
-func (m AssignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, issue_iid_in_)
+func (m AssignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
@@ -392,13 +466,15 @@ func (m AssignSelf_methods) Call(ctx context.Context, c *varlink.Connection, pro
 	return
 }
 
-func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (uint64, error), error) {
+func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.AssignSelf", in, flags)
 	if err != nil {
 		return nil, err
@@ -413,13 +489,15 @@ func (m AssignSelf_methods) Send(ctx context.Context, c *varlink.Connection, fla
 	}, nil
 }
 
-func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m AssignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.AssignSelf", in)
 	if err != nil {
 		return nil, err
@@ -438,8 +516,8 @@ type UnassignSelf_methods struct{}
 
 func UnassignSelf() UnassignSelf_methods { return UnassignSelf_methods{} }
 
-func (m UnassignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (err_ error) {
-	receive, err_ := m.Send(ctx, c, 0, project_id_in_, issue_iid_in_)
+func (m UnassignSelf_methods) Call(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (err_ error) {
+	receive, err_ := m.Send(ctx, c, 0, project_id_in_, iid_in_, kind_in_)
 	if err_ != nil {
 		return
 	}
@@ -447,13 +525,15 @@ func (m UnassignSelf_methods) Call(ctx context.Context, c *varlink.Connection, p
 	return
 }
 
-func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (uint64, error), error) {
+func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, flags uint64, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (uint64, error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	receive, err := c.Send(ctx, "org.thehoster.gitlab.trackrd.UnassignSelf", in, flags)
 	if err != nil {
 		return nil, err
@@ -468,13 +548,15 @@ func (m UnassignSelf_methods) Send(ctx context.Context, c *varlink.Connection, f
 	}, nil
 }
 
-func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, issue_iid_in_ int64) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
+func (m UnassignSelf_methods) Upgrade(ctx context.Context, c *varlink.Connection, project_id_in_ int64, iid_in_ int64, kind_in_ IssuableKind) (func(ctx context.Context) (flags uint64, conn varlink.ReadWriterContext, err_ error), error) {
 	var in struct {
-		Project_id int64 `json:"project_id"`
-		Issue_iid  int64 `json:"issue_iid"`
+		Project_id int64        `json:"project_id"`
+		Iid        int64        `json:"iid"`
+		Kind       IssuableKind `json:"kind"`
 	}
 	in.Project_id = project_id_in_
-	in.Issue_iid = issue_iid_in_
+	in.Iid = iid_in_
+	in.Kind = kind_in_
 	receive, err := c.Upgrade(ctx, "org.thehoster.gitlab.trackrd.UnassignSelf", in)
 	if err != nil {
 		return nil, err
@@ -952,11 +1034,12 @@ func (m WhoAmI_methods) Upgrade(ctx context.Context, c *varlink.Connection) (fun
 
 type orgthehostergitlabtrackrdInterface interface {
 	GetAssignedIssues(ctx context.Context, c VarlinkCall, groups_ *[]string) error
+	GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error
 	Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error
-	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64, duration_ string, summary_ *string) error
-	CloseIssue(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error
-	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error
-	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error
+	PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error
+	Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
+	AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
+	UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error
 	ClearCache(ctx context.Context, c VarlinkCall, scope_ *[]string) error
 	GetHistory(ctx context.Context, c VarlinkCall, days_ *int64) error
 	GetFailures(ctx context.Context, c VarlinkCall) error
@@ -997,6 +1080,14 @@ func (c *VarlinkCall) ReplyGetAssignedIssues(ctx context.Context, issues_ []Issu
 	return c.Reply(ctx, &out)
 }
 
+func (c *VarlinkCall) ReplyGetAssignedMergeRequests(ctx context.Context, merge_requests_ []MergeRequest) error {
+	var out struct {
+		Merge_requests []MergeRequest `json:"merge_requests"`
+	}
+	out.Merge_requests = []MergeRequest(merge_requests_)
+	return c.Reply(ctx, &out)
+}
+
 func (c *VarlinkCall) ReplySearch(ctx context.Context, issues_ []Issue, merge_requests_ []MergeRequest, projects_ []Project, groups_ []Group) error {
 	var out struct {
 		Issues         []Issue        `json:"issues"`
@@ -1015,7 +1106,7 @@ func (c *VarlinkCall) ReplyPostTime(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
-func (c *VarlinkCall) ReplyCloseIssue(ctx context.Context) error {
+func (c *VarlinkCall) ReplyClose(ctx context.Context) error {
 	return c.Reply(ctx, nil)
 }
 
@@ -1083,23 +1174,27 @@ func (s *VarlinkInterface) GetAssignedIssues(ctx context.Context, c VarlinkCall,
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.GetAssignedIssues")
 }
 
+func (s *VarlinkInterface) GetAssignedMergeRequests(ctx context.Context, c VarlinkCall, groups_ *[]string) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.GetAssignedMergeRequests")
+}
+
 func (s *VarlinkInterface) Search(ctx context.Context, c VarlinkCall, query_ string, kinds_ *[]string, limit_ *int64) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.Search")
 }
 
-func (s *VarlinkInterface) PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64, duration_ string, summary_ *string) error {
+func (s *VarlinkInterface) PostTime(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind, duration_ string, summary_ *string) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.PostTime")
 }
 
-func (s *VarlinkInterface) CloseIssue(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error {
-	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.CloseIssue")
+func (s *VarlinkInterface) Close(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
+	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.Close")
 }
 
-func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error {
+func (s *VarlinkInterface) AssignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.AssignSelf")
 }
 
-func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, issue_iid_ int64) error {
+func (s *VarlinkInterface) UnassignSelf(ctx context.Context, c VarlinkCall, project_id_ int64, iid_ int64, kind_ IssuableKind) error {
 	return c.ReplyMethodNotImplemented(ctx, "org.thehoster.gitlab.trackrd.UnassignSelf")
 }
 
@@ -1153,6 +1248,16 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 		}
 		return s.orgthehostergitlabtrackrdInterface.GetAssignedIssues(ctx, VarlinkCall{call}, in.Groups)
 
+	case "GetAssignedMergeRequests":
+		var in struct {
+			Groups *[]string `json:"groups,omitempty"`
+		}
+		err := call.GetParameters(&in)
+		if err != nil {
+			return call.ReplyInvalidParameter(ctx, "parameters")
+		}
+		return s.orgthehostergitlabtrackrdInterface.GetAssignedMergeRequests(ctx, VarlinkCall{call}, in.Groups)
+
 	case "Search":
 		var in struct {
 			Query string    `json:"query"`
@@ -1167,49 +1272,53 @@ func (s *VarlinkInterface) VarlinkDispatch(ctx context.Context, call varlink.Cal
 
 	case "PostTime":
 		var in struct {
-			Project_id int64   `json:"project_id"`
-			Issue_iid  int64   `json:"issue_iid"`
-			Duration   string  `json:"duration"`
-			Summary    *string `json:"summary,omitempty"`
+			Project_id int64        `json:"project_id"`
+			Iid        int64        `json:"iid"`
+			Kind       IssuableKind `json:"kind"`
+			Duration   string       `json:"duration"`
+			Summary    *string      `json:"summary,omitempty"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehostergitlabtrackrdInterface.PostTime(ctx, VarlinkCall{call}, in.Project_id, in.Issue_iid, in.Duration, in.Summary)
+		return s.orgthehostergitlabtrackrdInterface.PostTime(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind, in.Duration, in.Summary)
 
-	case "CloseIssue":
+	case "Close":
 		var in struct {
-			Project_id int64 `json:"project_id"`
-			Issue_iid  int64 `json:"issue_iid"`
+			Project_id int64        `json:"project_id"`
+			Iid        int64        `json:"iid"`
+			Kind       IssuableKind `json:"kind"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehostergitlabtrackrdInterface.CloseIssue(ctx, VarlinkCall{call}, in.Project_id, in.Issue_iid)
+		return s.orgthehostergitlabtrackrdInterface.Close(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
 
 	case "AssignSelf":
 		var in struct {
-			Project_id int64 `json:"project_id"`
-			Issue_iid  int64 `json:"issue_iid"`
+			Project_id int64        `json:"project_id"`
+			Iid        int64        `json:"iid"`
+			Kind       IssuableKind `json:"kind"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehostergitlabtrackrdInterface.AssignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Issue_iid)
+		return s.orgthehostergitlabtrackrdInterface.AssignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
 
 	case "UnassignSelf":
 		var in struct {
-			Project_id int64 `json:"project_id"`
-			Issue_iid  int64 `json:"issue_iid"`
+			Project_id int64        `json:"project_id"`
+			Iid        int64        `json:"iid"`
+			Kind       IssuableKind `json:"kind"`
 		}
 		err := call.GetParameters(&in)
 		if err != nil {
 			return call.ReplyInvalidParameter(ctx, "parameters")
 		}
-		return s.orgthehostergitlabtrackrdInterface.UnassignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Issue_iid)
+		return s.orgthehostergitlabtrackrdInterface.UnassignSelf(ctx, VarlinkCall{call}, in.Project_id, in.Iid, in.Kind)
 
 	case "ClearCache":
 		var in struct {
@@ -1302,12 +1411,15 @@ type Issue (
   graph_status: string
 )
 
+type IssuableKind (issue, merge_request)
+
 type HistoryEvent (
   timestamp: int,
   source: string,
+  kind: IssuableKind,
   project_id: int,
-  issue_iid: int,
-  issue_title: string,
+  iid: int,
+  title: string,
   web_url: string,
   duration: string,
   summary: string
@@ -1316,8 +1428,9 @@ type HistoryEvent (
 type FailedTask (
   id: int,
   op: string,
+  kind: IssuableKind,
   project_id: int,
-  issue_iid: int,
+  iid: int,
   detail: string,
   error: string,
   queued_at: int,
@@ -1330,7 +1443,8 @@ type MergeRequest (
   project_id: int,
   title: string,
   web_url: string,
-  state: string
+  state: string,
+  assignees: []string
 )
 
 type Project (
@@ -1355,15 +1469,17 @@ error NotAuthenticated (reason: ?NotAuthReason, detail: ?string)
 
 method GetAssignedIssues(groups: ?[]string) -> (issues: []Issue)
 
+method GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)
+
 method Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)
 
-method PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()
+method PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()
 
-method CloseIssue(project_id: int, issue_iid: int) -> ()
+method Close(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method AssignSelf(project_id: int, issue_iid: int) -> ()
+method AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
-method UnassignSelf(project_id: int, issue_iid: int) -> ()
+method UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()
 
 method ClearCache(scope: ?[]string) -> ()
 

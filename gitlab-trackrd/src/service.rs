@@ -10,12 +10,13 @@ use varlink::Reply;
 use varlink::sansio::ServerEvent;
 
 use gitlab_trackr_api::{
-    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures,
-    Call_CloseIssue, Call_DismissFailure, Call_GetAssignedIssues, Call_GetFailures,
+    AssignSelf_Args, AsyncCall, Call_AssignSelf, Call_ClearCache, Call_ClearFailures, Call_Close,
+    Call_DismissFailure, Call_GetAssignedIssues, Call_GetAssignedMergeRequests, Call_GetFailures,
     Call_GetHistory, Call_Login, Call_Logout, Call_PostTime, Call_RetryFailure, Call_Search,
-    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, CloseIssue_Args, DismissFailure_Args,
-    GetAssignedIssues_Args, GetHistory_Args, Login_Args, PostTime_Args, RetryFailure_Args,
-    Search_Args, UnassignSelf_Args, VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
+    Call_UnassignSelf, Call_WhoAmI, ClearCache_Args, Close_Args, DismissFailure_Args,
+    GetAssignedIssues_Args, GetAssignedMergeRequests_Args, GetHistory_Args, Login_Args,
+    PostTime_Args, RetryFailure_Args, Search_Args, UnassignSelf_Args,
+    VARLINK_INTERFACE_DESCRIPTION, VarlinkInterface as _,
 };
 
 use crate::handlers::Handlers;
@@ -222,6 +223,27 @@ async fn handle_trackrd(
                 .get_assigned_issues(&mut call as &mut dyn Call_GetAssignedIssues, args.groups)
                 .await?;
         }
+        "org.thehoster.gitlab.trackrd.GetAssignedMergeRequests" => {
+            // Same defaulting pattern as `GetAssignedIssues`: every field is
+            // optional, so a missing `parameters` block is a valid call.
+            let args: GetAssignedMergeRequests_Args = match params {
+                Some(v) => serde_json::from_value(v).map_err(|e| {
+                    varlink::Error(
+                        varlink::ErrorKind::InvalidParameter(e.to_string()),
+                        None,
+                        None,
+                    )
+                })?,
+                None => GetAssignedMergeRequests_Args { groups: None },
+            };
+
+            handlers
+                .get_assigned_merge_requests(
+                    &mut call as &mut dyn Call_GetAssignedMergeRequests,
+                    args.groups,
+                )
+                .await?;
+        }
         "org.thehoster.gitlab.trackrd.Search" => {
             // `query` is required, so a missing `parameters` block is an error
             // (the `PostTime` pattern, not the defaulting one).
@@ -265,20 +287,21 @@ async fn handle_trackrd(
                 .post_time(
                     &mut call as &mut dyn Call_PostTime,
                     args.project_id,
-                    args.issue_iid,
+                    args.iid,
+                    args.kind,
                     args.duration,
                     args.summary,
                 )
                 .await?;
         }
-        "org.thehoster.gitlab.trackrd.CloseIssue" => {
+        "org.thehoster.gitlab.trackrd.Close" => {
             let Some(args_val) = params else {
                 return Ok(Some(Reply::error(
                     "org.varlink.service.InvalidParameter",
                     Some(serde_json::json!({"parameter": "parameters"})),
                 )));
             };
-            let args: CloseIssue_Args = serde_json::from_value(args_val).map_err(|e| {
+            let args: Close_Args = serde_json::from_value(args_val).map_err(|e| {
                 varlink::Error(
                     varlink::ErrorKind::InvalidParameter(e.to_string()),
                     None,
@@ -286,10 +309,11 @@ async fn handle_trackrd(
                 )
             })?;
             handlers
-                .close_issue(
-                    &mut call as &mut dyn Call_CloseIssue,
+                .close(
+                    &mut call as &mut dyn Call_Close,
                     args.project_id,
-                    args.issue_iid,
+                    args.iid,
+                    args.kind,
                 )
                 .await?;
         }
@@ -311,7 +335,8 @@ async fn handle_trackrd(
                 .assign_self(
                     &mut call as &mut dyn Call_AssignSelf,
                     args.project_id,
-                    args.issue_iid,
+                    args.iid,
+                    args.kind,
                 )
                 .await?;
         }
@@ -333,7 +358,8 @@ async fn handle_trackrd(
                 .unassign_self(
                     &mut call as &mut dyn Call_UnassignSelf,
                     args.project_id,
-                    args.issue_iid,
+                    args.iid,
+                    args.kind,
                 )
                 .await?;
         }

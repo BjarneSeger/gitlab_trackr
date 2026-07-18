@@ -32,6 +32,10 @@ pub struct State {
 pub struct LastIssue {
     pub project_id: i64,
     pub issue_iid: i64,
+    /// What the iid refers to. `serde(default)` (= issue) keeps state files
+    /// written before MR support readable.
+    #[serde(default)]
+    pub kind: crate::refspec::RefKind,
 }
 
 impl State {
@@ -132,6 +136,18 @@ mod tests {
         assert_eq!(format_duration(29 * 60), "29m");
         assert_eq!(format_duration(3600), "1h");
         assert_eq!(format_duration(4500), "1h15m");
+    }
+
+    #[test]
+    fn last_issue_written_before_mr_support_still_parses() {
+        // Pre-MR state files carry no `kind`; it must default to Issue.
+        let st: State = serde_json::from_str(
+            r#"{"last_prompt":1,"last_issue":{"project_id":7,"issue_iid":42}}"#,
+        )
+        .unwrap();
+        let last = st.last_issue.unwrap();
+        assert_eq!(last.kind, crate::refspec::RefKind::Issue);
+        assert_eq!(last.issue_iid, 42);
     }
 
     /// Split a `"1h15m"`-style rendering back into (hours, minutes).

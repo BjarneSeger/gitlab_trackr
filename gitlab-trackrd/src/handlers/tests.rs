@@ -10,15 +10,15 @@ use std::time::Duration;
 use tokio::sync::{Notify, RwLock};
 
 use gitlab_trackr_api::{
-    Call_ClearCache, Call_CloseIssue, Call_GetAssignedIssues, Call_PostTime, Issue,
-    VarlinkInterface,
+    Call_ClearCache, Call_Close, Call_GetAssignedIssues, Call_GetAssignedMergeRequests,
+    Call_GetHistory, Call_PostTime, Call_UnassignSelf, IssuableKind, Issue, VarlinkInterface,
 };
 
 use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::config::SharedConfig;
 use crate::error::{DormancyReason, Result as TrackrResult};
-use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
 use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
@@ -48,15 +48,17 @@ fn enrich_timelog_matches_by_web_url() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: "fresh".to_string(),
         web_url: "https://gl/-/issues/42".to_string(),
         duration: "1h".to_string(),
         summary: "s".to_string(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 7);
-    assert_eq!(r.issue_title, "fresh", "fresh title preserved");
+    assert_eq!(r.title, "fresh", "fresh title preserved");
     assert_eq!(r.web_url, "https://gl/-/issues/42");
 }
 
@@ -69,13 +71,15 @@ fn enrich_timelog_falls_back_to_iid_when_url_misses() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: "fresh".to_string(),
         web_url: String::new(),
         duration: "1h".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 7);
     assert_eq!(
         r.web_url, "https://gl/-/issues/42",
@@ -91,15 +95,17 @@ fn enrich_timelog_no_match_leaves_project_id_zero() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 99,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 99,
+        title: "fresh".to_string(),
         web_url: "https://gl/-/issues/99".to_string(),
         duration: "30m".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 0);
-    assert_eq!(r.issue_title, "fresh");
+    assert_eq!(r.title, "fresh");
     assert_eq!(r.web_url, "https://gl/-/issues/99");
 }
 
@@ -112,14 +118,54 @@ fn enrich_timelog_empty_title_filled_from_cache() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: String::new(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: String::new(),
         web_url: "https://gl/-/issues/42".to_string(),
         duration: "1h".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
-    assert_eq!(r.issue_title, "From cache");
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
+    assert_eq!(r.title, "From cache");
+}
+
+#[test]
+fn enrich_timelog_mr_falls_back_to_search_corpus() {
+    let m = search_mr(3, "MR title"); // project_id 1, web_url …/merge_requests/30
+    let mr_by_url = HashMap::from([(m.web_url.as_str(), &m)]);
+
+    let t = FetchedTimelog {
+        timelog_id: 1,
+        spent_at_secs: 100,
+        kind: Issuable::MergeRequest,
+        project_id: 0, // GraphQL gave no project → fall back to the corpus
+        iid: 30,
+        title: String::new(),
+        web_url: m.web_url.clone(),
+        duration: "1h".to_string(),
+        summary: String::new(),
+    };
+    let r = enrich_timelog(t, &HashMap::new(), &HashMap::new(), &mr_by_url);
+    assert_eq!(r.kind, Issuable::MergeRequest);
+    assert_eq!(r.project_id, 1, "project filled from the search corpus");
+    assert_eq!(r.title, "MR title", "empty title filled from the corpus");
+
+    // GraphQL-provided project id always wins.
+    let t = FetchedTimelog {
+        timelog_id: 2,
+        spent_at_secs: 100,
+        kind: Issuable::MergeRequest,
+        project_id: 9,
+        iid: 30,
+        title: "fresh".to_string(),
+        web_url: "https://gl/unknown".to_string(),
+        duration: "1h".to_string(),
+        summary: String::new(),
+    };
+    let r = enrich_timelog(t, &HashMap::new(), &HashMap::new(), &mr_by_url);
+    assert_eq!(r.project_id, 9);
+    assert_eq!(r.title, "fresh");
 }
 
 // ── enrich_graph_status with FakeGitlab ────────────────────────────────
@@ -250,8 +296,9 @@ impl GitlabApi for FakeGitlab {
     }
     async fn add_spent_time(
         &self,
+        _kind: Issuable,
         _project_id: i64,
-        _issue_iid: i64,
+        _iid: i64,
         _duration: &str,
         _summary: Option<&str>,
     ) -> TrackrResult<()> {
@@ -259,7 +306,8 @@ impl GitlabApi for FakeGitlab {
     }
     async fn create_timelog(
         &self,
-        _issue_id: i64,
+        _kind: Issuable,
+        _issuable_id: i64,
         _duration: &str,
         _summary: &str,
         _spent_at: chrono::DateTime<chrono::Utc>,
@@ -279,13 +327,18 @@ impl GitlabApi for FakeGitlab {
             None => self.fetch_result(),
         }
     }
-    async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn close(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
         unimplemented!()
     }
-    async fn assign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn assign_self(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
         unimplemented!()
     }
-    async fn unassign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn unassign_self(
+        &self,
+        _kind: Issuable,
+        _project_id: i64,
+        _iid: i64,
+    ) -> TrackrResult<()> {
         unimplemented!()
     }
     async fn fetch_board_list_labels(&self, project_id: i64) -> TrackrResult<Vec<String>> {
@@ -519,9 +572,10 @@ fn stored(timelog_id: u64, spent_at_secs: u64) -> StoredTimelog {
     StoredTimelog {
         timelog_id,
         spent_at_secs,
+        kind: Issuable::Issue,
         project_id: 1,
-        issue_iid: 1,
-        issue_title: "t".into(),
+        iid: 1,
+        title: "t".into(),
         web_url: "u".into(),
         duration: "1h".into(),
         summary: String::new(),
@@ -593,11 +647,11 @@ fn looks_like_duration_accepts_valid_and_rejects_typos() {
 }
 
 #[tokio::test]
-async fn close_issue_rejects_bad_issue_ref() {
+async fn close_rejects_bad_issuable_ref() {
     use gitlab_trackr_api::AsyncCall;
     let (h, _dir) = dormant_handlers();
     let mut call = AsyncCall::default();
-    h.close_issue(&mut call as &mut dyn Call_CloseIssue, 0, 42)
+    h.close(&mut call as &mut dyn Call_Close, 0, 42, IssuableKind::issue)
         .await
         .unwrap();
 
@@ -651,6 +705,7 @@ async fn post_time_queues_through_an_unreachable_outage() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -679,6 +734,7 @@ async fn post_time_rejects_when_dormant_but_not_unreachable() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -710,6 +766,7 @@ async fn post_time_transient_queues_without_demoting() {
         &mut call as &mut dyn Call_PostTime,
         7,
         42,
+        IssuableKind::issue,
         "30m".to_string(),
         None,
     )
@@ -846,7 +903,7 @@ async fn get_assigned_issues_empty_cache_dormant_is_not_authenticated() {
 // ── search sync engine ─────────────────────────────────────────────────
 
 use crate::config::SearchPopulation;
-use crate::search::SyncStamps;
+use crate::search::{SEARCH_SCHEMA_VERSION, SyncStamps};
 
 fn search_issue(id: i64, title: &str) -> SearchIssue {
     SearchIssue {
@@ -872,6 +929,7 @@ fn search_mr(id: i64, title: &str) -> SearchMr {
         web_url: format!("https://gl/team/api/-/merge_requests/{}", id * 10),
         state: "opened".to_string(),
         labels: vec![],
+        assignees: vec![],
         updated_at_secs: 100,
     }
 }
@@ -934,6 +992,7 @@ async fn search_sync_throttled_while_stamps_fresh() {
         .set_stamps(&SyncStamps {
             last_partial_sync_secs: now,
             last_full_sync_secs: now,
+            schema_version: SEARCH_SCHEMA_VERSION,
             ..Default::default()
         })
         .unwrap();
@@ -1009,6 +1068,7 @@ async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
     let stamps = SyncStamps {
         last_partial_sync_secs: now - 10_000,
         last_full_sync_secs: now - 100,
+        schema_version: SEARCH_SCHEMA_VERSION,
         ..Default::default()
     };
     {
@@ -1437,6 +1497,374 @@ async fn search_sync_auto_does_not_degrade_on_transient_global_failure() {
     );
 }
 
+// ── GetAssignedMergeRequests ────────────────────────────────────────────
+
+/// Seed the search corpus with MRs and stamps as one completed sync (user 1,
+/// current schema) would have left them. The assigned-MR view is cold until
+/// both rows AND stamps exist — zero stamps read as never-synced.
+fn seed_assigned_mrs(h: &Handlers) {
+    let g = h.search.try_begin_sync().unwrap();
+    let mut mine = search_mr(1, "mine"); // project 1, iid 10
+    mine.assignees = vec![crate::search::MrAssignee {
+        id: 1,
+        username: "me".into(),
+    }];
+    let mut mine_closed = search_mr(2, "mine but closed"); // iid 20
+    mine_closed.assignees = vec![crate::search::MrAssignee {
+        id: 1,
+        username: "me".into(),
+    }];
+    mine_closed.state = "closed".into();
+    let mut someone_elses = search_mr(3, "someone else's"); // iid 30
+    someone_elses.assignees = vec![crate::search::MrAssignee {
+        id: 9,
+        username: "them".into(),
+    }];
+    g.upsert_mrs(&[mine, mine_closed, someone_elses]).unwrap();
+    g.set_stamps(&SyncStamps {
+        last_partial_sync_secs: 100,
+        last_full_sync_secs: 100,
+        degraded_to_member: false,
+        schema_version: SEARCH_SCHEMA_VERSION,
+        synced_user_id: 1,
+    })
+    .unwrap();
+}
+
+fn reply_mrs(call: &mut gitlab_trackr_api::AsyncCall) -> Vec<gitlab_trackr_api::MergeRequest> {
+    let reply = call.take_reply().expect("a reply");
+    assert!(
+        reply.error.is_none(),
+        "expected success, got {:?}",
+        reply.error
+    );
+    let params: gitlab_trackr_api::GetAssignedMergeRequests_Reply =
+        serde_json::from_value(reply.parameters.expect("parameters")).expect("parse reply");
+    params.merge_requests
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_serves_open_assigned_from_cache_while_dormant() {
+    use gitlab_trackr_api::AsyncCall;
+    // Dormant on purpose: the view is a pure cache read.
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let mrs = reply_mrs(&mut call);
+    assert_eq!(mrs.len(), 1, "assigned-to-me AND opened only");
+    assert_eq!(mrs[0].iid, 10);
+    assert_eq!(mrs[0].assignees, vec!["me".to_string()]);
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_cold_cache_dormant_is_not_authenticated() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "never-synced while dormant → honest auth error, not fake-empty"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_cold_cache_connected_is_empty() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = connected_handlers(FakeGitlab::default());
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    assert!(
+        reply_mrs(&mut call).is_empty(),
+        "connected + first sync pending → empty reply"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_stale_schema_reads_as_cold() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h);
+    // Downgrade the stamps to the pre-assignee schema: rows exist but their
+    // assignee data can't be trusted yet.
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: 100,
+            last_full_sync_secs: 100,
+            degraded_to_member: false,
+            schema_version: 0,
+            synced_user_id: 0,
+        })
+        .unwrap();
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "stale schema while dormant → cold-cache behavior"
+    );
+}
+
+#[tokio::test]
+async fn get_assigned_merge_requests_group_filter_matches_namespace() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+    seed_assigned_mrs(&h); // web_urls live under gl/team/api/-/…
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(
+        &mut call as &mut dyn Call_GetAssignedMergeRequests,
+        Some(vec!["team".into()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply_mrs(&mut call).len(), 1, "subgroup-inclusive match");
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(
+        &mut call as &mut dyn Call_GetAssignedMergeRequests,
+        Some(vec!["other".into()]),
+    )
+    .await
+    .unwrap();
+    assert!(reply_mrs(&mut call).is_empty(), "non-matching group filter");
+}
+
+// ── MR write reflection in the search cache ─────────────────────────────
+
+#[tokio::test]
+async fn close_mr_while_unreachable_queues_and_updates_search_row() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+    seed_grouped_cache(&h); // issue cache must stay untouched by an MR close
+
+    let mut call = AsyncCall::default();
+    h.close(
+        &mut call as &mut dyn Call_Close,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert!(reply.error.is_none(), "unreachable → queued, success reply");
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert_eq!(row.state, "closed", "cached MR state flipped immediately");
+    assert_eq!(
+        h.cache.get().unwrap().unwrap().len(),
+        3,
+        "issue cache untouched by an MR close"
+    );
+}
+
+#[tokio::test]
+async fn unassign_mr_removes_synced_user_from_cached_assignees() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.unassign_self(
+        &mut call as &mut dyn Call_UnassignSelf,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert!(
+        row.assignees.is_empty(),
+        "synced user removed from the cached row"
+    );
+}
+
+#[tokio::test]
+async fn mr_cache_update_skips_when_sync_gate_is_held() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    // Simulate an in-flight sync: the write handler must not block on the
+    // gate — it skips the cache update and still replies success.
+    let _guard = h.search.try_begin_sync().unwrap();
+
+    let mut call = AsyncCall::default();
+    h.close(
+        &mut call as &mut dyn Call_Close,
+        1,
+        10,
+        IssuableKind::merge_request,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let row = h
+        .search
+        .all_mrs()
+        .unwrap()
+        .into_iter()
+        .find(|m| m.iid == 10)
+        .unwrap();
+    assert_eq!(
+        row.state, "opened",
+        "gate contended → cache update skipped, sync reconciles later"
+    );
+}
+
+#[tokio::test]
+async fn post_time_on_mr_defers_with_the_global_mr_id() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        1,
+        10,
+        IssuableKind::merge_request,
+        "30m".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(call.take_reply().unwrap().error.is_none());
+
+    let pending = h.queue.pending_post_time().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, crate::gitlab::Issuable::MergeRequest);
+}
+
+#[tokio::test]
+async fn get_history_joins_queued_mr_titles_from_search_corpus() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = handlers_with(ConnState::Dormant(DormancyReason::Unreachable {
+        host: "gitlab.example.com".into(),
+        detail: "connection refused".into(),
+    }));
+    seed_assigned_mrs(&h);
+
+    let mut call = AsyncCall::default();
+    h.post_time(
+        &mut call as &mut dyn Call_PostTime,
+        1,
+        10,
+        IssuableKind::merge_request,
+        "30m".to_string(),
+        None,
+    )
+    .await
+    .unwrap();
+    call.take_reply();
+
+    let mut call = AsyncCall::default();
+    h.get_history(&mut call as &mut dyn Call_GetHistory, None)
+        .await
+        .unwrap();
+    let reply = call.take_reply().expect("a reply");
+    assert!(reply.error.is_none());
+    let params: gitlab_trackr_api::GetHistory_Reply =
+        serde_json::from_value(reply.parameters.expect("parameters")).unwrap();
+    assert_eq!(params.events.len(), 1);
+    let e = &params.events[0];
+    assert_eq!(e.kind, IssuableKind::merge_request);
+    assert_eq!(e.iid, 10);
+    assert_eq!(e.title, "mine", "queued MR title joined from search corpus");
+    assert_eq!(e.source, "queued");
+}
+
+#[tokio::test]
+async fn search_sync_stale_schema_version_forces_full_resync() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // Perfectly fresh stamps, but written under entry-schema version 0 (rows
+    // predate assignee capture). Without the version check this sync would be
+    // throttled outright.
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 1,
+            last_full_sync_secs: now - 1,
+            degraded_to_member: false,
+            schema_version: 0,
+            synced_user_id: 0,
+        })
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    let calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(
+        calls.as_slice(),
+        &[(None, None)],
+        "stale schema → treated as never synced → one full global fetch"
+    );
+    drop(calls);
+
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(stamps.schema_version, SEARCH_SCHEMA_VERSION);
+    assert_eq!(
+        stamps.synced_user_id, 1,
+        "session user id persisted for the assigned-MR filter"
+    );
+}
+
 #[tokio::test]
 async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() {
     let fake = Arc::new(canned_search_fake());
@@ -1450,6 +1878,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: now - 100,
             degraded_to_member: true,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
         })
         .unwrap();
 
@@ -1476,6 +1906,8 @@ async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() 
             last_partial_sync_secs: now - 10_000,
             last_full_sync_secs: 1,
             degraded_to_member: true,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
         })
         .unwrap();
     fake.search_issue_calls.lock().unwrap().clear();
@@ -1708,6 +2140,7 @@ proptest! {
                 &mut call as &mut dyn Call_PostTime,
                 project_id,
                 issue_iid,
+                IssuableKind::issue,
                 duration.clone(),
                 None,
             )
@@ -1750,8 +2183,10 @@ fn canned_refresh_fake() -> FakeGitlab {
         timelog_id: 1,
         // Recent, so the prune following the slow-tier refreshes keeps it.
         spent_at_secs: now_secs(),
-        issue_iid: 1,
-        issue_title: "t".into(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 1,
+        title: "t".into(),
         web_url: "u".into(),
         duration: "1h".into(),
         summary: String::new(),
@@ -1856,12 +2291,39 @@ async fn backfill_skips_when_slow_stamp_fresh_and_retention_covered() {
         .update(|s| {
             s.last_slow_sync_secs = now_secs();
             s.backfilled_retention_hours = retention_hours;
+            s.schema_version = crate::refresh_meta::HISTORY_SCHEMA_VERSION;
         })
         .unwrap();
 
     h.backfill_history().await;
 
     assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn backfill_runs_when_history_schema_is_stale() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let retention_hours = h.config.read().unwrap().history.retention_hours;
+    // Slow stamp fresh and retention covered, but the stored-timelog schema
+    // predates kind support — one full-window re-backfill is due so old
+    // MR-as-issue junk rows get overwritten by timelog_id.
+    h.refresh_meta
+        .update(|s| {
+            s.last_slow_sync_secs = now_secs();
+            s.backfilled_retention_hours = retention_hours;
+            s.schema_version = 0;
+        })
+        .unwrap();
+
+    h.backfill_history().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.refresh_meta.stamps().unwrap().schema_version,
+        crate::refresh_meta::HISTORY_SCHEMA_VERSION,
+        "successful backfill stamps the current schema version"
+    );
 }
 
 #[tokio::test]

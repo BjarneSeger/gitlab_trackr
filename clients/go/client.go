@@ -24,6 +24,13 @@ const (
 	ReasonLoggedOut     NotAuthReason = "logged_out"
 )
 
+// IssuableKind values selecting what a write method targets, mirroring the
+// .varlink enum the same way the NotAuthReason constants do.
+const (
+	KindIssue        IssuableKind = "issue"
+	KindMergeRequest IssuableKind = "merge_request"
+)
+
 // DefaultAddress resolves the gitlab-trackrd varlink address using the same
 // precedence as tt-cli:
 //
@@ -76,6 +83,14 @@ func (c *Client) GetAssignedIssues(ctx context.Context, groups *[]string) ([]Iss
 	return GetAssignedIssues().Call(ctx, c.conn, groups)
 }
 
+// GetAssignedMergeRequests returns open merge requests assigned to the
+// authenticated user, optionally filtered to the given group paths (nil = all
+// groups). Served from the daemon's search corpus, so freshness follows the
+// search sync cadence.
+func (c *Client) GetAssignedMergeRequests(ctx context.Context, groups *[]string) ([]MergeRequest, error) {
+	return GetAssignedMergeRequests().Call(ctx, c.conn, groups)
+}
+
 // SearchResults groups the per-kind result sets of Search.
 type SearchResults struct {
 	Issues        []Issue
@@ -93,24 +108,27 @@ func (c *Client) Search(ctx context.Context, query string, kinds *[]string, limi
 	return SearchResults{issues, mrs, projects, groups}, err
 }
 
-// PostTime logs a time-tracking entry on an issue. summary is optional (nil to omit).
-func (c *Client) PostTime(ctx context.Context, projectID, issueIID int64, duration string, summary *string) error {
-	return PostTime().Call(ctx, c.conn, projectID, issueIID, duration, summary)
+// PostTime logs a time-tracking entry on an issue or merge request (per kind).
+// summary is optional (nil to omit).
+func (c *Client) PostTime(ctx context.Context, projectID, iid int64, kind IssuableKind, duration string, summary *string) error {
+	return PostTime().Call(ctx, c.conn, projectID, iid, kind, duration, summary)
 }
 
-// CloseIssue closes an issue.
-func (c *Client) CloseIssue(ctx context.Context, projectID, issueIID int64) error {
-	return CloseIssue().Call(ctx, c.conn, projectID, issueIID)
+// CloseIssuable closes an issue or merge request (per kind). Wraps the varlink
+// method `Close`; the Go name differs because Close is taken by the
+// connection-releasing io.Closer method above.
+func (c *Client) CloseIssuable(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
+	return Close().Call(ctx, c.conn, projectID, iid, kind)
 }
 
-// AssignSelf assigns the authenticated user to an issue.
-func (c *Client) AssignSelf(ctx context.Context, projectID, issueIID int64) error {
-	return AssignSelf().Call(ctx, c.conn, projectID, issueIID)
+// AssignSelf assigns the authenticated user to an issue or merge request.
+func (c *Client) AssignSelf(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
+	return AssignSelf().Call(ctx, c.conn, projectID, iid, kind)
 }
 
-// UnassignSelf removes the authenticated user from an issue's assignees.
-func (c *Client) UnassignSelf(ctx context.Context, projectID, issueIID int64) error {
-	return UnassignSelf().Call(ctx, c.conn, projectID, issueIID)
+// UnassignSelf removes the authenticated user from an issuable's assignees.
+func (c *Client) UnassignSelf(ctx context.Context, projectID, iid int64, kind IssuableKind) error {
+	return UnassignSelf().Call(ctx, c.conn, projectID, iid, kind)
 }
 
 // ClearCache clears the daemon's cache, optionally scoped to the given keys

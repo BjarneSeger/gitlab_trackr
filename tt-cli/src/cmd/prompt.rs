@@ -1,4 +1,4 @@
-//! `tt prompt` — interactive issue picker + time logger.
+//! `tt prompt` — interactive issue/MR picker + time logger.
 //!
 //! Shared by [`crate::cmd::tick`], which feeds in an elapsed-time-based
 //! duration suggestion.
@@ -11,23 +11,64 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
-use gitlab_trackr_api::{Issue, VarlinkClientInterface};
+use gitlab_trackr_api::{Issue, MergeRequest, VarlinkClientInterface};
 use inquire::{InquireError, Select, Text};
 
+use crate::refspec::{self, RefKind};
 use crate::{client, config, state};
 
-/// Newtype so we can render `Issue` in the `Select` list without touching the
-/// generated struct (which we don't own and which doesn't implement `Display`).
-struct IssueChoice(Issue);
+/// One pickable issuable, wrapping the generated structs (which we don't own
+/// and which don't implement `Display`) so `Select` can render them with the
+/// GitLab sigil: `#42` for issues, `!7` for MRs.
+enum Choice {
+    Issue(Issue),
+    Mr(MergeRequest),
+}
 
-impl fmt::Display for IssueChoice {
+impl Choice {
+    fn kind(&self) -> RefKind {
+        match self {
+            Choice::Issue(_) => RefKind::Issue,
+            Choice::Mr(_) => RefKind::Mr,
+        }
+    }
+
+    fn project_id(&self) -> i64 {
+        match self {
+            Choice::Issue(i) => i.project_id,
+            Choice::Mr(m) => m.project_id,
+        }
+    }
+
+    fn iid(&self) -> i64 {
+        match self {
+            Choice::Issue(i) => i.iid,
+            Choice::Mr(m) => m.iid,
+        }
+    }
+
+    fn title(&self) -> &str {
+        match self {
+            Choice::Issue(i) => &i.title,
+            Choice::Mr(m) => &m.title,
+        }
+    }
+}
+
+impl fmt::Display for Choice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "#{:<5} {}", self.0.iid, self.0.title)
+        write!(
+            f,
+            "{}{:<5} {}",
+            refspec::sigil(self.kind()),
+            self.iid(),
+            self.title()
+        )
     }
 }
 
 struct PromptAnswers {
-    issue: Issue,
+    picked: Choice,
     duration: String,
     summary: Option<String>,
 }
@@ -53,25 +94,37 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     let cfg = config::load()?;
     let socket = cfg.socket.clone().unwrap_or_else(client::default_socket);
     let client = client::connect(&socket).await?;
-    let reply = client
+    let issues = client
         .get_assigned_issues(None)
         .call()
         .await
-        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?;
+        .map_err(|e| crate::friendly::friendly("GetAssignedIssues", e))?
+        .issues;
+    let mrs = client
+        .get_assigned_merge_requests(None)
+        .call()
+        .await
+        .map_err(|e| crate::friendly::friendly("GetAssignedMergeRequests", e))?
+        .merge_requests;
 
-    if reply.issues.is_empty() {
-        println!("no assigned issues");
+    if issues.is_empty() && mrs.is_empty() {
+        println!("no assigned issues or merge requests");
         return Ok(false);
     }
 
-    let issues = reply.issues;
     let suggested = suggested_duration.unwrap_or(cfg.default_duration);
 
     // inquire's prompts are synchronous, blocking terminal I/O. Run them off
     // the async executor thread so the single-threaded runtime isn't blocked
     // for the (potentially long) duration of user input.
     let answers = tokio::task::spawn_blocking(move || -> Result<Option<PromptAnswers>> {
-        let choices: Vec<IssueChoice> = issues.into_iter().map(IssueChoice).collect();
+        // Issues first (the primary tracking objects), MRs after — the daemon
+        // pre-sorts MRs newest-updated first.
+        let choices: Vec<Choice> = issues
+            .into_iter()
+            .map(Choice::Issue)
+            .chain(mrs.into_iter().map(Choice::Mr))
+            .collect();
 
         let picked = match Select::new("What are you working on?", choices).prompt() {
             Ok(p) => p,
@@ -102,7 +155,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         };
 
         Ok(Some(PromptAnswers {
-            issue: picked.0,
+            picked,
             duration,
             summary,
         }))
@@ -110,7 +163,7 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
     .await??;
 
     let Some(PromptAnswers {
-        issue,
+        picked,
         duration,
         summary,
     }) = answers
@@ -118,19 +171,32 @@ pub async fn run_with_default_duration(suggested_duration: Option<String>) -> Re
         return Ok(false);
     };
 
+    let kind = picked.kind();
     client
-        .post_time(issue.project_id, issue.iid, duration.clone(), summary)
+        .post_time(
+            picked.project_id(),
+            picked.iid(),
+            refspec::wire(kind),
+            duration.clone(),
+            summary,
+        )
         .call()
         .await
         .map_err(|e| crate::friendly::friendly("PostTime", e))?;
 
     let mut st = state::load().unwrap_or_default();
     st.last_issue = Some(state::LastIssue {
-        project_id: issue.project_id,
-        issue_iid: issue.iid,
+        project_id: picked.project_id(),
+        issue_iid: picked.iid(),
+        kind,
     });
     state::save(&st).context("saving state")?;
 
-    println!("logged {duration} on !{} ({})", issue.iid, issue.title);
+    println!(
+        "logged {duration} on {}{} ({})",
+        refspec::sigil(kind),
+        picked.iid(),
+        picked.title()
+    );
     Ok(true)
 }

@@ -21,7 +21,7 @@ anyhow = "1.0"
 
 # External APIs
 gitlab = "0.1900"
-gitlab-trackr-api = { path = "./gitlab-trackr-api", version = "0.11.0" }
+gitlab-trackr-api = { path = "./gitlab-trackr-api", version = "0.12.0" }
 varlink = { version = "13.0", features = ["tokio"] }
 varlink_generator = "13.0"
 dirs = "6"

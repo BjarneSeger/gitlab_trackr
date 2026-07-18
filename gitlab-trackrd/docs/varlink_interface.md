@@ -36,39 +36,54 @@ type Issue (
 ```
 
 ```varlink
+type IssuableKind (issue, merge_request)
+```
+
+The two things time can be tracked on. Every method and type that addresses an
+issue or a merge request carries an `IssuableKind` next to the `(project_id, iid)`
+pair; the iid is the per-project number the UI shows (`#42` for issues, `!7` for
+MRs).
+
+```varlink
 type HistoryEvent (
-  timestamp:   int,    # unix seconds — spent_at for synced entries, enqueue time for queued ones
-  source:      string, # "gitlab" (synced timelog) | "queued" (pending PostTime in the retry queue)
-  project_id:  int,
-  issue_iid:   int,
-  issue_title: string, # empty on queued events whose issue is not in the cache
-  web_url:     string,
-  duration:    string,
-  summary:     string
+  timestamp:  int,          # unix seconds — spent_at for synced entries, enqueue time for queued ones
+  source:     string,       # "gitlab" (synced timelog) | "queued" (pending PostTime in the retry queue)
+  kind:       IssuableKind, # what the time was logged on
+  project_id: int,
+  iid:        int,
+  title:      string,       # empty on queued events whose issuable is not in the caches
+  web_url:    string,
+  duration:   string,
+  summary:    string
 )
 ```
 
 ```varlink
 type FailedTask (
-  id:         int,    # handle for RetryFailure / DismissFailure
-  op:         string, # which write failed (e.g. "PostTime", "CloseIssue")
+  id:         int,          # handle for RetryFailure / DismissFailure
+  op:         string,       # which write failed ("PostTime", "Close", "AssignSelf", "UnassignSelf")
+  kind:       IssuableKind,
   project_id: int,
-  issue_iid:  int,
-  detail:     string, # operation-specific summary (e.g. the duration)
-  error:      string, # the GitLab error that dead-lettered it
-  queued_at:  int,    # unix seconds
-  failed_at:  int     # unix seconds
+  iid:        int,
+  detail:     string,       # operation-specific summary (e.g. the duration)
+  error:      string,       # the GitLab error that dead-lettered it
+  queued_at:  int,          # unix seconds
+  failed_at:  int           # unix seconds
 )
 ```
 
+Tasks dead-lettered by a daemon predating MR support render with the current `op`
+names (a close reads `"Close"`, never `"CloseIssue"`) and `kind` `issue`.
+
 ```varlink
 type MergeRequest (
-  id:         int,    # global MR ID (unique across the GitLab instance)
-  iid:        int,    # per-project MR number (the "!7" shown in the UI)
+  id:         int,      # global MR ID (unique across the GitLab instance)
+  iid:        int,      # per-project MR number (the "!7" shown in the UI)
   project_id: int,
   title:      string,
   web_url:    string,
-  state:      string  # "opened" | "closed" | "merged" | "locked"
+  state:      string,   # "opened" | "closed" | "merged" | "locked"
+  assignees:  []string  # assignee usernames, captured at the last search sync
 )
 ```
 
@@ -129,6 +144,18 @@ issues appearing under several requested groups are deduplicated. Omitted or emp
 `groups` returns everything. When the cache has never been populated: replies with an
 empty list if a session exists (first sync pending), `NotAuthenticated` otherwise.
 
+### `GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)`
+
+Open merge requests assigned to the authenticated user, served purely from the
+search corpus (no separate MR cache): the sync captures each MR's assignees plus
+the syncing user's id, and this filters on both — so it works while dormant, and
+freshness follows the **search** cadence (delta every `search.partial_interval_secs`,
+default 30 min), not the issue quick tier. `groups` filters by namespace exactly
+like `GetAssignedIssues`. Replies newest-updated first. When the corpus has never
+been synced (or was synced by a daemon predating assignee capture): empty list if a
+session exists, `NotAuthenticated` otherwise. `ClearCache` scope `search` clears
+and refills this view.
+
 ### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
 Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
@@ -159,8 +186,9 @@ synced: replies with empty arrays if a session exists (first sync pending),
 Time-tracking events from the last `days` days (default 7). Merges two sources,
 distinguished by `source`: `"gitlab"` — timelogs synced from GitLab; `"queued"` —
 `PostTime` operations still waiting in the retry queue (so freshly logged time shows
-up even while GitLab is unreachable). Served from local state; never errors on cache
-trouble (degrades to whatever is readable).
+up even while GitLab is unreachable). Events carry the issuable `kind` — time logged
+on merge requests appears here like issue time. Served from local state; never
+errors on cache trouble (degrades to whatever is readable).
 
 ### `WhoAmI() -> (host: string, user_id: int)`
 
@@ -169,32 +197,36 @@ without a round-trip. `NotAuthenticated` when dormant.
 
 ## Writing (queued when GitLab is away)
 
-All four validate the issue reference eagerly (`project_id`/`issue_iid` must be
-positive) and reply `GitlabError` on a malformed one without attempting or queuing
-anything. On an unreachable session or a transient network failure the operation is
-queued for retry and the call **replies success**; a GitLab rejection replies
-`GitlabError`. Other dormancy reasons reply `NotAuthenticated`.
+All four take the target as `(project_id, iid, kind)` — `kind` selects issue vs
+merge request; the same operation works on both. They validate the reference
+eagerly (`project_id`/`iid` must be positive) and reply `GitlabError` on a
+malformed one without attempting or queuing anything. On an unreachable session or
+a transient network failure the operation is queued for retry and the call
+**replies success**; a GitLab rejection replies `GitlabError`. Other dormancy
+reasons reply `NotAuthenticated`.
 
-### `PostTime(project_id: int, issue_iid: int, duration: string, summary: ?string) -> ()`
+### `PostTime(project_id: int, iid: int, kind: IssuableKind, duration: string, summary: ?string) -> ()`
 
-Records spent time. `duration` uses GitLab's time-tracking syntax (`"1h30m"`, `"45m"`,
-`"2d"`); an obviously malformed duration is rejected up front. `summary` becomes the
-timelog note.
+Records spent time on the issuable. `duration` uses GitLab's time-tracking syntax
+(`"1h30m"`, `"45m"`, `"2d"`); an obviously malformed duration is rejected up front.
+`summary` becomes the timelog note.
 
-### `CloseIssue(project_id: int, issue_iid: int) -> ()`
+### `Close(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
-Closes the issue and immediately drops it from the assigned-issues cache so list reads
-reflect the close before the next sync.
+Closes the issuable. Immediately reflected in the caches: an issue is dropped from
+the assigned-issues cache, an MR's cached state flips to `closed`, so list reads
+show the close before the next sync.
 
-### `AssignSelf(project_id: int, issue_iid: int) -> ()`
+### `AssignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
-Assigns the authenticated user to the issue. The issue appears in
-`GetAssignedIssues` after the next sync.
+Assigns the authenticated user to the issuable. It appears in the assigned views
+after the next sync of the respective cache.
 
-### `UnassignSelf(project_id: int, issue_iid: int) -> ()`
+### `UnassignSelf(project_id: int, iid: int, kind: IssuableKind) -> ()`
 
-Removes the authenticated user from the issue's assignees and immediately drops it
-from the assigned-issues cache.
+Removes the authenticated user from the issuable's assignees. Immediately
+reflected in the caches: an issue is dropped from the assigned-issues cache, the
+user is removed from the MR's cached assignee list.
 
 ## Retry-queue failures (dead letters)
 
@@ -229,7 +261,7 @@ each scope string selects a slice:
 | scope    | clears                                              | re-fetches            |
 |----------|-----------------------------------------------------|-----------------------|
 | `issues` | assigned-issues and board caches                    | (next quick refresh)  |
-| `search` | search corpus (issues, MRs, projects, groups) and its sync stamps | full search resync |
+| `search` | search corpus (issues, MRs, projects, groups — incl. the assigned-MR view) and its sync stamps | full search resync |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) | that window |
 | `slow`   | history between the quick and slow windows          | the slow window       |
 | `stale`  | history older than the slow window                  | the full retention window, then prunes |
@@ -261,7 +293,11 @@ varlinkctl call $SOCKET org.thehoster.gitlab.trackrd.GetAssignedIssues '{}'
 
 # post 1h30m to project 42, issue #7
 varlinkctl call $SOCKET org.thehoster.gitlab.trackrd.PostTime \
-  '{"project_id": 42, "issue_iid": 7, "duration": "1h30m", "summary": "code review"}'
+  '{"project_id": 42, "iid": 7, "kind": "issue", "duration": "1h30m", "summary": "code review"}'
+
+# close merge request !3 in project 42
+varlinkctl call $SOCKET org.thehoster.gitlab.trackrd.Close \
+  '{"project_id": 42, "iid": 3, "kind": "merge_request"}'
 
 # introspect the live interface
 varlinkctl introspect $SOCKET org.thehoster.gitlab.trackrd

@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 use crate::config::SearchPopulation;
 use crate::error::Error;
 use crate::gitlab::GitlabApi;
-use crate::search::{SyncGuard, SyncStamps};
+use crate::search::{SEARCH_SCHEMA_VERSION, SyncGuard, SyncStamps};
 
 use super::{Handlers, now_secs};
 
@@ -88,13 +88,27 @@ impl Handlers {
             debug!("search sync already in flight; skipping");
             return;
         };
-        let stamps = match self.search.stamps() {
+        let mut stamps = match self.search.stamps() {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "search sync: stamp read failed");
                 return;
             }
         };
+        // A stamp from an older entry schema is treated as never-synced: only
+        // a full resync rewrites every row, so rows carrying `serde(default)`
+        // values for the new fields would otherwise linger until the next
+        // scheduled full sync (up to a week).
+        if stamps.schema_version < SEARCH_SCHEMA_VERSION {
+            if stamps.last_partial_sync_secs != 0 {
+                info!(
+                    from = stamps.schema_version,
+                    to = SEARCH_SCHEMA_VERSION,
+                    "search entry schema changed; forcing a full resync"
+                );
+            }
+            stamps = SyncStamps::default();
+        }
         let now = now_secs();
         let full_due = stamps.last_full_sync_secs == 0
             || now.saturating_sub(stamps.last_full_sync_secs) >= full_secs;
@@ -111,6 +125,7 @@ impl Handlers {
                 return;
             }
         };
+        let user_id = session.user_id;
         let gitlab = session.gitlab;
 
         // Resolve `auto` against the host and the sticky degrade flag. The
@@ -183,6 +198,8 @@ impl Handlers {
                 stamps.last_full_sync_secs
             },
             degraded_to_member: degraded,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: user_id,
         };
         if let Err(e) = guard.set_stamps(&fresh) {
             warn!(error = %e, "search sync: stamp write failed");
