@@ -338,7 +338,7 @@ pub(crate) fn graph_status_from(
 /// projects but is better than nothing) and MRs to the search corpus (by
 /// `web_url`). If nothing hits, `project_id` stays at `0` — the client can
 /// still display the entry.
-pub(crate) fn enrich_timelog(
+pub fn enrich_timelog(
     t: FetchedTimelog,
     by_url: &HashMap<&str, &Issue>,
     by_iid: &HashMap<i64, &Issue>,

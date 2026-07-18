@@ -14,6 +14,9 @@ cargo test                                    # all tests (inline #[cfg(test)] m
 cargo test -p gitlab-trackrd <name>           # single test by name filter
 cargo fmt                                     # formatting is enforced; run before committing
 cargo run -p gitlab-trackrd --bin gen-config-template   # annotated default daemon config
+cargo bench -p gitlab-trackrd                 # local perf suite (never in CI; see gitlab-trackrd/docs/benchmarks.md)
+cargo bench -p gitlab-trackrd -- --save-baseline main   # record baseline before a change
+cargo bench -p gitlab-trackrd -- --baseline main        # compare against it after
 ```
 
 Daemon logging: `GITLAB_TRACKRD_LOG=debug` (env-filter syntax, default `gitlab_trackrd=info`).

@@ -440,9 +440,8 @@ pub fn reload(shared: &SharedConfig) -> Result<(), confique::Error> {
     Ok(())
 }
 
-/// A fully-defaulted config (no file layers), for tests that need a
-/// [`SharedConfig`] without touching the real XDG path.
-#[cfg(test)]
+/// A fully-defaulted config (no file layers), for tests and benches that need
+/// a [`SharedConfig`] without touching the real XDG path.
 pub fn defaults() -> Config {
     Config::builder()
         .load()

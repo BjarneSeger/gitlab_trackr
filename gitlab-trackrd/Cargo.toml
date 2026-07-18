@@ -31,6 +31,19 @@ security-framework-sys = { workspace = true, features = ["OSX_10_15"] }
 oo7 = { workspace = true }
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio", "html_reports"] }
 proptest.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "storage"
+harness = false
+
+[[bench]]
+name = "handlers"
+harness = false

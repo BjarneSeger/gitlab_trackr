@@ -34,6 +34,10 @@ mod refresh;
 mod search_sync;
 mod varlink;
 
+// Exposed for the Criterion benches only; not a stable API.
+#[doc(hidden)]
+pub use refresh::enrich_timelog;
+
 #[cfg(test)]
 pub(crate) mod tests;
 

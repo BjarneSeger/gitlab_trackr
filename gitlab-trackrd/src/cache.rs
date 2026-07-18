@@ -123,7 +123,7 @@ impl IssueCache {
 /// (`https://host/<namespace>/-/issues/<iid>`). Returns `""` when there is no
 /// namespace to parse — such issues still show in `tt list`, they just don't
 /// match any `tt list <group>` filter.
-pub(crate) fn namespace_of(web_url: &str) -> String {
+pub fn namespace_of(web_url: &str) -> String {
     web_url
         .split_once("://")
         .map(|(_, rest)| rest)
