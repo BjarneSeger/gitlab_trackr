@@ -14,7 +14,7 @@ use gitlab_trackr_api::{
 };
 
 use crate::error::{DormancyReason, Error};
-use crate::gitlab::GitlabClient;
+use crate::gitlab::{GitlabClient, Issuable};
 use crate::history::HistoryCache;
 use crate::search::{SearchIssue, parse_iid_query, text_matches};
 use crate::secrets::{self, Credentials};
@@ -52,7 +52,14 @@ impl Handlers {
     ) {
         let issue_id = self.resolve_issue_id(project_id, issue_iid);
         self.queue
-            .post_time(project_id, issue_iid, duration, summary, issue_id)
+            .post_time(
+                Issuable::Issue,
+                project_id,
+                issue_iid,
+                duration,
+                summary,
+                issue_id,
+            )
             .await;
     }
 
@@ -60,20 +67,26 @@ impl Handlers {
     /// `tt list` reflects it at once. Shared by both deferral arms of
     /// [`Self::close_issue`].
     async fn defer_close_issue(&self, project_id: i64, issue_iid: i64) {
-        self.queue.close_issue(project_id, issue_iid).await;
+        self.queue
+            .close(Issuable::Issue, project_id, issue_iid)
+            .await;
         self.forget_cached_issue(project_id, issue_iid);
     }
 
     /// Queue an `AssignSelf` write for retry. Shared by both deferral arms of
     /// [`Self::assign_self`].
     async fn defer_assign_self(&self, project_id: i64, issue_iid: i64) {
-        self.queue.assign_self(project_id, issue_iid).await;
+        self.queue
+            .assign_self(Issuable::Issue, project_id, issue_iid)
+            .await;
     }
 
     /// Queue an `UnassignSelf` write for retry and drop the issue from the cache.
     /// Shared by both deferral arms of [`Self::unassign_self`].
     async fn defer_unassign_self(&self, project_id: i64, issue_iid: i64) {
-        self.queue.unassign_self(project_id, issue_iid).await;
+        self.queue
+            .unassign_self(Issuable::Issue, project_id, issue_iid)
+            .await;
         self.forget_cached_issue(project_id, issue_iid);
     }
 
@@ -443,7 +456,13 @@ impl VarlinkInterface for Handlers {
             }
         };
         match gitlab
-            .add_spent_time(project_id, issue_iid, &duration, summary.as_deref())
+            .add_spent_time(
+                Issuable::Issue,
+                project_id,
+                issue_iid,
+                &duration,
+                summary.as_deref(),
+            )
             .await
         {
             Ok(()) => {
@@ -484,12 +503,12 @@ impl VarlinkInterface for Handlers {
         match self.queue.pending_post_time() {
             Ok(pending) => {
                 for p in pending {
-                    let issue = by_key.get(&(p.project_id, p.issue_iid));
+                    let issue = by_key.get(&(p.project_id, p.iid));
                     events.push(HistoryEvent {
                         timestamp: p.queued_at_secs as i64,
                         source: "queued".to_string(),
                         project_id: p.project_id,
-                        issue_iid: p.issue_iid,
+                        issue_iid: p.iid,
                         issue_title: issue.map(|i| i.title.clone()).unwrap_or_default(),
                         web_url: issue.map(|i| i.web_url.clone()).unwrap_or_default(),
                         duration: p.duration,
@@ -536,7 +555,7 @@ impl VarlinkInterface for Handlers {
                 id: f.id as i64,
                 op: f.op_kind.to_string(),
                 project_id: f.project_id,
-                issue_iid: f.issue_iid,
+                issue_iid: f.iid,
                 detail: f.detail,
                 error: f.error,
                 queued_at: f.queued_at_secs as i64,
@@ -619,7 +638,7 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab.close_issue(project_id, issue_iid).await {
+        match gitlab.close(Issuable::Issue, project_id, issue_iid).await {
             Ok(()) => {
                 info!(project_id, issue_iid, "closed issue");
                 self.forget_cached_issue(project_id, issue_iid);
@@ -662,7 +681,10 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab.assign_self(project_id, issue_iid).await {
+        match gitlab
+            .assign_self(Issuable::Issue, project_id, issue_iid)
+            .await
+        {
             Ok(()) => {
                 info!(project_id, issue_iid, "assigned self");
                 call.reply()
@@ -704,7 +726,10 @@ impl VarlinkInterface for Handlers {
                 return call.reply_not_authenticated(reason, detail);
             }
         };
-        match gitlab.unassign_self(project_id, issue_iid).await {
+        match gitlab
+            .unassign_self(Issuable::Issue, project_id, issue_iid)
+            .await
+        {
             Ok(()) => {
                 info!(project_id, issue_iid, "unassigned self");
                 self.forget_cached_issue(project_id, issue_iid);

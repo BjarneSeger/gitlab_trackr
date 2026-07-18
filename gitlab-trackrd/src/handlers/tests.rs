@@ -18,7 +18,7 @@ use crate::boards::BoardCache;
 use crate::cache::IssueCache;
 use crate::config::SharedConfig;
 use crate::error::{DormancyReason, Result as TrackrResult};
-use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 use crate::history::{HistoryCache, StoredTimelog};
 use crate::queue::RetryQueue;
 use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
@@ -250,8 +250,9 @@ impl GitlabApi for FakeGitlab {
     }
     async fn add_spent_time(
         &self,
+        _kind: Issuable,
         _project_id: i64,
-        _issue_iid: i64,
+        _iid: i64,
         _duration: &str,
         _summary: Option<&str>,
     ) -> TrackrResult<()> {
@@ -259,7 +260,8 @@ impl GitlabApi for FakeGitlab {
     }
     async fn create_timelog(
         &self,
-        _issue_id: i64,
+        _kind: Issuable,
+        _issuable_id: i64,
         _duration: &str,
         _summary: &str,
         _spent_at: chrono::DateTime<chrono::Utc>,
@@ -279,13 +281,18 @@ impl GitlabApi for FakeGitlab {
             None => self.fetch_result(),
         }
     }
-    async fn close_issue(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn close(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
         unimplemented!()
     }
-    async fn assign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn assign_self(&self, _kind: Issuable, _project_id: i64, _iid: i64) -> TrackrResult<()> {
         unimplemented!()
     }
-    async fn unassign_self(&self, _project_id: i64, _issue_iid: i64) -> TrackrResult<()> {
+    async fn unassign_self(
+        &self,
+        _kind: Issuable,
+        _project_id: i64,
+        _iid: i64,
+    ) -> TrackrResult<()> {
         unimplemented!()
     }
     async fn fetch_board_list_labels(&self, project_id: i64) -> TrackrResult<Vec<String>> {

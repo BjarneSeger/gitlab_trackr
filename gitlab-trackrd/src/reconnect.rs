@@ -330,7 +330,7 @@ mod tests {
 
     use tokio::sync::RwLock;
 
-    use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+    use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 
     struct NoopGitlab;
 
@@ -344,6 +344,7 @@ mod tests {
         }
         async fn add_spent_time(
             &self,
+            _k: Issuable,
             _p: i64,
             _i: i64,
             _d: &str,
@@ -353,6 +354,7 @@ mod tests {
         }
         async fn create_timelog(
             &self,
+            _k: Issuable,
             _id: i64,
             _d: &str,
             _s: &str,
@@ -366,13 +368,13 @@ mod tests {
         ) -> crate::error::Result<Vec<FetchedTimelog>> {
             unimplemented!()
         }
-        async fn close_issue(&self, _p: i64, _i: i64) -> crate::error::Result<()> {
+        async fn close(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
             unimplemented!()
         }
-        async fn assign_self(&self, _p: i64, _i: i64) -> crate::error::Result<()> {
+        async fn assign_self(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
             unimplemented!()
         }
-        async fn unassign_self(&self, _p: i64, _i: i64) -> crate::error::Result<()> {
+        async fn unassign_self(&self, _k: Issuable, _p: i64, _i: i64) -> crate::error::Result<()> {
             unimplemented!()
         }
         async fn fetch_board_list_labels(&self, _p: i64) -> crate::error::Result<Vec<String>> {

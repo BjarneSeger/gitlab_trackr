@@ -1,7 +1,7 @@
 //! GitLab API access — the only module that knows about the `gitlab` crate.
 //!
 //! Wraps `gitlab::AsyncGitlab` plus a handful of custom endpoints that the
-//! crate doesn't ship (`add_spent_time`, board lookups, `close_issue`).
+//! crate doesn't ship (`add_spent_time`, board lookups, `close`).
 //! Returns plain [`Issue`] values so the rest of the daemon never touches
 //! `serde_json::Value`.
 
@@ -16,13 +16,43 @@ use crate::error::{Error, Result};
 use crate::search::{SearchGroup, SearchIssue, SearchMr, SearchProject};
 use gitlab_trackr_api::Issue;
 
+/// Which GitLab issuable an operation targets. Internal counterpart of the
+/// wire `IssuableKind`, kept separate so persisted queue/history records
+/// don't couple the on-disk format to the api crate; `Default = Issue`
+/// because every record written before MR support was an issue, which lets
+/// them deserialize via `#[serde(default)]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Issuable {
+    #[default]
+    Issue,
+    MergeRequest,
+}
+
+impl Issuable {
+    /// REST URL path segment: `projects/{id}/<segment>/{iid}/…`.
+    pub fn path_segment(self) -> &'static str {
+        match self {
+            Issuable::Issue => "issues",
+            Issuable::MergeRequest => "merge_requests",
+        }
+    }
+
+    /// GraphQL global-ID type: `gid://gitlab/<type>/{id}`.
+    pub fn gid_type(self) -> &'static str {
+        match self {
+            Issuable::Issue => "Issue",
+            Issuable::MergeRequest => "MergeRequest",
+        }
+    }
+}
+
 pub struct GitlabClient {
     inner: gitlab::AsyncGitlab,
     /// GitLab host (e.g. `"gitlab.com"`) used to build `inner`. Exposed so
     /// `WhoAmI` can return it.
     host: String,
     /// Numeric ID of the authenticated user, fetched once at `connect()`.
-    /// Required so `assign_self`/`unassign_self` can mutate the issue's
+    /// Required so `assign_self`/`unassign_self` can mutate the issuable's
     /// `assignee_ids` list without an extra round-trip per call.
     current_user_id: i64,
 }
@@ -68,15 +98,17 @@ pub trait GitlabApi: Send + Sync {
 
     async fn add_spent_time(
         &self,
+        kind: Issuable,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
         duration: &str,
         summary: Option<&str>,
     ) -> Result<()>;
 
     async fn create_timelog(
         &self,
-        issue_id: i64,
+        kind: Issuable,
+        issuable_id: i64,
         duration: &str,
         summary: &str,
         spent_at: chrono::DateTime<chrono::Utc>,
@@ -87,11 +119,11 @@ pub trait GitlabApi: Send + Sync {
         since: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<FetchedTimelog>>;
 
-    async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+    async fn close(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
 
-    async fn assign_self(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+    async fn assign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
 
-    async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()>;
+    async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()>;
 
     async fn fetch_board_list_labels(&self, project_id: i64) -> Result<Vec<String>>;
 
@@ -124,18 +156,20 @@ pub trait GitlabApi: Send + Sync {
 }
 
 impl GitlabClient {
-    /// Read the issue's current `assignee_ids`, apply the add/remove, and PUT
-    /// the new list back. Skips the PUT when the issue is already in the
-    /// target state (`add && already assigned` or `!add && not assigned`).
+    /// Read the issuable's current `assignee_ids`, apply the add/remove, and
+    /// PUT the new list back. Skips the PUT when the issuable is already in
+    /// the target state (`add && already assigned` or `!add && not assigned`).
     async fn mutate_self_assignment(
         &self,
+        kind: Issuable,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
         add: bool,
     ) -> Result<()> {
-        let raw: serde_json::Value = GetIssueEndpoint {
+        let raw: serde_json::Value = GetIssuableEndpoint {
+            kind,
             project_id,
-            issue_iid,
+            iid,
         }
         .query_async(&self.inner)
         .await
@@ -152,8 +186,9 @@ impl GitlabClient {
 
         use gitlab::api::ignore;
         ignore(UpdateAssigneesEndpoint {
+            kind,
             project_id,
-            issue_iid,
+            iid,
             assignee_ids: new_ids,
         })
         .query_async(&self.inner)
@@ -249,20 +284,22 @@ impl GitlabApi for GitlabClient {
         }
     }
 
-    /// Record time spent on a GitLab issue.
+    /// Record time spent on a GitLab issue or merge request.
     #[instrument(skip(self))]
     async fn add_spent_time(
         &self,
+        kind: Issuable,
         project_id: i64,
-        issue_iid: i64,
+        iid: i64,
         duration: &str,
         summary: Option<&str>,
     ) -> Result<()> {
         use gitlab::api::ignore;
 
         ignore(AddSpentTime {
+            kind,
             project_id,
-            issue_iid,
+            iid,
             duration,
             summary,
         })
@@ -272,20 +309,21 @@ impl GitlabApi for GitlabClient {
         Ok(())
     }
 
-    /// Record time spent on a GitLab issue via the GraphQL `timelogCreate` mutation,
+    /// Record time spent on an issuable via the GraphQL `timelogCreate` mutation,
     /// stamping it at `spent_at` instead of "now". Used by the retry queue so a
     /// task that was queued during an outage appears in GitLab at the time the
     /// user actually logged it, not the time we reconnected.
     #[instrument(skip(self))]
     async fn create_timelog(
         &self,
-        issue_id: i64,
+        kind: Issuable,
+        issuable_id: i64,
         duration: &str,
         summary: &str,
         spent_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         let endpoint = TimelogCreate {
-            issuable_id: format!("gid://gitlab/Issue/{issue_id}"),
+            issuable_id: format!("gid://gitlab/{}/{issuable_id}", kind.gid_type()),
             time_spent: duration,
             summary,
             spent_at: spent_at.to_rfc3339(),
@@ -393,14 +431,16 @@ impl GitlabApi for GitlabClient {
         Ok(out)
     }
 
-    /// Close a GitLab issue (`PUT /projects/:id/issues/:iid` with `state_event=close`).
+    /// Close a GitLab issuable (`PUT /projects/:id/<kind>/:iid` with
+    /// `state_event=close`).
     #[instrument(skip(self))]
-    async fn close_issue(&self, project_id: i64, issue_iid: i64) -> Result<()> {
+    async fn close(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
         use gitlab::api::ignore;
 
-        ignore(CloseIssueEndpoint {
+        ignore(CloseEndpoint {
+            kind,
             project_id,
-            issue_iid,
+            iid,
         })
         .query_async(&self.inner)
         .await
@@ -408,17 +448,17 @@ impl GitlabApi for GitlabClient {
         Ok(())
     }
 
-    /// Add the authenticated user to the issue's `assignee_ids` list.
+    /// Add the authenticated user to the issuable's `assignee_ids` list.
     #[instrument(skip(self))]
-    async fn assign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
-        self.mutate_self_assignment(project_id, issue_iid, true)
+    async fn assign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
+        self.mutate_self_assignment(kind, project_id, iid, true)
             .await
     }
 
-    /// Remove the authenticated user from the issue's `assignee_ids` list.
+    /// Remove the authenticated user from the issuable's `assignee_ids` list.
     #[instrument(skip(self))]
-    async fn unassign_self(&self, project_id: i64, issue_iid: i64) -> Result<()> {
-        self.mutate_self_assignment(project_id, issue_iid, false)
+    async fn unassign_self(&self, kind: Issuable, project_id: i64, iid: i64) -> Result<()> {
+        self.mutate_self_assignment(kind, project_id, iid, false)
             .await
     }
 
@@ -771,10 +811,11 @@ fn search_group_from_json(v: &serde_json::Value) -> SearchGroup {
     }
 }
 
-/// `POST /projects/:project_id/issues/:issue_iid/add_spent_time`
+/// `POST /projects/:project_id/<kind>/:iid/add_spent_time`
 struct AddSpentTime<'a> {
+    kind: Issuable,
     project_id: i64,
-    issue_iid: i64,
+    iid: i64,
     duration: &'a str,
     summary: Option<&'a str>,
 }
@@ -786,8 +827,10 @@ impl gitlab::api::Endpoint for AddSpentTime<'_> {
 
     fn endpoint(&self) -> Cow<'static, str> {
         format!(
-            "projects/{}/issues/{}/add_spent_time",
-            self.project_id, self.issue_iid
+            "projects/{}/{}/{}/add_spent_time",
+            self.project_id,
+            self.kind.path_segment(),
+            self.iid
         )
         .into()
     }
@@ -859,27 +902,35 @@ impl gitlab::api::Endpoint for CurrentUserEndpoint {
     }
 }
 
-/// `GET /projects/:project_id/issues/:issue_iid`. Used to read the existing
+/// `GET /projects/:project_id/<kind>/:iid`. Used to read the existing
 /// assignee list before mutating it.
-struct GetIssueEndpoint {
+struct GetIssuableEndpoint {
+    kind: Issuable,
     project_id: i64,
-    issue_iid: i64,
+    iid: i64,
 }
 
-impl gitlab::api::Endpoint for GetIssueEndpoint {
+impl gitlab::api::Endpoint for GetIssuableEndpoint {
     fn method(&self) -> http::Method {
         http::Method::GET
     }
 
     fn endpoint(&self) -> Cow<'static, str> {
-        format!("projects/{}/issues/{}", self.project_id, self.issue_iid).into()
+        format!(
+            "projects/{}/{}/{}",
+            self.project_id,
+            self.kind.path_segment(),
+            self.iid
+        )
+        .into()
     }
 }
 
-/// `PUT /projects/:project_id/issues/:issue_iid` with `assignee_ids=[...]`.
+/// `PUT /projects/:project_id/<kind>/:iid` with `assignee_ids=[...]`.
 struct UpdateAssigneesEndpoint {
+    kind: Issuable,
     project_id: i64,
-    issue_iid: i64,
+    iid: i64,
     assignee_ids: Vec<i64>,
 }
 
@@ -889,7 +940,13 @@ impl gitlab::api::Endpoint for UpdateAssigneesEndpoint {
     }
 
     fn endpoint(&self) -> Cow<'static, str> {
-        format!("projects/{}/issues/{}", self.project_id, self.issue_iid).into()
+        format!(
+            "projects/{}/{}/{}",
+            self.project_id,
+            self.kind.path_segment(),
+            self.iid
+        )
+        .into()
     }
 
     fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
@@ -921,19 +978,26 @@ fn compute_new_assignees(current: &[i64], self_id: i64, add: bool) -> Option<Vec
     }
 }
 
-/// `PUT /projects/:project_id/issues/:issue_iid` with `state_event=close`.
-struct CloseIssueEndpoint {
+/// `PUT /projects/:project_id/<kind>/:iid` with `state_event=close`.
+struct CloseEndpoint {
+    kind: Issuable,
     project_id: i64,
-    issue_iid: i64,
+    iid: i64,
 }
 
-impl gitlab::api::Endpoint for CloseIssueEndpoint {
+impl gitlab::api::Endpoint for CloseEndpoint {
     fn method(&self) -> http::Method {
         http::Method::PUT
     }
 
     fn endpoint(&self) -> Cow<'static, str> {
-        format!("projects/{}/issues/{}", self.project_id, self.issue_iid).into()
+        format!(
+            "projects/{}/{}/{}",
+            self.project_id,
+            self.kind.path_segment(),
+            self.iid
+        )
+        .into()
     }
 
     fn body(&self) -> std::result::Result<Option<(&'static str, Vec<u8>)>, gitlab::api::BodyError> {
@@ -1108,6 +1172,60 @@ mod tests {
             // forms.
             prop_assert_eq!(parse_gid(&format!("gid://gitlab/Timelog/{tail}")), None);
             prop_assert_eq!(parse_gid(&tail), None);
+        }
+    }
+
+    #[test]
+    fn issuable_maps_to_rest_segment_and_gid_type() {
+        assert_eq!(Issuable::Issue.path_segment(), "issues");
+        assert_eq!(Issuable::MergeRequest.path_segment(), "merge_requests");
+        assert_eq!(Issuable::Issue.gid_type(), "Issue");
+        assert_eq!(Issuable::MergeRequest.gid_type(), "MergeRequest");
+    }
+
+    /// The write endpoints render the same URL shape per kind — a wrong
+    /// segment here would silently hit the wrong resource class.
+    #[test]
+    fn write_endpoints_render_kind_specific_paths() {
+        use gitlab::api::Endpoint;
+
+        for (kind, seg) in [
+            (Issuable::Issue, "issues"),
+            (Issuable::MergeRequest, "merge_requests"),
+        ] {
+            let close = CloseEndpoint {
+                kind,
+                project_id: 7,
+                iid: 42,
+            };
+            assert_eq!(close.endpoint(), format!("projects/7/{seg}/42"));
+
+            let spend = AddSpentTime {
+                kind,
+                project_id: 7,
+                iid: 42,
+                duration: "1h",
+                summary: None,
+            };
+            assert_eq!(
+                spend.endpoint(),
+                format!("projects/7/{seg}/42/add_spent_time")
+            );
+
+            let get = GetIssuableEndpoint {
+                kind,
+                project_id: 7,
+                iid: 42,
+            };
+            assert_eq!(get.endpoint(), format!("projects/7/{seg}/42"));
+
+            let update = UpdateAssigneesEndpoint {
+                kind,
+                project_id: 7,
+                iid: 42,
+                assignee_ids: vec![1],
+            };
+            assert_eq!(update.endpoint(), format!("projects/7/{seg}/42"));
         }
     }
 
