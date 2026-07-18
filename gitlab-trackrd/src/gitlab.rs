@@ -76,14 +76,18 @@ pub struct IssueWithLabels {
     pub labels: Vec<String>,
 }
 
-/// A timelog entry as returned by GraphQL `currentUser.timelogs`. The handler
-/// fills in `project_id` from the issue cache before persisting.
+/// A timelog entry as returned by GraphQL `currentUser.timelogs`, attached to
+/// an issue or a merge request per `kind`. `project_id` comes from the
+/// `Timelog.project` field; `0` when GitLab didn't return one (the refresh
+/// enrichment then falls back to the caches).
 #[derive(Clone)]
 pub struct FetchedTimelog {
     pub timelog_id: u64,
     pub spent_at_secs: u64,
-    pub issue_iid: i64,
-    pub issue_title: String,
+    pub kind: Issuable,
+    pub project_id: i64,
+    pub iid: i64,
+    pub title: String,
     pub web_url: String,
     pub duration: String,
     pub summary: String,
@@ -400,31 +404,7 @@ impl GitlabApi for GitlabClient {
                 ))
             })?;
 
-        let mut out = Vec::with_capacity(nodes.len());
-        for n in &nodes {
-            let Some(timelog_id) = parse_gid(n["id"].as_str().unwrap_or("")) else {
-                continue;
-            };
-            let spent_at = n["spentAt"].as_str().unwrap_or("");
-            let spent_at_secs = chrono::DateTime::parse_from_rfc3339(spent_at)
-                .map(|d| d.timestamp().max(0) as u64)
-                .unwrap_or(0);
-            let time_spent_secs = n["timeSpent"].as_i64().unwrap_or(0).max(0) as u64;
-
-            out.push(FetchedTimelog {
-                timelog_id,
-                spent_at_secs,
-                issue_iid: n["issue"]["iid"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .or_else(|| n["issue"]["iid"].as_i64())
-                    .unwrap_or(0),
-                issue_title: n["issue"]["title"].as_str().unwrap_or("").to_string(),
-                web_url: n["issue"]["webUrl"].as_str().unwrap_or("").to_string(),
-                duration: format_duration(time_spent_secs),
-                summary: n["summary"].as_str().unwrap_or("").to_string(),
-            });
-        }
+        let mut out: Vec<FetchedTimelog> = nodes.iter().filter_map(timelog_from_node).collect();
 
         out.sort_by_key(|t| std::cmp::Reverse(t.spent_at_secs));
         info!(count = out.len(), "fetched timelogs from GitLab");
@@ -1073,7 +1053,9 @@ impl gitlab::api::Endpoint for MyTimelogs {
                                 timeSpent
                                 spentAt
                                 summary
+                                project { id }
                                 issue { iid title webUrl }
+                                mergeRequest { iid title webUrl }
                             }
                         }
                     }
@@ -1083,6 +1065,46 @@ impl gitlab::api::Endpoint for MyTimelogs {
         });
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
     }
+}
+
+/// Parse one `currentUser.timelogs` node. `None` skips the node: an
+/// unparsable timelog GID, or a timelog attached to neither an issue nor a
+/// merge request (e.g. the issuable is no longer visible to the user).
+fn timelog_from_node(n: &serde_json::Value) -> Option<FetchedTimelog> {
+    let timelog_id = parse_gid(n["id"].as_str().unwrap_or(""))?;
+
+    let (kind, issuable) = if !n["issue"].is_null() {
+        (Issuable::Issue, &n["issue"])
+    } else if !n["mergeRequest"].is_null() {
+        (Issuable::MergeRequest, &n["mergeRequest"])
+    } else {
+        return None;
+    };
+
+    let spent_at = n["spentAt"].as_str().unwrap_or("");
+    let spent_at_secs = chrono::DateTime::parse_from_rfc3339(spent_at)
+        .map(|d| d.timestamp().max(0) as u64)
+        .unwrap_or(0);
+    let time_spent_secs = n["timeSpent"].as_i64().unwrap_or(0).max(0) as u64;
+
+    Some(FetchedTimelog {
+        timelog_id,
+        spent_at_secs,
+        kind,
+        project_id: parse_gid(n["project"]["id"].as_str().unwrap_or(""))
+            .map(|id| id as i64)
+            .unwrap_or(0),
+        // GraphQL returns iid as a string; tolerate a plain number too.
+        iid: issuable["iid"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| issuable["iid"].as_i64())
+            .unwrap_or(0),
+        title: issuable["title"].as_str().unwrap_or("").to_string(),
+        web_url: issuable["webUrl"].as_str().unwrap_or("").to_string(),
+        duration: format_duration(time_spent_secs),
+        summary: n["summary"].as_str().unwrap_or("").to_string(),
+    })
 }
 
 /// Pull the trailing integer out of a `gid://gitlab/Timelog/<id>` global ID.
@@ -1333,6 +1355,59 @@ mod tests {
             let removed = compute_new_assignees(&added, self_id, false).expect("present → change");
             prop_assert_eq!(removed, current);
         }
+    }
+
+    #[test]
+    fn timelog_from_node_detects_kind_and_project() {
+        let issue_node = serde_json::json!({
+            "id": "gid://gitlab/Timelog/11",
+            "timeSpent": 5400,
+            "spentAt": "2026-07-01T10:00:00Z",
+            "summary": "s",
+            "project": { "id": "gid://gitlab/Project/7" },
+            "issue": { "iid": "42", "title": "I", "webUrl": "https://gl/i/42" },
+            "mergeRequest": null,
+        });
+        let t = timelog_from_node(&issue_node).unwrap();
+        assert_eq!(t.kind, Issuable::Issue);
+        assert_eq!(t.project_id, 7);
+        assert_eq!(t.iid, 42);
+        assert_eq!(t.title, "I");
+        assert_eq!(t.duration, "1h 30m");
+
+        let mr_node = serde_json::json!({
+            "id": "gid://gitlab/Timelog/12",
+            "timeSpent": 1800,
+            "spentAt": "2026-07-01T10:00:00Z",
+            "summary": "",
+            "project": { "id": "gid://gitlab/Project/7" },
+            "issue": null,
+            "mergeRequest": { "iid": "5", "title": "M", "webUrl": "https://gl/mr/5" },
+        });
+        let t = timelog_from_node(&mr_node).unwrap();
+        assert_eq!(t.kind, Issuable::MergeRequest);
+        assert_eq!(t.iid, 5);
+        assert_eq!(t.title, "M");
+
+        // A timelog whose issuable is no longer visible: today's iid-0 junk
+        // rows — now skipped outright.
+        let orphan = serde_json::json!({
+            "id": "gid://gitlab/Timelog/13",
+            "timeSpent": 60,
+            "spentAt": "2026-07-01T10:00:00Z",
+            "issue": null,
+            "mergeRequest": null,
+        });
+        assert!(timelog_from_node(&orphan).is_none());
+
+        // Missing project field → 0, the enrichment fallback marker.
+        let no_project = serde_json::json!({
+            "id": "gid://gitlab/Timelog/14",
+            "timeSpent": 60,
+            "spentAt": "2026-07-01T10:00:00Z",
+            "issue": { "iid": 1, "title": "t", "webUrl": "u" },
+        });
+        assert_eq!(timelog_from_node(&no_project).unwrap().project_id, 0);
     }
 
     #[test]

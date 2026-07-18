@@ -13,6 +13,13 @@ use serde::{Deserialize, Serialize};
 use crate::db::KvStore;
 use crate::error::Result;
 
+/// Bumped when the stored-timelog schema gains data that only a full-window
+/// backfill can repair (e.g. MR timelogs stored as iid-0 issue rows before
+/// kind support). A stamp with an older version makes `backfill_history` due
+/// regardless of the slow cadence; re-fetched rows overwrite in place by
+/// `timelog_id`.
+pub const HISTORY_SCHEMA_VERSION: u32 = 1;
+
 /// Refresh-tier bookkeeping. `0` means "never" — both for a fresh database and
 /// after `ClearCache` — which makes the next run unconditionally due.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
@@ -27,6 +34,11 @@ pub struct RefreshStamps {
     /// fresh. `serde(default)` keeps stamps written before this field readable.
     #[serde(default)]
     pub backfilled_retention_hours: u64,
+    /// The stored-timelog schema version the last backfill ran under; see
+    /// [`HISTORY_SCHEMA_VERSION`]. Defaults to 0 for pre-existing stamps,
+    /// forcing one full-retention backfill.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 const REFRESH_META_KEYSPACE: &str = "refresh_meta_v1";

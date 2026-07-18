@@ -12,14 +12,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::KvStore;
 use crate::error::Result;
+use crate::gitlab::Issuable;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredTimelog {
     pub timelog_id: u64,
     pub spent_at_secs: u64,
+    /// Which issuable the time was logged on. Defaults to `Issue` for entries
+    /// persisted before MR support; the aliases keep those readable too.
+    #[serde(default)]
+    pub kind: Issuable,
     pub project_id: i64,
-    pub issue_iid: i64,
-    pub issue_title: String,
+    #[serde(alias = "issue_iid")]
+    pub iid: i64,
+    #[serde(alias = "issue_title")]
+    pub title: String,
     pub web_url: String,
     pub duration: String,
     pub summary: String,
@@ -100,9 +107,10 @@ mod tests {
         StoredTimelog {
             timelog_id,
             spent_at_secs: spent_at,
+            kind: Issuable::Issue,
             project_id: 1,
-            issue_iid: 1,
-            issue_title: title.to_string(),
+            iid: 1,
+            title: title.to_string(),
             web_url: "https://gl/-/issues/1".to_string(),
             duration: "1h".to_string(),
             summary: String::new(),
@@ -118,13 +126,26 @@ mod tests {
     }
 
     #[test]
+    fn stored_timelog_written_before_mr_support_still_parses() {
+        // Entries persisted before `kind` existed used issue-named fields;
+        // they must stay readable as issue timelogs.
+        let old = r#"{"timelog_id":9,"spent_at_secs":100,"project_id":7,
+                      "issue_iid":42,"issue_title":"T","web_url":"u",
+                      "duration":"1h","summary":""}"#;
+        let t: StoredTimelog = serde_json::from_str(old).unwrap();
+        assert_eq!(t.kind, Issuable::Issue);
+        assert_eq!(t.iid, 42);
+        assert_eq!(t.title, "T");
+    }
+
+    #[test]
     fn upsert_dedupes_by_timelog_id() {
         let (h, _td) = cache();
         h.upsert(&[entry(1, 100, "old")]).unwrap();
         h.upsert(&[entry(1, 100, "new")]).unwrap();
         let all = h.all_since(0).unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].issue_title, "new");
+        assert_eq!(all[0].title, "new");
     }
 
     #[test]
@@ -218,6 +239,6 @@ mod tests {
         let h = HistoryCache::open(&db).unwrap();
         let all = h.all_since(0).unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].issue_title, "persisted");
+        assert_eq!(all[0].title, "persisted");
     }
 }

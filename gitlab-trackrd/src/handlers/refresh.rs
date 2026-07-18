@@ -22,9 +22,10 @@ use tracing::{debug, info, warn};
 use gitlab_trackr_api::Issue;
 
 use crate::boards::BoardCache;
-use crate::gitlab::{FetchedTimelog, GitlabApi, IssueWithLabels};
+use crate::gitlab::{FetchedTimelog, GitlabApi, Issuable, IssueWithLabels};
 use crate::history::StoredTimelog;
-use crate::refresh_meta::RefreshStamps;
+use crate::refresh_meta::{HISTORY_SCHEMA_VERSION, RefreshStamps};
+use crate::search::SearchMr;
 
 use super::{Handlers, now_secs};
 
@@ -130,6 +131,7 @@ impl Handlers {
             s.last_slow_sync_secs == 0
                 || now.saturating_sub(s.last_slow_sync_secs) >= slow_secs
                 || s.backfilled_retention_hours < retention_hours
+                || s.schema_version < HISTORY_SCHEMA_VERSION
         }) {
             return;
         }
@@ -145,6 +147,7 @@ impl Handlers {
             self.stamp(|s| {
                 s.last_slow_sync_secs = started;
                 s.backfilled_retention_hours = retention_hours;
+                s.schema_version = HISTORY_SCHEMA_VERSION;
             });
         }
         self.prune_history();
@@ -225,10 +228,13 @@ impl Handlers {
             .map(|i| (i.web_url.as_str(), i))
             .collect();
         let by_iid: HashMap<i64, &Issue> = cached_issues.iter().map(|i| (i.iid, i)).collect();
+        let cached_mrs = self.search.all_mrs().unwrap_or_default();
+        let mr_by_url: HashMap<&str, &SearchMr> =
+            cached_mrs.iter().map(|m| (m.web_url.as_str(), m)).collect();
 
         let stored: Vec<StoredTimelog> = fetched
             .into_iter()
-            .map(|t| enrich_timelog(t, &by_url, &by_iid))
+            .map(|t| enrich_timelog(t, &by_url, &by_iid, &mr_by_url))
             .collect();
 
         if let Err(e) = self.history.upsert(&stored) {
@@ -324,32 +330,57 @@ pub(crate) fn graph_status_from(
     }
 }
 
-/// Fill `project_id` on a fetched timelog from the issue cache.
+/// Fill the gaps on a fetched timelog from the caches.
 ///
-/// GitLab's GraphQL `Timelog.issue` doesn't expose `project_id` directly, so
-/// we match by `web_url` first (exact, robust) and fall back to `iid` (which
-/// can collide across projects but is better than nothing). If neither hits,
-/// `project_id` stays at `0` — the client can still display the entry.
+/// `project_id` prefers the GraphQL `Timelog.project` value; when GitLab
+/// didn't return one, issues fall back to the assigned-issue cache (matched
+/// by `web_url` first — exact, robust — then `iid`, which can collide across
+/// projects but is better than nothing) and MRs to the search corpus (by
+/// `web_url`). If nothing hits, `project_id` stays at `0` — the client can
+/// still display the entry.
 pub(crate) fn enrich_timelog(
     t: FetchedTimelog,
     by_url: &HashMap<&str, &Issue>,
     by_iid: &HashMap<i64, &Issue>,
+    mr_by_url: &HashMap<&str, &SearchMr>,
 ) -> StoredTimelog {
-    let issue = by_url
-        .get(t.web_url.as_str())
-        .or_else(|| by_iid.get(&t.issue_iid));
+    let (fallback_project_id, fallback_title, fallback_web_url) = match t.kind {
+        Issuable::Issue => {
+            let issue = by_url
+                .get(t.web_url.as_str())
+                .or_else(|| by_iid.get(&t.iid));
+            (
+                issue.map(|i| i.project_id).unwrap_or(0),
+                issue.map(|i| i.title.clone()).unwrap_or_default(),
+                issue.map(|i| i.web_url.clone()).unwrap_or_default(),
+            )
+        }
+        Issuable::MergeRequest => {
+            let mr = mr_by_url.get(t.web_url.as_str());
+            (
+                mr.map(|m| m.project_id).unwrap_or(0),
+                mr.map(|m| m.title.clone()).unwrap_or_default(),
+                String::new(),
+            )
+        }
+    };
     StoredTimelog {
         timelog_id: t.timelog_id,
         spent_at_secs: t.spent_at_secs,
-        project_id: issue.map(|i| i.project_id).unwrap_or(0),
-        issue_iid: t.issue_iid,
-        issue_title: if t.issue_title.is_empty() {
-            issue.map(|i| i.title.clone()).unwrap_or_default()
+        kind: t.kind,
+        project_id: if t.project_id != 0 {
+            t.project_id
         } else {
-            t.issue_title
+            fallback_project_id
+        },
+        iid: t.iid,
+        title: if t.title.is_empty() {
+            fallback_title
+        } else {
+            t.title
         },
         web_url: if t.web_url.is_empty() {
-            issue.map(|i| i.web_url.clone()).unwrap_or_default()
+            fallback_web_url
         } else {
             t.web_url
         },

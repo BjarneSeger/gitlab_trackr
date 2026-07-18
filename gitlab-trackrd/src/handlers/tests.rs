@@ -48,15 +48,17 @@ fn enrich_timelog_matches_by_web_url() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: "fresh".to_string(),
         web_url: "https://gl/-/issues/42".to_string(),
         duration: "1h".to_string(),
         summary: "s".to_string(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 7);
-    assert_eq!(r.issue_title, "fresh", "fresh title preserved");
+    assert_eq!(r.title, "fresh", "fresh title preserved");
     assert_eq!(r.web_url, "https://gl/-/issues/42");
 }
 
@@ -69,13 +71,15 @@ fn enrich_timelog_falls_back_to_iid_when_url_misses() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: "fresh".to_string(),
         web_url: String::new(),
         duration: "1h".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 7);
     assert_eq!(
         r.web_url, "https://gl/-/issues/42",
@@ -91,15 +95,17 @@ fn enrich_timelog_no_match_leaves_project_id_zero() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 99,
-        issue_title: "fresh".to_string(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 99,
+        title: "fresh".to_string(),
         web_url: "https://gl/-/issues/99".to_string(),
         duration: "30m".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
     assert_eq!(r.project_id, 0);
-    assert_eq!(r.issue_title, "fresh");
+    assert_eq!(r.title, "fresh");
     assert_eq!(r.web_url, "https://gl/-/issues/99");
 }
 
@@ -112,14 +118,54 @@ fn enrich_timelog_empty_title_filled_from_cache() {
     let t = FetchedTimelog {
         timelog_id: 1,
         spent_at_secs: 100,
-        issue_iid: 42,
-        issue_title: String::new(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 42,
+        title: String::new(),
         web_url: "https://gl/-/issues/42".to_string(),
         duration: "1h".to_string(),
         summary: String::new(),
     };
-    let r = enrich_timelog(t, &by_url, &by_iid);
-    assert_eq!(r.issue_title, "From cache");
+    let r = enrich_timelog(t, &by_url, &by_iid, &HashMap::new());
+    assert_eq!(r.title, "From cache");
+}
+
+#[test]
+fn enrich_timelog_mr_falls_back_to_search_corpus() {
+    let m = search_mr(3, "MR title"); // project_id 1, web_url …/merge_requests/30
+    let mr_by_url = HashMap::from([(m.web_url.as_str(), &m)]);
+
+    let t = FetchedTimelog {
+        timelog_id: 1,
+        spent_at_secs: 100,
+        kind: Issuable::MergeRequest,
+        project_id: 0, // GraphQL gave no project → fall back to the corpus
+        iid: 30,
+        title: String::new(),
+        web_url: m.web_url.clone(),
+        duration: "1h".to_string(),
+        summary: String::new(),
+    };
+    let r = enrich_timelog(t, &HashMap::new(), &HashMap::new(), &mr_by_url);
+    assert_eq!(r.kind, Issuable::MergeRequest);
+    assert_eq!(r.project_id, 1, "project filled from the search corpus");
+    assert_eq!(r.title, "MR title", "empty title filled from the corpus");
+
+    // GraphQL-provided project id always wins.
+    let t = FetchedTimelog {
+        timelog_id: 2,
+        spent_at_secs: 100,
+        kind: Issuable::MergeRequest,
+        project_id: 9,
+        iid: 30,
+        title: "fresh".to_string(),
+        web_url: "https://gl/unknown".to_string(),
+        duration: "1h".to_string(),
+        summary: String::new(),
+    };
+    let r = enrich_timelog(t, &HashMap::new(), &HashMap::new(), &mr_by_url);
+    assert_eq!(r.project_id, 9);
+    assert_eq!(r.title, "fresh");
 }
 
 // ── enrich_graph_status with FakeGitlab ────────────────────────────────
@@ -526,9 +572,10 @@ fn stored(timelog_id: u64, spent_at_secs: u64) -> StoredTimelog {
     StoredTimelog {
         timelog_id,
         spent_at_secs,
+        kind: Issuable::Issue,
         project_id: 1,
-        issue_iid: 1,
-        issue_title: "t".into(),
+        iid: 1,
+        title: "t".into(),
         web_url: "u".into(),
         duration: "1h".into(),
         summary: String::new(),
@@ -1802,8 +1849,10 @@ fn canned_refresh_fake() -> FakeGitlab {
         timelog_id: 1,
         // Recent, so the prune following the slow-tier refreshes keeps it.
         spent_at_secs: now_secs(),
-        issue_iid: 1,
-        issue_title: "t".into(),
+        kind: Issuable::Issue,
+        project_id: 0,
+        iid: 1,
+        title: "t".into(),
         web_url: "u".into(),
         duration: "1h".into(),
         summary: String::new(),
@@ -1908,12 +1957,39 @@ async fn backfill_skips_when_slow_stamp_fresh_and_retention_covered() {
         .update(|s| {
             s.last_slow_sync_secs = now_secs();
             s.backfilled_retention_hours = retention_hours;
+            s.schema_version = crate::refresh_meta::HISTORY_SCHEMA_VERSION;
         })
         .unwrap();
 
     h.backfill_history().await;
 
     assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn backfill_runs_when_history_schema_is_stale() {
+    let fake = Arc::new(canned_refresh_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let retention_hours = h.config.read().unwrap().history.retention_hours;
+    // Slow stamp fresh and retention covered, but the stored-timelog schema
+    // predates kind support — one full-window re-backfill is due so old
+    // MR-as-issue junk rows get overwritten by timelog_id.
+    h.refresh_meta
+        .update(|s| {
+            s.last_slow_sync_secs = now_secs();
+            s.backfilled_retention_hours = retention_hours;
+            s.schema_version = 0;
+        })
+        .unwrap();
+
+    h.backfill_history().await;
+
+    assert_eq!(fake.timelog_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.refresh_meta.stamps().unwrap().schema_version,
+        crate::refresh_meta::HISTORY_SCHEMA_VERSION,
+        "successful backfill stamps the current schema version"
+    );
 }
 
 #[tokio::test]
