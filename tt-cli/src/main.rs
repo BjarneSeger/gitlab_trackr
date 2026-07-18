@@ -12,16 +12,18 @@ use clap::Parser;
 
 /// Clap-derived command-line surface.
 ///
-/// GitLab terminology note: every issue has both a global `id` and a
-/// per-project `iid` (the `#42` shown in the UI). The varlink API needs both
-/// `project_id` and `issue_iid` to address an issue; users almost always know
-/// the `iid` but rarely the `project_id`, so the issue-acting commands accept
-/// `iid` positionally and resolve the project lazily (see [`cmd::project`]).
+/// GitLab terminology note: every issue/MR has both a global `id` and a
+/// per-project `iid` (the `#42` / `!7` shown in the UI). The varlink API needs
+/// `project_id`, `iid`, and the issuable kind to address one; users almost
+/// always know the `iid` but rarely the `project_id`, so the issuable-acting
+/// commands accept a `#42`/`!42`-style ref positionally (see [`refspec`]) and
+/// resolve the project lazily (see [`cmd::project`]).
 mod cli;
 mod client;
 mod cmd;
 mod config;
 mod friendly;
+mod refspec;
 mod state;
 
 use cli::{Cli, Command};
@@ -34,18 +36,19 @@ async fn main() -> Result<()> {
     let args = Cli::parse();
     let output = args.output;
     match args.command {
-        Command::List { groups } => cmd::list::run(groups, output).await,
+        Command::List { groups, mrs } => cmd::list::run(groups, mrs, output).await,
         Command::Search {
             query,
             kinds,
             limit,
         } => cmd::search::run(query, kinds, limit, output).await,
         Command::Log {
-            iid,
+            issuable,
             duration,
+            mr,
             project_id,
             summary,
-        } => cmd::log::run(iid, duration, project_id, summary).await,
+        } => cmd::log::run(&issuable, duration, mr, project_id, summary).await,
         Command::Prompt => cmd::prompt::run().await,
         Command::Tick { mode } => cmd::tick::run(mode).await,
         Command::Hook { shell } => {
@@ -66,9 +69,21 @@ async fn main() -> Result<()> {
         Command::Login { host } => cmd::login::run(host).await,
         Command::Logout => cmd::logout::run().await,
         Command::Whoami => cmd::whoami::run(output).await,
-        Command::Close { iid, project_id } => cmd::close::run(iid, project_id).await,
-        Command::Assign { iid, project_id } => cmd::assign::run(iid, project_id).await,
-        Command::Unassign { iid, project_id } => cmd::unassign::run(iid, project_id).await,
+        Command::Close {
+            issuable,
+            mr,
+            project_id,
+        } => cmd::close::run(&issuable, mr, project_id).await,
+        Command::Assign {
+            issuable,
+            mr,
+            project_id,
+        } => cmd::assign::run(&issuable, mr, project_id).await,
+        Command::Unassign {
+            issuable,
+            mr,
+            project_id,
+        } => cmd::unassign::run(&issuable, mr, project_id).await,
         Command::History { days } => cmd::history::run(output, days).await,
         Command::Queue { action } => cmd::queue::run(action, output).await,
     }

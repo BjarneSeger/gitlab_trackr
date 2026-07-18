@@ -50,10 +50,17 @@ list of your assigned issues to pick from.
 
 ```sh
 tt list                  # your assigned issues, straight from the cache
+tt list --mrs            # your open merge requests
 tt log 42 1h30m          # log time on issue #42
+tt log '!42' 1h30m       # log time on merge request !42 (or: tt log 42 1h30m --mr)
 tt history               # what you tracked recently (including queued entries)
 tt queue                 # writes that failed permanently, with retry/dismiss
 ```
+
+Issue-acting commands (`log`, `close`, `assign`, `unassign`) take GitLab-style
+references: `#42` or bare `42` is an issue, `!42` a merge request. Quote the
+sigil forms in bash/zsh (history expansion / comments); `42 --mr` avoids
+quoting entirely.
 
 ## Config
 

@@ -53,12 +53,16 @@ pub enum TickMode {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// List issues assigned to you.
+    /// List issues assigned to you (or merge requests, with --mrs).
     List {
         /// Restrict to issues in the given GitLab group. Repeat the flag to
         /// query several groups; the daemon merges their results.
         #[arg(long = "group", value_name = "GROUP")]
         groups: Vec<String>,
+        /// List your open merge requests instead of issues. Served from the
+        /// search corpus, so freshness follows the search sync cadence.
+        #[arg(long)]
+        mrs: bool,
     },
     /// Search the daemon's cached issues, merge requests, projects, and
     /// groups. Matches titles, labels, and project/group paths
@@ -74,14 +78,20 @@ pub enum Command {
         #[arg(long)]
         limit: Option<i64>,
     },
-    /// Log time on an issue non-interactively.
+    /// Log time on an issue or merge request non-interactively.
     Log {
-        /// Issue IID (per-project number, shown as `#42` in the GitLab UI).
-        iid: i64,
+        /// Issue or MR reference: `42`/`#42` is an issue, `!42` a merge
+        /// request. Quote sigil forms in bash/zsh (`'!42'`); `42 --mr` needs
+        /// no quoting.
+        #[arg(value_name = "REF")]
+        issuable: String,
         /// Duration string accepted by GitLab (e.g. `30m`, `1h15m`).
         duration: String,
-        /// Project ID. If omitted, resolved from the last-used issue cache or
-        /// by scanning your assigned issues for one matching `iid`.
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
+        /// Project ID. If omitted, resolved from the last-used issuable or by
+        /// scanning your assigned issues/MRs for one matching the reference.
         #[arg(short = 'p', long)]
         project_id: Option<i64>,
         /// Optional summary note.
@@ -140,26 +150,42 @@ pub enum Command {
     Logout,
     /// Print the authenticated user (host + numeric user ID).
     Whoami,
-    /// Close an issue.
+    /// Close an issue or merge request.
     Close {
-        /// Issue IID.
-        iid: i64,
+        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
+        /// bash/zsh).
+        #[arg(value_name = "REF")]
+        issuable: String,
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
         /// Project ID. If omitted, resolved like `tt log`.
         #[arg(short = 'p', long)]
         project_id: Option<i64>,
     },
-    /// Assign yourself to an issue (without removing existing assignees).
+    /// Assign yourself to an issue or merge request (without removing
+    /// existing assignees).
     Assign {
-        /// Issue IID.
-        iid: i64,
+        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
+        /// bash/zsh).
+        #[arg(value_name = "REF")]
+        issuable: String,
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
         /// Project ID. If omitted, resolved like `tt log`.
         #[arg(short = 'p', long)]
         project_id: Option<i64>,
     },
-    /// Remove yourself from an issue's assignee list.
+    /// Remove yourself from an issue's or merge request's assignee list.
     Unassign {
-        /// Issue IID.
-        iid: i64,
+        /// Issue or MR reference (`42`, `#42`, or `!42`; quote sigils in
+        /// bash/zsh).
+        #[arg(value_name = "REF")]
+        issuable: String,
+        /// Treat a bare number as a merge request.
+        #[arg(long)]
+        mr: bool,
         /// Project ID. If omitted, resolved like `tt log`.
         #[arg(short = 'p', long)]
         project_id: Option<i64>,

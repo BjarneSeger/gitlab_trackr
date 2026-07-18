@@ -7,7 +7,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use gitlab_trackr_api::{VarlinkClient, VarlinkClientInterface};
+use gitlab_trackr_api::{IssuableKind, VarlinkClient, VarlinkClientInterface};
 
 use crate::cli::{OutputFormat, QueueAction};
 use crate::{client, config};
@@ -74,8 +74,12 @@ async fn list(client: &VarlinkClient, output: OutputFormat) -> Result<()> {
                 } else {
                     format!(" ({})", f.detail)
                 };
+                let sigil = match f.kind {
+                    IssuableKind::merge_request => '!',
+                    IssuableKind::issue => '#',
+                };
                 println!(
-                    "[{}] {} #{}{}  —  {}  ({})",
+                    "[{}] {} {sigil}{}{}  —  {}  ({})",
                     f.id, f.op, f.iid, detail, f.error, when
                 );
             }
