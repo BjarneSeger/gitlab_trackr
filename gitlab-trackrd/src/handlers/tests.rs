@@ -222,6 +222,10 @@ struct FakeGitlab {
     /// When set, only `fetch_assigned_merge_requests` fails this way — the
     /// other search fetches still serve their canned data.
     assigned_mr_err: Option<FetchErr>,
+    /// When set, per-project search issue/MR fetches for this project fail
+    /// this way; other projects still serve the canned data. Drives the
+    /// tracked sync's skip-inaccessible-project path.
+    project_search_err: Option<(i64, FetchErr)>,
     /// Canned results for the live search fetchers.
     live_issues: Mutex<Vec<SearchIssue>>,
     live_mrs: Mutex<Vec<SearchMr>>,
@@ -405,6 +409,11 @@ impl GitlabApi for FakeGitlab {
         {
             return err_result(err);
         }
+        if let Some((pid, err)) = self.project_search_err
+            && project == Some(pid)
+        {
+            return err_result(err);
+        }
         Ok(self.search_issues.lock().unwrap().clone())
     }
     async fn fetch_merge_requests_for_search(
@@ -421,6 +430,11 @@ impl GitlabApi for FakeGitlab {
         }
         if project.is_none()
             && let Some(err) = self.global_search_err
+        {
+            return err_result(err);
+        }
+        if let Some((pid, err)) = self.project_search_err
+            && project == Some(pid)
         {
             return err_result(err);
         }
@@ -1825,35 +1839,118 @@ pub(crate) fn dormant_with_seeded_corpus() -> (Handlers, tempfile::TempDir) {
 }
 
 #[tokio::test]
-async fn search_live_hits_merge_persist_and_track() {
+async fn search_live_hits_merge_persist_and_track_member_projects_only() {
     let fake = Arc::new(canned_search_fake());
-    // A live hit whose title does NOT contain the needle — the server
-    // matched it in the description, which the corpus doesn't store.
-    let mut desc_hit = search_issue(70, "unrelated words");
-    desc_hit.project_id = 7;
-    *fake.live_issues.lock().unwrap() = vec![desc_hit];
+    // Two live hits whose titles do NOT contain the needle — the server
+    // matched them in descriptions, which the corpus doesn't store. One is
+    // in the member project the seeded corpus knows (4), one in a foreign
+    // project (7) — e.g. a public hit on a shared instance.
+    let mut member_hit = search_issue(60, "unrelated words");
+    member_hit.project_id = 4;
+    let mut foreign_hit = search_issue(70, "other unrelated words");
+    foreign_hit.project_id = 7;
+    *fake.live_issues.lock().unwrap() = vec![member_hit, foreign_hit];
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
-    seed_search_cache(&h); // corpus: issue 1 "OAuth token refresh"
+    seed_search_cache(&h); // corpus: issue 1 "OAuth token refresh", project 4
 
     let reply = run_search(&h, "oauth", None, None).await;
 
     let ids: Vec<i64> = reply.issues.iter().map(|i| i.id).collect();
     assert!(ids.contains(&1), "the local title match is served");
     assert!(
-        ids.contains(&70),
-        "the description-only live hit passes through"
+        ids.contains(&60) && ids.contains(&70),
+        "description-only live hits pass through"
+    );
+    let cached: Vec<i64> = h
+        .search
+        .all_issues()
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert!(
+        cached.contains(&60) && cached.contains(&70),
+        "both live hits land in the corpus"
+    );
+    let tracked: Vec<i64> = h
+        .search
+        .tracked_projects()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(
+        tracked.contains(&4),
+        "the member project's live hit earns a tracked slot"
     );
     assert!(
-        h.search.all_issues().unwrap().iter().any(|i| i.id == 70),
-        "the live hit lands in the corpus"
+        !tracked.contains(&7),
+        "a foreign project's live hit must not enroll it in the background refresh"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_tracked_skips_permanently_rejected_projects() {
+    let fake = Arc::new(FakeGitlab {
+        // Project 5 (history evidence) 403s its per-project fetches; the
+        // sync must skip it and still refresh project 9 and stamp.
+        project_search_err: Some((5, FetchErr::Permanent)),
+        ..canned_search_fake()
+    });
+    let mut mine = search_mr(90, "assigned");
+    mine.project_id = 9;
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let mut event = stored(1, now_secs());
+    event.project_id = 5;
+    h.history.upsert(&[event]).unwrap();
+
+    h.sync_search_cache().await;
+
+    let stamps = h.search.stamps().unwrap();
+    assert!(
+        stamps.last_full_sync_secs > 0,
+        "one inaccessible project must not wedge the sync"
+    );
+    let fetched: Vec<Option<i64>> = fake
+        .search_issue_calls
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _)| *p)
+        .collect();
+    assert_eq!(
+        fetched,
+        vec![Some(5), Some(9)],
+        "the rejected project is attempted, the healthy one still refreshed"
     );
     assert!(
-        h.search
-            .tracked_projects()
-            .unwrap()
-            .iter()
-            .any(|(id, _)| *id == 7),
-        "the live hit's project joins the tracked set"
+        matches!(&*h.session.read().await, ConnState::Connected(_)),
+        "a per-project rejection is not a connectivity problem"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_tracked_transient_project_failure_still_aborts() {
+    let fake = Arc::new(FakeGitlab {
+        project_search_err: Some((9, FetchErr::Transient)),
+        ..canned_search_fake()
+    });
+    let mut mine = search_mr(90, "assigned");
+    mine.project_id = 9;
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    assert_eq!(
+        h.search.stamps().unwrap().last_partial_sync_secs,
+        0,
+        "a network failure aborts the run so the next tick retries"
+    );
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Dormant(_)),
+        "transient per-project failure demotes as usual"
     );
 }
 

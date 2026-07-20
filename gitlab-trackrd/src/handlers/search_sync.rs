@@ -12,9 +12,10 @@
 //! (`auto`, resolving to `tracked`) never enumerates the instance or the
 //! membership: it refreshes only *tracked* projects — those with recent
 //! local evidence of relevance (assigned issues/MRs, time-tracking history,
-//! live-search hits; see [`crate::search::TrackedProject`]) — and a full
-//! sync additionally evicts projects whose evidence went stale, pruning
-//! their corpus entries. The eager modes (`all`, `member`) fetch instance-
+//! member-project live-search hits; see [`crate::search::TrackedProject`])
+//! — and a full sync additionally evicts projects whose evidence went
+//! stale, pruning their corpus entries. A tracked project that permanently
+//! rejects its fetch (403/404) is skipped, never fatal. The eager modes (`all`, `member`) fetch instance-
 //! or membership-wide and reconcile deletions with global keep-sets.
 //! Assigned MRs are always fetched directly (`scope=assigned_to_me`), so the
 //! assigned-MR view never depends on population coverage.
@@ -334,39 +335,66 @@ impl Handlers {
             );
         }
 
+        // A permanent rejection of one project's fetch (403 when a feature
+        // is disabled or access was lost, 404 after deletion) must not
+        // abort the run — that would starve every other tracked project's
+        // refresh forever, since the stamps only advance on success. Skip
+        // the kind and move on: access coming back heals on a later sync,
+        // and a project that stops earning evidence ages out via retention.
+        // Transient failures still abort (and demote) — the network being
+        // down is not a per-project condition.
         let mut issue_count = 0usize;
         let mut mr_count = 0usize;
+        let mut skipped = 0usize;
         for &pid in &tracked {
-            let issues = match gitlab
+            match gitlab
                 .fetch_issues_for_search(Some(pid), updated_after)
                 .await
             {
-                Ok(i) => i,
+                Ok(issues) => {
+                    issue_count += issues.len();
+                    log_store("issues", guard.upsert_issues(&issues));
+                    if full {
+                        let keep: HashSet<u64> = issues.iter().map(|i| i.id as u64).collect();
+                        log_retain("issues", guard.retain_issues_in_project(pid, &keep));
+                    }
+                }
+                Err(e @ Error::Gitlab(_)) => {
+                    warn!(
+                        error = %e,
+                        project = pid,
+                        "tracked project rejected the issue fetch; skipping"
+                    );
+                    skipped += 1;
+                }
                 Err(e) => return self.fail_search_fetch(gitlab, "issues", &e).await,
-            };
-            issue_count += issues.len();
-            log_store("issues", guard.upsert_issues(&issues));
-            if full {
-                let keep: HashSet<u64> = issues.iter().map(|i| i.id as u64).collect();
-                log_retain("issues", guard.retain_issues_in_project(pid, &keep));
             }
 
-            let mrs = match gitlab
+            match gitlab
                 .fetch_merge_requests_for_search(Some(pid), updated_after)
                 .await
             {
-                Ok(m) => m,
+                Ok(mrs) => {
+                    mr_count += mrs.len();
+                    log_store("merge requests", guard.upsert_mrs(&mrs));
+                    if full {
+                        let keep: HashSet<u64> = mrs
+                            .iter()
+                            .chain(assigned_mrs.iter().filter(|m| m.project_id == pid))
+                            .map(|m| m.id as u64)
+                            .collect();
+                        log_retain("merge requests", guard.retain_mrs_in_project(pid, &keep));
+                    }
+                }
+                Err(e @ Error::Gitlab(_)) => {
+                    warn!(
+                        error = %e,
+                        project = pid,
+                        "tracked project rejected the MR fetch; skipping"
+                    );
+                    skipped += 1;
+                }
                 Err(e) => return self.fail_search_fetch(gitlab, "merge requests", &e).await,
-            };
-            mr_count += mrs.len();
-            log_store("merge requests", guard.upsert_mrs(&mrs));
-            if full {
-                let keep: HashSet<u64> = mrs
-                    .iter()
-                    .chain(assigned_mrs.iter().filter(|m| m.project_id == pid))
-                    .map(|m| m.id as u64)
-                    .collect();
-                log_retain("merge requests", guard.retain_mrs_in_project(pid, &keep));
             }
         }
 
@@ -375,6 +403,7 @@ impl Handlers {
             tracked = tracked.len(),
             issues = issue_count,
             merge_requests = mr_count,
+            skipped,
             "tracked search sync complete"
         );
         Outcome::Ok

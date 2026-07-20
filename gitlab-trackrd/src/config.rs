@@ -293,7 +293,8 @@ pub struct SearchConfig {
     /// `"tracked"` (what the default `"auto"` resolves to) populates lazily —
     /// searches ask GitLab directly and cache what they find, and the
     /// background sync refreshes only projects with recent evidence of
-    /// relevance (assigned items, time-tracking history, live-search hits).
+    /// relevance (assigned items, time-tracking history, live-search hits
+    /// in projects you are a member of).
     /// `"all"` eagerly syncs everything your token can see (GitLab
     /// `scope=all`; infeasible on large instances), `"member"` eagerly syncs
     /// every project you are a member of (two fetches per project). Projects

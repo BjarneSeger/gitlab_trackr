@@ -128,7 +128,9 @@ const STAMPS_KEY: &str = "stamps";
 
 /// Per-project bookkeeping for the tracked population mode: a project is
 /// "tracked" while there is recent local evidence of relevance (an assigned
-/// issue/MR, a history entry, or a live-search hit). Keyed by project id.
+/// issue/MR, a history entry, or a live-search hit in a member project —
+/// foreign hits are cached but never enrolled in the background refresh).
+/// Keyed by project id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrackedProject {
     /// UNIX seconds of the most recent evidence; drives inactivity eviction.

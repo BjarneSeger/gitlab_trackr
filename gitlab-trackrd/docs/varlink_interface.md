@@ -167,11 +167,13 @@ Searches the corpus, transparently refreshed: under the default tracked populati
 a connected daemon also asks GitLab live — the dedicated `/search` API for issues
 and MRs (which matches **descriptions** as well as titles), the membership-scoped
 list endpoints for projects and groups — folds the results into the corpus, marks
-their projects as tracked, and merges them into the reply. The live phase is
-bounded by `search.live_limit` (per kind, default 100) and `search.live_deadline_ms`
-(default 3 s); on timeout, per-kind failure, dormancy, an eager population, or a
-repeat of an identical query within `search.live_debounce_secs`, the reply degrades
-to the pure local read. A live failure never disturbs the session.
+their *member* projects as tracked (foreign hits are cached but not enrolled in
+the background refresh), and merges them into the reply. Each kind's live lookup
+is bounded by `search.live_limit` (default 100) and its own
+`search.live_deadline_ms` (default 3 s), so one slow endpoint doesn't discard the
+kinds that answered; on timeout, per-kind failure, dormancy, an eager population,
+or a repeat of an identical query within `search.live_debounce_secs`, the affected
+kinds degrade to the pure local read. A live failure never disturbs the session.
 
 Local matching is a case-insensitive substring test on issue/MR titles and labels
 and on project/group names and paths; a query of the exact form `#123` additionally
@@ -195,9 +197,11 @@ shows both frames.
 
 What the corpus contains depends on `[search] population`: `"tracked"` (what the
 default `"auto"` resolves to) grows it lazily from assigned issues/MRs, recent
-time-tracking history, and live-search hits, and the background sync refreshes only
-those *tracked* projects — a full resync also evicts projects without evidence
-within `search.tracked_retention_hours` (default 90 days) and prunes their entries.
+time-tracking history, and member-project live-search hits, and the background sync
+refreshes only those *tracked* projects, skipping (never failing on) any that
+permanently reject their fetch — a full resync also evicts projects without
+evidence within `search.tracked_retention_hours` (default 90 days) and prunes their
+entries.
 `"all"` (everything the token can see) and `"member"` (every membership project)
 remain as eager modes. Projects and groups are always membership-scoped.
 Issue `graph_status` is filled best-effort from already-cached board labels and is

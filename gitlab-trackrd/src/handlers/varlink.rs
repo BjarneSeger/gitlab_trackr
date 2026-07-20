@@ -390,53 +390,55 @@ impl Handlers {
             return Some(LiveHits::default());
         }
 
-        match tokio::time::timeout(
-            deadline,
-            self.fetch_live_hits(&gitlab, query, want, live_limit),
-        )
-        .await
-        {
-            Ok(hits) => {
-                // Only a fully-answered lookup arms the debounce — a failed
-                // kind (e.g. a rate limit) should be retried by the very
-                // next search, which is a manual, human-paced action.
-                if hits.complete {
-                    self.record_live_search(key, debounce);
-                }
-                self.absorb_live_hits(&hits);
-                Some(hits)
-            }
-            Err(_) => {
-                debug!("live search deadline expired; serving cache only");
-                Some(LiveHits::default())
-            }
+        let hits = self
+            .fetch_live_hits(&gitlab, query, want, live_limit, deadline)
+            .await;
+        // Only a fully-answered lookup arms the debounce — a failed or
+        // timed-out kind (e.g. a rate limit, or a slow instance-wide
+        // /search) should be retried by the very next search, which is a
+        // manual, human-paced action.
+        if hits.complete {
+            self.record_live_search(key, debounce);
         }
+        self.absorb_live_hits(&hits);
+        Some(hits)
     }
 
-    /// The per-kind live fetchers, run concurrently under the caller's
-    /// deadline. Each kind fails independently — a rejected `/search` must
-    /// not blank the kinds that answered — and a failure is a debug log.
+    /// The per-kind live fetchers, run concurrently, each under its own
+    /// `deadline`. Per-kind on purpose: one slow endpoint (instance-wide
+    /// `/search` on a busy instance can exceed any sane budget) must not
+    /// discard the kinds that answered in time. A failure or expiry is a
+    /// debug log, never an error reply.
     async fn fetch_live_hits(
         &self,
         gitlab: &Arc<dyn GitlabApi>,
         query: &str,
         want: &impl Fn(&str) -> bool,
         limit: usize,
+        deadline: Duration,
     ) -> LiveHits {
         /// Run one kind's fetcher when wanted; `(hits, ok)`. The future is
         /// built eagerly but never polled when unwanted.
         async fn arm<T>(
             wanted: bool,
             kind: &'static str,
+            deadline: Duration,
             fut: impl Future<Output = crate::error::Result<Vec<T>>>,
         ) -> (Vec<T>, bool) {
             if !wanted {
                 return (Vec::new(), true);
             }
-            match fut.await {
-                Ok(v) => (v, true),
-                Err(e) => {
+            match tokio::time::timeout(deadline, fut).await {
+                Ok(Ok(v)) => (v, true),
+                Ok(Err(e)) => {
                     debug!(error = %e, kind, "live search fetch failed; serving cache only");
+                    (Vec::new(), false)
+                }
+                Err(_) => {
+                    debug!(
+                        kind,
+                        "live search fetch deadline expired; serving cache only"
+                    );
                     (Vec::new(), false)
                 }
             }
@@ -446,21 +448,25 @@ impl Handlers {
             arm(
                 want("issues"),
                 "issues",
+                deadline,
                 gitlab.search_issues_live(query, limit)
             ),
             arm(
                 want("merge_requests"),
                 "merge requests",
+                deadline,
                 gitlab.search_mrs_live(query, limit)
             ),
             arm(
                 want("projects"),
                 "projects",
+                deadline,
                 gitlab.search_projects_live(query, limit)
             ),
             arm(
                 want("groups"),
                 "groups",
+                deadline,
                 gitlab.search_groups_live(query, limit)
             ),
         );
@@ -496,12 +502,19 @@ impl Handlers {
         recent.insert(key, Instant::now());
     }
 
-    /// Fold live hits into the corpus and mark their projects as tracked, so
-    /// the background partial sync keeps them fresh from here on. Uses the
-    /// non-blocking sync gate: when a background sync holds it, caching is
-    /// skipped — the reply still carries the hits (pass-through), and the
-    /// next search simply re-fetches. Synchronous on purpose: never holds
-    /// the guard across an await.
+    /// Fold live hits into the corpus and mark their *member* projects as
+    /// tracked, so the background partial sync keeps them fresh from here
+    /// on. Member-gated on purpose: an instance-wide `/search` on a shared
+    /// instance returns hits from arbitrary foreign projects — enrolling
+    /// those in the per-project background refresh would balloon the
+    /// tracked set from a single broad query (and foreign projects often
+    /// 403 the per-project endpoints). Non-member hits stay cached and
+    /// searchable until the next full-tier sweep prunes them; repeat
+    /// searches refresh them live anyway. Uses the non-blocking sync gate:
+    /// when a background sync holds it, caching is skipped — the reply
+    /// still carries the hits (pass-through), and the next search simply
+    /// re-fetches. Synchronous on purpose: never holds the guard across an
+    /// await.
     fn absorb_live_hits(&self, hits: &LiveHits) {
         if hits.issues.is_empty()
             && hits.mrs.is_empty()
@@ -534,6 +547,13 @@ impl Handlers {
                 hit
             })
             .collect();
+        let members: HashSet<i64> = match self.search.all_projects() {
+            Ok(projects) => projects.iter().map(|p| p.id).collect(),
+            Err(e) => {
+                warn!(error = %e, "member project read failed; not tracking live hits");
+                HashSet::new()
+            }
+        };
         let stored = guard
             .upsert_issues(&issues)
             .and(guard.upsert_mrs(&hits.mrs))
@@ -544,7 +564,8 @@ impl Handlers {
                     hits.issues
                         .iter()
                         .map(|i| i.project_id)
-                        .chain(hits.mrs.iter().map(|m| m.project_id)),
+                        .chain(hits.mrs.iter().map(|m| m.project_id))
+                        .filter(|id| members.contains(id)),
                     now_secs(),
                 ),
             );
