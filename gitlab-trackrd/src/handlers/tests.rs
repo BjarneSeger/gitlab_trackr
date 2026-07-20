@@ -172,7 +172,7 @@ fn enrich_timelog_mr_falls_back_to_search_corpus() {
 
 /// How a `FakeGitlab` fails its issue / timelog fetches, so the background
 /// refresh tests can drive the runtime-demotion logic.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum FetchErr {
     /// Network failure → `Error::Transient` (should demote to `Unreachable`).
     Transient,
@@ -201,7 +201,7 @@ struct FakeGitlab {
     write_err: Option<FetchErr>,
     /// When set, only the *global* (`project = None`) search issue/MR fetches
     /// fail this way — per-project fetches still serve the canned data.
-    /// Drives the auto-population degrade path.
+    /// Drives the explicit-`all` rejection path.
     global_search_err: Option<FetchErr>,
     /// Canned results for the search-sync fetches.
     search_issues: Mutex<Vec<SearchIssue>>,
@@ -215,6 +215,28 @@ struct FakeGitlab {
     search_mr_calls: Mutex<Vec<(Option<i64>, Option<chrono::DateTime<chrono::Utc>>)>>,
     project_list_calls: AtomicUsize,
     group_list_calls: AtomicUsize,
+    /// Canned result for `fetch_assigned_merge_requests` (default: none
+    /// assigned, so sync tests that don't care get an empty fetch).
+    assigned_mrs: Mutex<Vec<SearchMr>>,
+    assigned_mr_calls: AtomicUsize,
+    /// When set, only `fetch_assigned_merge_requests` fails this way — the
+    /// other search fetches still serve their canned data.
+    assigned_mr_err: Option<FetchErr>,
+    /// Canned results for the live search fetchers.
+    live_issues: Mutex<Vec<SearchIssue>>,
+    live_mrs: Mutex<Vec<SearchMr>>,
+    live_projects: Mutex<Vec<SearchProject>>,
+    live_groups: Mutex<Vec<SearchGroup>>,
+    live_issue_calls: AtomicUsize,
+    live_mr_calls: AtomicUsize,
+    live_project_calls: AtomicUsize,
+    live_group_calls: AtomicUsize,
+    /// When set, every live search fetcher fails this way.
+    live_err: Option<FetchErr>,
+    /// When set, every live search fetcher sleeps this long before returning
+    /// — how the deadline-fallback test fakes a slow instance within the
+    /// no-paused-clock timing rules.
+    live_delay: Option<Duration>,
 }
 
 impl FakeGitlab {
@@ -254,6 +276,23 @@ impl FakeGitlab {
 
     fn board_calls(&self) -> usize {
         self.board_calls.load(Ordering::SeqCst)
+    }
+
+    /// Total live search fetcher invocations across all four kinds.
+    fn live_calls(&self) -> usize {
+        self.live_issue_calls.load(Ordering::SeqCst)
+            + self.live_mr_calls.load(Ordering::SeqCst)
+            + self.live_project_calls.load(Ordering::SeqCst)
+            + self.live_group_calls.load(Ordering::SeqCst)
+    }
+
+    /// Shared prologue of the live fetchers: count, fake slowness, fail.
+    async fn live_gate<T>(&self, counter: &AtomicUsize) -> Option<TrackrResult<Vec<T>>> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        if let Some(d) = self.live_delay {
+            tokio::time::sleep(d).await;
+        }
+        self.live_err.map(err_result)
     }
 
     fn fetch_result<T>(&self) -> TrackrResult<Vec<T>> {
@@ -387,6 +426,16 @@ impl GitlabApi for FakeGitlab {
         }
         Ok(self.search_mrs.lock().unwrap().clone())
     }
+    async fn fetch_assigned_merge_requests(&self) -> TrackrResult<Vec<SearchMr>> {
+        self.assigned_mr_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fetch_err.is_some() {
+            return self.fetch_result();
+        }
+        if let Some(err) = self.assigned_mr_err {
+            return err_result(err);
+        }
+        Ok(self.assigned_mrs.lock().unwrap().clone())
+    }
     async fn fetch_member_projects(&self) -> TrackrResult<Vec<SearchProject>> {
         self.project_list_calls.fetch_add(1, Ordering::SeqCst);
         if self.fetch_err.is_some() {
@@ -400,6 +449,42 @@ impl GitlabApi for FakeGitlab {
             return self.fetch_result();
         }
         Ok(self.search_groups.lock().unwrap().clone())
+    }
+    async fn search_issues_live(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> TrackrResult<Vec<SearchIssue>> {
+        if let Some(err) = self.live_gate(&self.live_issue_calls).await {
+            return err;
+        }
+        Ok(self.live_issues.lock().unwrap().clone())
+    }
+    async fn search_mrs_live(&self, _query: &str, _limit: usize) -> TrackrResult<Vec<SearchMr>> {
+        if let Some(err) = self.live_gate(&self.live_mr_calls).await {
+            return err;
+        }
+        Ok(self.live_mrs.lock().unwrap().clone())
+    }
+    async fn search_projects_live(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> TrackrResult<Vec<SearchProject>> {
+        if let Some(err) = self.live_gate(&self.live_project_calls).await {
+            return err;
+        }
+        Ok(self.live_projects.lock().unwrap().clone())
+    }
+    async fn search_groups_live(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> TrackrResult<Vec<SearchGroup>> {
+        if let Some(err) = self.live_gate(&self.live_group_calls).await {
+            return err;
+        }
+        Ok(self.live_groups.lock().unwrap().clone())
     }
 }
 
@@ -546,6 +631,7 @@ fn handlers_with(state: ConnState) -> (Handlers, tempfile::TempDir) {
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
+            live_search_recent: std::sync::Mutex::new(std::collections::HashMap::new()),
         },
         dir,
     )
@@ -1011,6 +1097,7 @@ async fn search_sync_throttled_while_stamps_fresh() {
 async fn search_sync_cold_cache_runs_full_and_stamps_both() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
 
     h.sync_search_cache().await;
 
@@ -1038,6 +1125,7 @@ async fn search_sync_cold_cache_runs_full_and_stamps_both() {
 async fn search_sync_full_drops_entries_gitlab_no_longer_returns() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
     {
         let g = h.search.try_begin_sync().unwrap();
         g.upsert_issues(&[search_issue(99, "deleted upstream")])
@@ -1063,6 +1151,7 @@ async fn search_sync_full_drops_entries_gitlab_no_longer_returns() {
 async fn search_sync_incremental_uses_overlap_cursor_and_keeps_full_stamp() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
     let now = now_secs();
     // Partial overdue (default interval 1800s), full still fresh.
     let stamps = SyncStamps {
@@ -1156,6 +1245,79 @@ async fn search_sync_permanent_failure_does_not_demote() {
             .await
             .is_err(),
         "no reconnect signal for a permanent error"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_assigned_mrs_feed_corpus_and_assigned_view() {
+    use gitlab_trackr_api::AsyncCall;
+    let fake = Arc::new(canned_search_fake());
+    // The population fetch sees nothing; only the direct assigned fetch
+    // carries the MR (session user is id 1).
+    *fake.search_mrs.lock().unwrap() = vec![];
+    let mut mine = search_mr(50, "assigned but unpopulated");
+    mine.assignees = vec![crate::search::MrAssignee {
+        id: 1,
+        username: "me".into(),
+    }];
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    assert_eq!(fake.assigned_mr_calls.load(Ordering::SeqCst), 1);
+    let ids: Vec<i64> = h.search.all_mrs().unwrap().iter().map(|m| m.id).collect();
+    assert_eq!(ids, vec![50], "assigned MR reached the corpus directly");
+
+    let mut call = AsyncCall::default();
+    h.get_assigned_merge_requests(&mut call as &mut dyn Call_GetAssignedMergeRequests, None)
+        .await
+        .unwrap();
+    let mrs = reply_mrs(&mut call);
+    assert_eq!(
+        mrs.len(),
+        1,
+        "assigned view must not depend on population coverage"
+    );
+    assert_eq!(mrs[0].iid, 500);
+}
+
+#[tokio::test]
+async fn search_sync_full_retain_keeps_assigned_mrs() {
+    let fake = Arc::new(canned_search_fake()); // population serves MR id 1
+    *fake.assigned_mrs.lock().unwrap() = vec![search_mr(50, "assigned only")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await; // zero stamps → full sync with retain
+
+    let mut ids: Vec<i64> = h.search.all_mrs().unwrap().iter().map(|m| m.id).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 50],
+        "full-sync retain must not prune an assigned MR the population fetch missed"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_assigned_mr_transient_failure_leaves_stamps_and_demotes() {
+    let fake = Arc::new(FakeGitlab {
+        assigned_mr_err: Some(FetchErr::Transient),
+        ..canned_search_fake()
+    });
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+
+    h.sync_search_cache().await;
+
+    let stamps = h.search.stamps().unwrap();
+    assert_eq!(
+        (stamps.last_partial_sync_secs, stamps.last_full_sync_secs),
+        (0, 0),
+        "a failed assigned-MR fetch must not advance the stamps"
+    );
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Dormant(_)),
+        "transient assigned-MR fetch failure demotes the session"
     );
 }
 
@@ -1395,6 +1557,7 @@ async fn clear_cache_search_scope_triggers_full_resync_when_connected() {
     use gitlab_trackr_api::AsyncCall;
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
     seed_search_cache(&h);
 
     let mut call = AsyncCall::default();
@@ -1418,82 +1581,498 @@ async fn clear_cache_search_scope_triggers_full_resync_when_connected() {
 }
 
 #[tokio::test]
-async fn search_sync_auto_on_gitlab_com_never_tries_the_global_fetch() {
+async fn search_sync_auto_resolves_to_tracked_on_every_host() {
+    for host in ["gitlab.com", "gitlab.example.com"] {
+        let fake = Arc::new(canned_search_fake());
+        let (h, _dir) = connected_handlers_with_host(Arc::clone(&fake), host);
+
+        h.sync_search_cache().await;
+
+        assert!(
+            fake.search_issue_calls.lock().unwrap().is_empty(),
+            "auto → tracked with no evidence fetches no issues on {host}"
+        );
+        assert!(
+            fake.search_mr_calls.lock().unwrap().is_empty(),
+            "auto → tracked with no evidence fetches no MRs on {host}"
+        );
+        assert_eq!(
+            fake.assigned_mr_calls.load(Ordering::SeqCst),
+            1,
+            "the direct assigned-MR fetch still runs on {host}"
+        );
+        let stamps = h.search.stamps().unwrap();
+        assert!(
+            stamps.last_full_sync_secs > 0,
+            "an evidence-less tracked sync still completes and stamps"
+        );
+        assert!(!stamps.degraded_to_member, "vestigial flag stays false");
+    }
+}
+
+#[tokio::test]
+async fn search_sync_tracked_derives_from_all_evidence_sources() {
     let fake = Arc::new(canned_search_fake());
-    let (h, _dir) = connected_handlers_with_host(Arc::clone(&fake), "gitlab.com");
+    // Evidence: assigned MR in project 9; the direct fetch delivers it.
+    let mut mine = search_mr(90, "assigned");
+    mine.project_id = 9;
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    // Evidence: assigned issue in project 7 (issue cache) and a recent
+    // history entry in project 5.
+    h.cache
+        .put(&[issue(7, 70, "assigned", "https://gl/team/api/-/issues/70")])
+        .unwrap();
+    let mut event = stored(1, now_secs());
+    event.project_id = 5;
+    h.history.upsert(&[event]).unwrap();
 
     h.sync_search_cache().await;
 
     let issue_calls = fake.search_issue_calls.lock().unwrap();
-    assert!(!issue_calls.is_empty());
-    assert!(
-        issue_calls.iter().all(|(p, _)| p.is_some()),
-        "gitlab.com resolves auto to member fetches only: {issue_calls:?}"
+    let fetched: Vec<Option<i64>> = issue_calls.iter().map(|(p, _)| *p).collect();
+    assert_eq!(
+        fetched,
+        vec![Some(5), Some(7), Some(9)],
+        "exactly the evidenced projects are refreshed, in order"
     );
     assert!(
-        !h.search.stamps().unwrap().degraded_to_member,
-        "the host rule is not the degrade flag"
+        issue_calls.iter().all(|(_, cursor)| cursor.is_none()),
+        "cold sync is a full sync — no cursor"
     );
-    assert_eq!(h.search.all_issues().unwrap().len(), 1);
+    drop(issue_calls);
+
+    let mut tracked: Vec<i64> = h
+        .search
+        .tracked_projects()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    tracked.sort_unstable();
+    assert_eq!(tracked, vec![5, 7, 9]);
 }
 
 #[tokio::test]
-async fn search_sync_auto_degrades_to_member_on_global_rejection() {
-    let mut fake = canned_search_fake();
-    fake.global_search_err = Some(FetchErr::Permanent);
-    let fake = Arc::new(fake);
+async fn search_sync_tracked_partial_uses_cursor_per_project() {
+    let fake = Arc::new(canned_search_fake());
+    let mut mine = search_mr(90, "assigned");
+    mine.project_id = 9;
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    let stamps = SyncStamps {
+        last_partial_sync_secs: now - 10_000,
+        last_full_sync_secs: now - 100,
+        schema_version: SEARCH_SCHEMA_VERSION,
+        synced_user_id: 1,
+        ..Default::default()
+    };
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&stamps)
+        .unwrap();
 
     h.sync_search_cache().await;
 
-    {
-        let calls = fake.search_issue_calls.lock().unwrap();
-        assert_eq!(calls[0].0, None, "the global fetch is attempted first");
-        assert!(
-            calls.len() > 1 && calls[1..].iter().all(|(p, _)| p.is_some()),
-            "rejection falls back to member fetches in the same sync: {calls:?}"
-        );
-    }
-    let stamps = h.search.stamps().unwrap();
-    assert!(stamps.degraded_to_member, "fallback is recorded sticky");
-    assert!(
-        stamps.last_full_sync_secs > 0,
-        "the degraded sync still stamps"
+    let issue_calls = fake.search_issue_calls.lock().unwrap();
+    assert_eq!(issue_calls.len(), 1);
+    let (project, cursor) = issue_calls[0];
+    assert_eq!(project, Some(9), "partial refreshes the tracked project");
+    assert_eq!(
+        cursor.expect("partial sync passes a cursor").timestamp() as u64,
+        stamps.last_partial_sync_secs - 300,
+        "cursor is the last partial sync minus the overlap margin"
     );
+}
+
+#[tokio::test]
+async fn search_sync_tracked_full_retains_per_project() {
+    let fake = Arc::new(canned_search_fake());
+    // Tracked evidence for project 9; the per-project fetch serves the
+    // canned issue 1 (project 1), i.e. nothing that vouches for issue 99.
+    let mut mine = search_mr(90, "assigned");
+    mine.project_id = 9;
+    *fake.assigned_mrs.lock().unwrap() = vec![mine];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        let mut stale = search_issue(99, "deleted upstream");
+        stale.project_id = 9;
+        g.upsert_issues(&[stale]).unwrap();
+    }
+
+    h.sync_search_cache().await; // zero stamps → full sync
+
+    let ids: Vec<i64> = h
+        .search
+        .all_issues()
+        .unwrap()
+        .iter()
+        .map(|i| i.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1],
+        "issue 99 reconciled away by the per-project retain; the fetched issue survives"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_tracked_evicts_stale_projects_and_prunes_their_corpus() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // Project 3 was tracked long ago (evidence far outside the 90-day
+    // retention) and left corpus entries behind; no current evidence.
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        g.note_tracked([3], now - 400 * 24 * 3600).unwrap();
+        let mut old = search_issue(30, "from the evicted project");
+        old.project_id = 3;
+        g.upsert_issues(&[old]).unwrap();
+    }
+
+    h.sync_search_cache().await; // zero stamps → full sync
+
+    assert!(
+        h.search.tracked_projects().unwrap().is_empty(),
+        "stale evidence evicts the tracked project"
+    );
+    assert!(
+        h.search.all_issues().unwrap().is_empty(),
+        "the evicted project's corpus entries are pruned"
+    );
+    assert!(
+        fake.search_issue_calls.lock().unwrap().is_empty(),
+        "evicted projects are not refreshed"
+    );
+}
+
+#[tokio::test]
+async fn search_sync_tracked_migration_prunes_eager_leftovers_only_on_full() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    let now = now_secs();
+    // A corpus inherited from an eager population: entries in a project with
+    // no evidence, under valid current-schema stamps.
+    {
+        let g = h.search.try_begin_sync().unwrap();
+        let mut leftover = search_issue(42, "from the all-population era");
+        leftover.project_id = 3;
+        g.upsert_issues(&[leftover]).unwrap();
+        g.set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 10_000,
+            last_full_sync_secs: now - 100,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    h.sync_search_cache().await; // partial: upsert-only, no sweep
+
     assert_eq!(
         h.search.all_issues().unwrap().len(),
         1,
-        "cache populated via the member path"
+        "a partial sync keeps unevidenced leftovers"
+    );
+
+    // Force the full cadence: the sweep drops what nothing vouches for.
+    h.search
+        .try_begin_sync()
+        .unwrap()
+        .set_stamps(&SyncStamps {
+            last_partial_sync_secs: now - 10_000,
+            last_full_sync_secs: 1,
+            schema_version: SEARCH_SCHEMA_VERSION,
+            synced_user_id: 1,
+            ..Default::default()
+        })
+        .unwrap();
+
+    h.sync_search_cache().await;
+
+    assert!(
+        h.search.all_issues().unwrap().is_empty(),
+        "the full-tier sweep prunes corpus entries of never-tracked projects"
+    );
+}
+
+// ── Search: transparent live phase ──────────────────────────────────────
+
+/// Scaffolding for the `service.rs` streaming tests: a connected handler
+/// whose live issue lookup returns one canned hit (id 70, "oauth live") over
+/// a seeded corpus (issue 1 matches "oauth"). `delay` fakes a slow instance.
+pub(crate) fn connected_with_live_hit(delay: Option<Duration>) -> (Handlers, tempfile::TempDir) {
+    let fake = Arc::new(FakeGitlab {
+        live_delay: delay,
+        ..canned_search_fake()
+    });
+    *fake.live_issues.lock().unwrap() = vec![search_issue(70, "oauth live")];
+    let (h, dir) = connected_handlers_shared(fake);
+    seed_search_cache(&h);
+    (h, dir)
+}
+
+/// Dormant handlers over a seeded corpus — the cache-only streaming case.
+pub(crate) fn dormant_with_seeded_corpus() -> (Handlers, tempfile::TempDir) {
+    let (h, dir) = dormant_handlers();
+    seed_search_cache(&h);
+    (h, dir)
+}
+
+#[tokio::test]
+async fn search_live_hits_merge_persist_and_track() {
+    let fake = Arc::new(canned_search_fake());
+    // A live hit whose title does NOT contain the needle — the server
+    // matched it in the description, which the corpus doesn't store.
+    let mut desc_hit = search_issue(70, "unrelated words");
+    desc_hit.project_id = 7;
+    *fake.live_issues.lock().unwrap() = vec![desc_hit];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h); // corpus: issue 1 "OAuth token refresh"
+
+    let reply = run_search(&h, "oauth", None, None).await;
+
+    let ids: Vec<i64> = reply.issues.iter().map(|i| i.id).collect();
+    assert!(ids.contains(&1), "the local title match is served");
+    assert!(
+        ids.contains(&70),
+        "the description-only live hit passes through"
     );
     assert!(
-        matches!(&*h.session.read().await, ConnState::Connected(_)),
-        "a permanent rejection must not demote"
+        h.search.all_issues().unwrap().iter().any(|i| i.id == 70),
+        "the live hit lands in the corpus"
+    );
+    assert!(
+        h.search
+            .tracked_projects()
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == 7),
+        "the live hit's project joins the tracked set"
     );
 }
 
 #[tokio::test]
-async fn search_sync_auto_does_not_degrade_on_transient_global_failure() {
-    let mut fake = canned_search_fake();
-    fake.global_search_err = Some(FetchErr::Transient);
-    let fake = Arc::new(fake);
+async fn search_live_hit_updates_and_dedupes_with_cached_row() {
+    let fake = Arc::new(canned_search_fake());
+    let mut fresher = search_issue(1, "OAuth token refresh (edited)");
+    fresher.updated_at_secs = 999;
+    *fake.live_issues.lock().unwrap() = vec![fresher];
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
 
-    h.sync_search_cache().await;
+    let reply = run_search(&h, "oauth", Some(vec!["issues".into()]), None).await;
 
+    let matching: Vec<_> = reply.issues.iter().filter(|i| i.id == 1).collect();
+    assert_eq!(matching.len(), 1, "one reply row per global id");
     assert_eq!(
-        fake.search_issue_calls.lock().unwrap().len(),
-        1,
-        "a network blip is not a scope problem — no member retry"
+        matching[0].title, "OAuth token refresh (edited)",
+        "the fresher live copy wins"
     );
-    let stamps = h.search.stamps().unwrap();
-    assert_eq!(
-        stamps.last_partial_sync_secs, 0,
-        "failed sync leaves stamps"
-    );
-    assert!(!stamps.degraded_to_member);
+}
+
+#[tokio::test]
+async fn search_live_deadline_falls_back_to_cache() {
+    let fake = Arc::new(FakeGitlab {
+        live_delay: Some(Duration::from_millis(300)),
+        ..canned_search_fake()
+    });
+    *fake.live_issues.lock().unwrap() = vec![search_issue(70, "oauth live")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.live_deadline_ms = 50;
+    seed_search_cache(&h);
+
+    let started = std::time::Instant::now();
+    let reply = run_search(&h, "oauth", Some(vec!["issues".into()]), None).await;
     assert!(
-        matches!(&*h.session.read().await, ConnState::Dormant(_)),
-        "transient failure demotes as usual"
+        started.elapsed() < Duration::from_millis(250),
+        "the deadline bounds the wait"
+    );
+
+    let ids: Vec<i64> = reply.issues.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![1], "cache-only reply after the deadline");
+    assert!(
+        !h.search.all_issues().unwrap().iter().any(|i| i.id == 70),
+        "a timed-out lookup caches nothing"
+    );
+    assert!(
+        matches!(&*h.session.read().await, ConnState::Connected(_)),
+        "a slow instance is not a dead session"
+    );
+}
+
+#[tokio::test]
+async fn search_first_ever_query_works_lazily() {
+    let fake = Arc::new(canned_search_fake());
+    *fake.live_issues.lock().unwrap() = vec![search_issue(70, "oauth live")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    // No seed, zero stamps: the pre-tracked daemon replied empty here.
+
+    let reply = run_search(&h, "oauth", Some(vec!["issues".into()]), None).await;
+
+    let ids: Vec<i64> = reply.issues.iter().map(|i| i.id).collect();
+    assert_eq!(ids, vec![70], "cold cache + live hit → results");
+    assert!(
+        h.search.all_issues().unwrap().iter().any(|i| i.id == 70),
+        "the first search seeds the corpus"
+    );
+}
+
+#[tokio::test]
+async fn search_cold_cache_dormant_is_not_authenticated() {
+    use gitlab_trackr_api::AsyncCall;
+    let (h, _dir) = dormant_handlers();
+
+    let mut call = AsyncCall::default();
+    h.search(
+        &mut call as &mut dyn Call_Search,
+        "anything".to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let reply = call.take_reply().expect("a reply");
+    assert_eq!(
+        reply.error.as_deref(),
+        Some("org.thehoster.gitlab.trackrd.NotAuthenticated"),
+        "never-synced while dormant → honest auth error"
+    );
+}
+
+#[tokio::test]
+async fn search_dormant_serves_cache_without_live_lookup() {
+    let (h, _dir) = dormant_handlers();
+    seed_search_cache(&h);
+
+    let reply = run_search(&h, "oauth", None, None).await;
+    assert_eq!(
+        reply.issues.len(),
+        1,
+        "dormant search stays a pure cache read"
+    );
+}
+
+#[tokio::test]
+async fn search_live_failure_never_demotes() {
+    for err in [FetchErr::Transient, FetchErr::Permanent] {
+        let fake = Arc::new(FakeGitlab {
+            live_err: Some(err),
+            ..canned_search_fake()
+        });
+        let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+        seed_search_cache(&h);
+
+        let reply = run_search(&h, "oauth", None, None).await;
+        assert_eq!(reply.issues.len(), 1, "the cache is still served");
+        assert!(
+            matches!(&*h.session.read().await, ConnState::Connected(_)),
+            "the read path has no demotion authority ({err:?})"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), h.reconnect_signal.notified())
+                .await
+                .is_err(),
+            "no reconnect signal from the live path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_live_debounce_skips_identical_queries() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+
+    run_search(&h, "oauth", None, None).await;
+    run_search(&h, "oauth", None, None).await;
+    assert_eq!(
+        fake.live_issue_calls.load(Ordering::SeqCst),
+        1,
+        "an identical repeat within the window is debounced"
+    );
+
+    run_search(&h, "other", None, None).await;
+    assert_eq!(
+        fake.live_issue_calls.load(Ordering::SeqCst),
+        2,
+        "a different query is not debounced"
+    );
+}
+
+#[tokio::test]
+async fn search_live_debounce_disabled_by_zero() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.live_debounce_secs = 0;
+    seed_search_cache(&h);
+
+    run_search(&h, "oauth", None, None).await;
+    run_search(&h, "oauth", None, None).await;
+    assert_eq!(fake.live_issue_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn search_eager_population_stays_a_pure_cache_read() {
+    let fake = Arc::new(canned_search_fake());
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::Member;
+    seed_search_cache(&h);
+
+    let reply = run_search(&h, "oauth", None, None).await;
+    assert_eq!(reply.issues.len(), 1);
+    assert_eq!(
+        fake.live_calls(),
+        0,
+        "eager populations keep Search fully offline"
+    );
+}
+
+#[tokio::test]
+async fn search_iid_query_filters_live_noise() {
+    let fake = Arc::new(canned_search_fake());
+    // Both live hits matched "#10" only in their descriptions server-side:
+    // one is the real reference (iid 10), one is unrelated noise (iid 999).
+    let mut noise = search_mr(80, "unrelated words");
+    noise.iid = 999;
+    let mut real = search_mr(81, "also unrelated");
+    real.iid = 10;
+    *fake.live_mrs.lock().unwrap() = vec![noise, real];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+
+    let reply = run_search(&h, "#10", Some(vec!["merge_requests".into()]), None).await;
+
+    let iids: Vec<i64> = reply.merge_requests.iter().map(|m| m.iid).collect();
+    assert!(iids.contains(&10), "the exact reference passes");
+    assert!(
+        !iids.contains(&999),
+        "reference queries stay exact — description noise is filtered"
+    );
+}
+
+#[tokio::test]
+async fn search_serves_live_hits_without_caching_while_sync_holds_the_gate() {
+    let fake = Arc::new(canned_search_fake());
+    *fake.live_issues.lock().unwrap() = vec![search_issue(70, "oauth live")];
+    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    seed_search_cache(&h);
+    let guard = h.search.begin_sync().await; // a background sync in flight
+
+    let reply = run_search(&h, "oauth", Some(vec!["issues".into()]), None).await;
+
+    let ids: Vec<i64> = reply.issues.iter().map(|i| i.id).collect();
+    assert!(ids.contains(&70), "live hits are served via pass-through");
+    drop(guard);
+    assert!(
+        !h.search.all_issues().unwrap().iter().any(|i| i.id == 70),
+        "nothing was cached while the gate was held"
     );
 }
 
@@ -1831,6 +2410,7 @@ async fn get_history_joins_queued_mr_titles_from_search_corpus() {
 async fn search_sync_stale_schema_version_forces_full_resync() {
     let fake = Arc::new(canned_search_fake());
     let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
+    h.config.write().unwrap().search.population = SearchPopulation::All;
     let now = now_secs();
     // Perfectly fresh stamps, but written under entry-schema version 0 (rows
     // predate assignee capture). Without the version check this sync would be
@@ -1862,66 +2442,6 @@ async fn search_sync_stale_schema_version_forces_full_resync() {
     assert_eq!(
         stamps.synced_user_id, 1,
         "session user id persisted for the assigned-MR filter"
-    );
-}
-
-#[tokio::test]
-async fn search_sync_degraded_flag_sticks_for_incremental_and_retries_on_full() {
-    let fake = Arc::new(canned_search_fake());
-    let (h, _dir) = connected_handlers_shared(Arc::clone(&fake));
-    let now = now_secs();
-    // Partial overdue, full fresh, degraded set by an earlier rejection.
-    h.search
-        .try_begin_sync()
-        .unwrap()
-        .set_stamps(&SyncStamps {
-            last_partial_sync_secs: now - 10_000,
-            last_full_sync_secs: now - 100,
-            degraded_to_member: true,
-            schema_version: SEARCH_SCHEMA_VERSION,
-            synced_user_id: 1,
-        })
-        .unwrap();
-
-    h.sync_search_cache().await;
-
-    {
-        let calls = fake.search_issue_calls.lock().unwrap();
-        assert!(
-            calls.iter().all(|(p, _)| p.is_some()),
-            "incremental honors the degrade flag: {calls:?}"
-        );
-    }
-    assert!(
-        h.search.stamps().unwrap().degraded_to_member,
-        "flag survives incremental syncs"
-    );
-
-    // Force the full cadence; the global fetch works now (no injected error),
-    // so the full sync recovers to all-population and clears the flag.
-    h.search
-        .try_begin_sync()
-        .unwrap()
-        .set_stamps(&SyncStamps {
-            last_partial_sync_secs: now - 10_000,
-            last_full_sync_secs: 1,
-            degraded_to_member: true,
-            schema_version: SEARCH_SCHEMA_VERSION,
-            synced_user_id: 1,
-        })
-        .unwrap();
-    fake.search_issue_calls.lock().unwrap().clear();
-
-    h.sync_search_cache().await;
-
-    assert_eq!(
-        fake.search_issue_calls.lock().unwrap()[0].0,
-        None,
-        "a due full sync retries the global fetch"
-    );
-    assert!(
-        !h.search.stamps().unwrap().degraded_to_member,
-        "recovery clears the flag"
     );
 }
 
@@ -1997,7 +2517,7 @@ proptest! {
     /// gets either a success reply or the documented eager rejection, and the
     /// read path never issues a GitLab call.
     #[test]
-    fn search_replies_or_rejects_any_arguments_without_touching_gitlab(
+    fn search_replies_or_rejects_any_arguments_and_gates_the_live_lookup(
         query in ".{0,12}",
         kinds in proptest::option::of(proptest::collection::vec("[a-z_]{1,14}", 0..3)),
         limit in proptest::option::of(any::<i64>()),
@@ -2041,8 +2561,15 @@ proptest! {
                 fake.project_list_calls.load(Ordering::SeqCst)
                     + fake.group_list_calls.load(Ordering::SeqCst),
                 0,
-                "the read handler must never touch GitLab"
+                "the read handler must never touch the eager fetch surface"
             );
+            if invalid {
+                assert_eq!(
+                    fake.live_calls(),
+                    0,
+                    "bad args must be rejected before the live lookup runs"
+                );
+            }
             assert!(
                 fake.search_issue_calls.lock().unwrap().is_empty()
                     && fake.search_mr_calls.lock().unwrap().is_empty(),

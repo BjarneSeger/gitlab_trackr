@@ -103,6 +103,7 @@ async fn main() -> Result<()> {
         queue,
         config: Arc::clone(&config),
         reconnect_signal,
+        live_search_recent: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     reload::spawn(Arc::clone(&config));

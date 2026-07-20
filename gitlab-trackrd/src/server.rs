@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use varlink::AsyncConnectionHandler;
 
 use crate::error::Result;
 
@@ -29,8 +28,45 @@ pub fn is_socket_activated() -> bool {
     std::env::var("LISTEN_FDS").as_deref() == Ok("1")
 }
 
+/// The daemon's connection-level dispatcher. A daemon-owned sibling of
+/// `varlink::AsyncConnectionHandler` whose `handle` also receives the
+/// connection's write side, so a method that streams (`more: true` →
+/// several replies with `continues`) can flush earlier replies to the
+/// socket *before* it finishes computing later ones — the whole point of
+/// streaming. Handlers that reply once can ignore `out`; the connection
+/// driver drains any unflushed transmits after `handle` returns.
+#[async_trait::async_trait]
+pub trait ConnectionHandler: Send + Sync {
+    async fn handle(
+        &self,
+        server: &mut varlink::sansio::Server,
+        out: &mut (dyn AsyncWrite + Send + Unpin),
+        upgraded: Option<String>,
+    ) -> varlink::Result<Option<String>>;
+}
+
+/// Write every pending sans-IO transmit to `out` and flush it.
+pub async fn flush_transmits(
+    server: &mut varlink::sansio::Server,
+    out: &mut (dyn AsyncWrite + Send + Unpin),
+) -> varlink::Result<()> {
+    let mut wrote = false;
+    while let Some(transmit) = server.poll_transmit() {
+        out.write_all(&transmit.payload)
+            .await
+            .map_err(|_| varlink::Error(varlink::ErrorKind::ConnectionClosed, None, None))?;
+        wrote = true;
+    }
+    if wrote {
+        out.flush()
+            .await
+            .map_err(|_| varlink::Error(varlink::ErrorKind::ConnectionClosed, None, None))?;
+    }
+    Ok(())
+}
+
 /// Accept loop — runs until the process receives a signal.
-pub async fn serve<H: AsyncConnectionHandler + 'static>(
+pub async fn serve<H: ConnectionHandler + 'static>(
     handler: Arc<H>,
     listener: UnixListener,
 ) -> Result<()> {
@@ -49,7 +85,7 @@ pub async fn serve<H: AsyncConnectionHandler + 'static>(
 }
 
 /// Drive a single varlink connection to completion using the sans-IO state machine.
-async fn handle_connection<H: AsyncConnectionHandler>(
+async fn handle_connection<H: ConnectionHandler>(
     mut stream: UnixStream,
     handler: Arc<H>,
 ) -> varlink::Result<()> {
@@ -68,17 +104,10 @@ async fn handle_connection<H: AsyncConnectionHandler>(
         }
 
         server.handle_input(&buf[..n])?;
-        upgraded_iface = handler.handle(&mut server, upgraded_iface.clone()).await?;
-
-        while let Some(transmit) = server.poll_transmit() {
-            stream
-                .write_all(&transmit.payload)
-                .await
-                .map_err(|_| varlink::Error(varlink::ErrorKind::ConnectionClosed, None, None))?;
-            stream
-                .flush()
-                .await
-                .map_err(|_| varlink::Error(varlink::ErrorKind::ConnectionClosed, None, None))?;
-        }
+        upgraded_iface = handler
+            .handle(&mut server, &mut stream, upgraded_iface.clone())
+            .await?;
+        // Catch-all: whatever the handler didn't flush itself.
+        flush_transmits(&mut server, &mut stream).await?;
     }
 }

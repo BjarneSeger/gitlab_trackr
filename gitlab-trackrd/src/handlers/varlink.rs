@@ -2,7 +2,10 @@
 //! they lean on. Each method is a short cascade: consult the cache, fall back
 //! to GitLab, reply — see the crate module docs for the error conventions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, instrument, warn};
 
@@ -15,10 +18,14 @@ use gitlab_trackr_api::{
 };
 
 use crate::cache::{in_group, namespace_of};
+use crate::config::SearchPopulation;
 use crate::error::{DormancyReason, Error};
-use crate::gitlab::{GitlabClient, Issuable};
+use crate::gitlab::{GitlabApi, GitlabClient, Issuable};
 use crate::history::HistoryCache;
-use crate::search::{SEARCH_SCHEMA_VERSION, SearchIssue, SearchMr, parse_iid_query, text_matches};
+use crate::search::{
+    SEARCH_SCHEMA_VERSION, SearchGroup, SearchIssue, SearchMr, SearchProject, parse_iid_query,
+    text_matches,
+};
 use crate::secrets::{self, Credentials};
 
 use super::refresh::graph_status_from;
@@ -172,6 +179,390 @@ impl Handlers {
             graph_status,
         }
     }
+
+    /// The pure cache-read half of `Search` — phase 1 of a streamed
+    /// (`more: true`) call. Same validation and matching as the full path,
+    /// no live phase, so it replies instantly.
+    pub(crate) async fn search_cached(
+        &self,
+        call: &mut dyn Call_Search,
+        query: String,
+        kinds: Option<Vec<String>>,
+        limit: Option<i64>,
+    ) -> varlink::Result<()> {
+        self.search_impl(call, query, kinds, limit, false).await
+    }
+
+    /// Shared implementation of [`VarlinkInterface::search`] (live phase
+    /// allowed) and [`Handlers::search_cached`] (cache only): validate,
+    /// optionally run the live micro-sync, then read, merge, and wire the
+    /// corpus.
+    #[instrument(skip(self, call))]
+    async fn search_impl(
+        &self,
+        call: &mut dyn Call_Search,
+        query: String,
+        kinds: Option<Vec<String>>,
+        limit: Option<i64>,
+        allow_live: bool,
+    ) -> varlink::Result<()> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return call.reply_gitlab_error("empty search query".to_string());
+        }
+        let limit = match limit {
+            None => DEFAULT_SEARCH_LIMIT,
+            Some(n) if n > 0 => n as usize,
+            Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
+        };
+        let kinds = kinds.unwrap_or_default();
+        if let Some(bad) = kinds.iter().find(|k| !SEARCH_KINDS.contains(&k.as_str())) {
+            return call.reply_gitlab_error(format!(
+                "unknown kind {bad:?} (expected one of: {})",
+                SEARCH_KINDS.join(", ")
+            ));
+        }
+        let want = |k: &str| kinds.is_empty() || kinds.iter().any(|x| x == k);
+
+        // The transparent live phase: under the tracked population with a
+        // connected session, ask GitLab directly — bounded by
+        // `search.live_limit` and `search.live_deadline_ms` — and fold the
+        // results into the corpus before reading it.
+        let live = if allow_live {
+            self.live_search(&query, &needle, &kinds, &want).await
+        } else {
+            None
+        };
+        let live_attempted = live.is_some();
+        let live = live.unwrap_or_default();
+
+        // Cold cache (never synced) without a live phase: mirror
+        // `get_assigned_issues` — an honest NotAuthenticated while dormant,
+        // an empty reply while the first sync is still pending. With a live
+        // phase the reply below already reflects GitLab, stamps or not.
+        if !live_attempted {
+            let never_synced = match self.search.stamps() {
+                Ok(s) => s.last_partial_sync_secs == 0,
+                Err(e) => {
+                    warn!("search stamp read failed, treating as never synced: {e}");
+                    true
+                }
+            };
+            if never_synced {
+                return match self.gitlab().await {
+                    Ok(_) => call.reply(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+                    Err(e) => {
+                        let (reason, detail) = dormant_args(&e);
+                        call.reply_not_authenticated(reason, detail)
+                    }
+                };
+            }
+        }
+
+        let iid_query = parse_iid_query(&query);
+
+        let mut issues: Vec<Issue> = Vec::new();
+        if want("issues") {
+            let mut hits: Vec<SearchIssue> = read_or_empty(self.search.all_issues(), "issues")
+                .into_iter()
+                .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
+                .collect();
+            merge_live(
+                &mut hits,
+                &live.issues,
+                |i| i.id,
+                |i| {
+                    iid_query.is_none()
+                        || search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid)
+                },
+            );
+            hits.sort_by_key(|i| std::cmp::Reverse(i.updated_at_secs));
+            hits.truncate(limit);
+            issues = hits
+                .into_iter()
+                .map(|i| self.wire_search_issue(i))
+                .collect();
+        }
+
+        let mut merge_requests: Vec<MergeRequest> = Vec::new();
+        if want("merge_requests") {
+            let mut hits = read_or_empty(self.search.all_mrs(), "merge requests");
+            hits.retain(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid));
+            merge_live(
+                &mut hits,
+                &live.mrs,
+                |m| m.id,
+                |m| {
+                    iid_query.is_none()
+                        || search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid)
+                },
+            );
+            hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
+            hits.truncate(limit);
+            merge_requests = hits.into_iter().map(wire_mr).collect();
+        }
+
+        let mut projects: Vec<Project> = Vec::new();
+        if want("projects") {
+            let mut hits = read_or_empty(self.search.all_projects(), "projects");
+            hits.retain(|p| text_matches(&needle, &p.name) || text_matches(&needle, &p.path));
+            merge_live(&mut hits, &live.projects, |p| p.id, |_| true);
+            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            hits.truncate(limit);
+            projects = hits
+                .into_iter()
+                .map(|p| Project {
+                    id: p.id,
+                    name: p.name,
+                    path: p.path,
+                    web_url: p.web_url,
+                })
+                .collect();
+        }
+
+        let mut groups: Vec<Group> = Vec::new();
+        if want("groups") {
+            let mut hits = read_or_empty(self.search.all_groups(), "groups");
+            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.path));
+            merge_live(&mut hits, &live.groups, |g| g.id, |_| true);
+            hits.sort_by(|a, b| a.path.cmp(&b.path));
+            hits.truncate(limit);
+            groups = hits
+                .into_iter()
+                .map(|g| Group {
+                    id: g.id,
+                    name: g.name,
+                    path: g.path,
+                    web_url: g.web_url,
+                })
+                .collect();
+        }
+
+        debug!(
+            issues = issues.len(),
+            merge_requests = merge_requests.len(),
+            projects = projects.len(),
+            groups = groups.len(),
+            live = live_attempted,
+            "serving search results"
+        );
+        call.reply(issues, merge_requests, projects, groups)
+    }
+
+    /// Run the bounded live micro-sync for one `Search` call, if eligible.
+    /// `None` means the live phase was not in play (eager population or
+    /// dormant session) and the cold-cache guard applies as it always did;
+    /// `Some` means the transparent path handled the call — possibly with
+    /// empty hits, since debounced repeats, per-kind failures, and deadline
+    /// expiry all degrade to "just the cache". A live problem is never a
+    /// session problem: nothing here demotes or touches the sync stamps.
+    async fn live_search(
+        &self,
+        query: &str,
+        needle: &str,
+        kinds: &[String],
+        want: &impl Fn(&str) -> bool,
+    ) -> Option<LiveHits> {
+        let (tracked_mode, deadline, live_limit, debounce) = {
+            let c = self.config.read().unwrap();
+            (
+                matches!(
+                    c.search.population,
+                    SearchPopulation::Auto | SearchPopulation::Tracked
+                ),
+                c.search.live_deadline(),
+                c.search.live_limit as usize,
+                c.search.live_debounce(),
+            )
+        };
+        if !tracked_mode {
+            return None;
+        }
+        let Ok(gitlab) = self.gitlab().await else {
+            return None;
+        };
+
+        let mut sorted_kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
+        sorted_kinds.sort_unstable();
+        let key = format!("{needle}\x1f{}", sorted_kinds.join(","));
+        if self.live_debounced(&key, debounce) {
+            debug!("live search debounced; serving cache only");
+            return Some(LiveHits::default());
+        }
+
+        match tokio::time::timeout(
+            deadline,
+            self.fetch_live_hits(&gitlab, query, want, live_limit),
+        )
+        .await
+        {
+            Ok(hits) => {
+                // Only a fully-answered lookup arms the debounce — a failed
+                // kind (e.g. a rate limit) should be retried by the very
+                // next search, which is a manual, human-paced action.
+                if hits.complete {
+                    self.record_live_search(key, debounce);
+                }
+                self.absorb_live_hits(&hits);
+                Some(hits)
+            }
+            Err(_) => {
+                debug!("live search deadline expired; serving cache only");
+                Some(LiveHits::default())
+            }
+        }
+    }
+
+    /// The per-kind live fetchers, run concurrently under the caller's
+    /// deadline. Each kind fails independently — a rejected `/search` must
+    /// not blank the kinds that answered — and a failure is a debug log.
+    async fn fetch_live_hits(
+        &self,
+        gitlab: &Arc<dyn GitlabApi>,
+        query: &str,
+        want: &impl Fn(&str) -> bool,
+        limit: usize,
+    ) -> LiveHits {
+        /// Run one kind's fetcher when wanted; `(hits, ok)`. The future is
+        /// built eagerly but never polled when unwanted.
+        async fn arm<T>(
+            wanted: bool,
+            kind: &'static str,
+            fut: impl Future<Output = crate::error::Result<Vec<T>>>,
+        ) -> (Vec<T>, bool) {
+            if !wanted {
+                return (Vec::new(), true);
+            }
+            match fut.await {
+                Ok(v) => (v, true),
+                Err(e) => {
+                    debug!(error = %e, kind, "live search fetch failed; serving cache only");
+                    (Vec::new(), false)
+                }
+            }
+        }
+
+        let (issues, mrs, projects, groups) = tokio::join!(
+            arm(
+                want("issues"),
+                "issues",
+                gitlab.search_issues_live(query, limit)
+            ),
+            arm(
+                want("merge_requests"),
+                "merge requests",
+                gitlab.search_mrs_live(query, limit)
+            ),
+            arm(
+                want("projects"),
+                "projects",
+                gitlab.search_projects_live(query, limit)
+            ),
+            arm(
+                want("groups"),
+                "groups",
+                gitlab.search_groups_live(query, limit)
+            ),
+        );
+        LiveHits {
+            complete: issues.1 && mrs.1 && projects.1 && groups.1,
+            issues: issues.0,
+            mrs: mrs.0,
+            projects: projects.0,
+            groups: groups.0,
+        }
+    }
+
+    /// Whether an identical live lookup completed within the debounce window.
+    fn live_debounced(&self, key: &str, window: Duration) -> bool {
+        if window.is_zero() {
+            return false;
+        }
+        self.live_search_recent
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|done| done.elapsed() < window)
+    }
+
+    /// Arm the debounce for `key`, opportunistically dropping expired
+    /// entries so the map doesn't grow with query diversity.
+    fn record_live_search(&self, key: String, window: Duration) {
+        if window.is_zero() {
+            return;
+        }
+        let mut recent = self.live_search_recent.lock().unwrap();
+        recent.retain(|_, done| done.elapsed() < window);
+        recent.insert(key, Instant::now());
+    }
+
+    /// Fold live hits into the corpus and mark their projects as tracked, so
+    /// the background partial sync keeps them fresh from here on. Uses the
+    /// non-blocking sync gate: when a background sync holds it, caching is
+    /// skipped — the reply still carries the hits (pass-through), and the
+    /// next search simply re-fetches. Synchronous on purpose: never holds
+    /// the guard across an await.
+    fn absorb_live_hits(&self, hits: &LiveHits) {
+        if hits.issues.is_empty()
+            && hits.mrs.is_empty()
+            && hits.projects.is_empty()
+            && hits.groups.is_empty()
+        {
+            return;
+        }
+        let Some(guard) = self.search.try_begin_sync() else {
+            debug!("search sync in flight; serving live hits without caching them");
+            return;
+        };
+        // `/search` issue JSON can omit the epic and time stats; don't let a
+        // live hit blank fields a background sync already filled.
+        let issues: Vec<SearchIssue> = hits
+            .issues
+            .iter()
+            .map(|hit| {
+                let mut hit = hit.clone();
+                if (hit.parent.is_empty() || hit.total_time.is_empty())
+                    && let Ok(Some(prev)) = self.search.issue_by_id(hit.id)
+                {
+                    if hit.parent.is_empty() {
+                        hit.parent = prev.parent;
+                    }
+                    if hit.total_time.is_empty() {
+                        hit.total_time = prev.total_time;
+                    }
+                }
+                hit
+            })
+            .collect();
+        let stored = guard
+            .upsert_issues(&issues)
+            .and(guard.upsert_mrs(&hits.mrs))
+            .and(guard.upsert_projects(&hits.projects))
+            .and(guard.upsert_groups(&hits.groups))
+            .and(
+                guard.note_tracked(
+                    hits.issues
+                        .iter()
+                        .map(|i| i.project_id)
+                        .chain(hits.mrs.iter().map(|m| m.project_id)),
+                    now_secs(),
+                ),
+            );
+        if let Err(e) = stored {
+            warn!(error = %e, "caching live search hits failed; results still served");
+        }
+    }
+}
+
+/// What one `Search` call's live micro-sync brought back.
+#[derive(Default)]
+struct LiveHits {
+    issues: Vec<SearchIssue>,
+    mrs: Vec<SearchMr>,
+    projects: Vec<SearchProject>,
+    groups: Vec<SearchGroup>,
+    /// Every wanted kind answered (no fetch error). Gates the debounce.
+    complete: bool,
 }
 
 /// A cache read for one `Search` kind, degraded to empty on failure so the
@@ -212,6 +603,25 @@ fn wire_mr(m: SearchMr) -> MergeRequest {
         state: m.state,
         assignees: m.assignees.into_iter().map(|a| a.username).collect(),
     }
+}
+
+/// Fold live hits into the locally-matched list: dedupe by global id (a hit
+/// the absorb step already cached shows up in the local read too), and pass
+/// through hits the local matcher would reject — the server side also
+/// matches descriptions, which the corpus doesn't store. `keep` narrows the
+/// pass-through (reference queries stay exact).
+fn merge_live<T: Clone>(
+    local: &mut Vec<T>,
+    live: &[T],
+    id_of: impl Fn(&T) -> i64,
+    keep: impl Fn(&T) -> bool,
+) {
+    let seen: HashSet<i64> = local.iter().map(&id_of).collect();
+    local.extend(
+        live.iter()
+            .filter(|t| !seen.contains(&id_of(t)) && keep(t))
+            .cloned(),
+    );
 }
 
 /// Whether an issue/MR matches the search: case-insensitive substring on the
@@ -325,111 +735,7 @@ impl VarlinkInterface for Handlers {
         kinds: Option<Vec<String>>,
         limit: Option<i64>,
     ) -> varlink::Result<()> {
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            return call.reply_gitlab_error("empty search query".to_string());
-        }
-        let limit = match limit {
-            None => DEFAULT_SEARCH_LIMIT,
-            Some(n) if n > 0 => n as usize,
-            Some(n) => return call.reply_gitlab_error(format!("invalid limit: {n}")),
-        };
-        let kinds = kinds.unwrap_or_default();
-        if let Some(bad) = kinds.iter().find(|k| !SEARCH_KINDS.contains(&k.as_str())) {
-            return call.reply_gitlab_error(format!(
-                "unknown kind {bad:?} (expected one of: {})",
-                SEARCH_KINDS.join(", ")
-            ));
-        }
-        let want = |k: &str| kinds.is_empty() || kinds.iter().any(|x| x == k);
-
-        // Cold cache (never synced): mirror `get_assigned_issues` — an honest
-        // NotAuthenticated while dormant, an empty reply while the first sync
-        // is still pending.
-        let never_synced = match self.search.stamps() {
-            Ok(s) => s.last_partial_sync_secs == 0,
-            Err(e) => {
-                warn!("search stamp read failed, treating as never synced: {e}");
-                true
-            }
-        };
-        if never_synced {
-            return match self.gitlab().await {
-                Ok(_) => call.reply(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                Err(e) => {
-                    let (reason, detail) = dormant_args(&e);
-                    call.reply_not_authenticated(reason, detail)
-                }
-            };
-        }
-
-        let iid_query = parse_iid_query(&query);
-
-        let mut issues: Vec<Issue> = Vec::new();
-        if want("issues") {
-            let mut hits: Vec<SearchIssue> = read_or_empty(self.search.all_issues(), "issues")
-                .into_iter()
-                .filter(|i| search_item_matches(&needle, iid_query, &i.title, &i.labels, i.iid))
-                .collect();
-            hits.sort_by_key(|i| std::cmp::Reverse(i.updated_at_secs));
-            hits.truncate(limit);
-            issues = hits
-                .into_iter()
-                .map(|i| self.wire_search_issue(i))
-                .collect();
-        }
-
-        let mut merge_requests: Vec<MergeRequest> = Vec::new();
-        if want("merge_requests") {
-            let mut hits = read_or_empty(self.search.all_mrs(), "merge requests");
-            hits.retain(|m| search_item_matches(&needle, iid_query, &m.title, &m.labels, m.iid));
-            hits.sort_by_key(|m| std::cmp::Reverse(m.updated_at_secs));
-            hits.truncate(limit);
-            merge_requests = hits.into_iter().map(wire_mr).collect();
-        }
-
-        let mut projects: Vec<Project> = Vec::new();
-        if want("projects") {
-            let mut hits = read_or_empty(self.search.all_projects(), "projects");
-            hits.retain(|p| text_matches(&needle, &p.name) || text_matches(&needle, &p.path));
-            hits.sort_by(|a, b| a.path.cmp(&b.path));
-            hits.truncate(limit);
-            projects = hits
-                .into_iter()
-                .map(|p| Project {
-                    id: p.id,
-                    name: p.name,
-                    path: p.path,
-                    web_url: p.web_url,
-                })
-                .collect();
-        }
-
-        let mut groups: Vec<Group> = Vec::new();
-        if want("groups") {
-            let mut hits = read_or_empty(self.search.all_groups(), "groups");
-            hits.retain(|g| text_matches(&needle, &g.name) || text_matches(&needle, &g.path));
-            hits.sort_by(|a, b| a.path.cmp(&b.path));
-            hits.truncate(limit);
-            groups = hits
-                .into_iter()
-                .map(|g| Group {
-                    id: g.id,
-                    name: g.name,
-                    path: g.path,
-                    web_url: g.web_url,
-                })
-                .collect();
-        }
-
-        debug!(
-            issues = issues.len(),
-            merge_requests = merge_requests.len(),
-            projects = projects.len(),
-            groups = groups.len(),
-            "serving search results from cache"
-        );
-        call.reply(issues, merge_requests, projects, groups)
+        self.search_impl(call, query, kinds, limit, true).await
     }
 
     #[instrument(skip(self, call))]

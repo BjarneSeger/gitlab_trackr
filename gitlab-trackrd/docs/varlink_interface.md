@@ -8,9 +8,12 @@ tier refreshes issues, boards, and the recent timelog window every few minutes, 
 tier re-polls the bulk history daily, and the search corpus (issues, merge requests,
 projects, groups) syncs incrementally via `updated_after` deltas at most every
 `search.partial_interval_secs` (default 30 min) with a full resync — which also
-reconciles deletions — every `search.full_interval_secs` (default weekly). Read
-methods serve whatever was last synced from the local store
-(`$XDG_DATA_HOME/gitlab-trackrd/db/`). Reads never trigger a GitLab round-trip.
+reconciles deletions and evicts stale tracked projects — every
+`search.full_interval_secs` (default weekly). Read methods serve whatever was last
+synced from the local store (`$XDG_DATA_HOME/gitlab-trackrd/db/`), with one deliberate
+exception: `Search` reads through — while connected it also runs a bounded live GitLab
+lookup and folds the results into the corpus before replying (see the `Search`
+section). Every other read never triggers a GitLab round-trip.
 
 **Write model**: mutating methods reply success even when GitLab is unreachable — the
 operation is persisted to a retry queue and drained on reconnect (exponential backoff,
@@ -147,22 +150,34 @@ empty list if a session exists (first sync pending), `NotAuthenticated` otherwis
 ### `GetAssignedMergeRequests(groups: ?[]string) -> (merge_requests: []MergeRequest)`
 
 Open merge requests assigned to the authenticated user, served purely from the
-search corpus (no separate MR cache): the sync captures each MR's assignees plus
-the syncing user's id, and this filters on both — so it works while dormant, and
-freshness follows the **search** cadence (delta every `search.partial_interval_secs`,
-default 30 min), not the issue quick tier. `groups` filters by namespace exactly
-like `GetAssignedIssues`. Replies newest-updated first. When the corpus has never
-been synced (or was synced by a daemon predating assignee capture): empty list if a
-session exists, `NotAuthenticated` otherwise. `ClearCache` scope `search` clears
-and refills this view.
+search corpus (no separate MR cache). Every search sync fetches the assigned MRs
+directly (`scope=assigned_to_me`) — regardless of how broadly `search.population`
+covers the instance — captures each MR's assignees plus the syncing user's id, and
+this filters on both: it works while dormant, and freshness follows the **search**
+cadence (delta every `search.partial_interval_secs`, default 30 min), not the issue
+quick tier. `groups` filters by namespace exactly like `GetAssignedIssues`. Replies
+newest-updated first. When the corpus has never been synced (or was synced by a
+daemon predating assignee capture): empty list if a session exists,
+`NotAuthenticated` otherwise. `ClearCache` scope `search` clears and refills this
+view.
 
 ### `Search(query: string, kinds: ?[]string, limit: ?int) -> (issues: []Issue, merge_requests: []MergeRequest, projects: []Project, groups: []Group)`
 
-Searches the locally cached corpus — a pure cache read, no GitLab round-trip.
-Matching is a case-insensitive substring test on issue/MR titles and labels and on
-project/group names and paths; a query of the exact form `#123` additionally matches
-issues and MRs by their per-project number. Descriptions are not cached and not
-searched.
+Searches the corpus, transparently refreshed: under the default tracked population
+a connected daemon also asks GitLab live — the dedicated `/search` API for issues
+and MRs (which matches **descriptions** as well as titles), the membership-scoped
+list endpoints for projects and groups — folds the results into the corpus, marks
+their projects as tracked, and merges them into the reply. The live phase is
+bounded by `search.live_limit` (per kind, default 100) and `search.live_deadline_ms`
+(default 3 s); on timeout, per-kind failure, dormancy, an eager population, or a
+repeat of an identical query within `search.live_debounce_secs`, the reply degrades
+to the pure local read. A live failure never disturbs the session.
+
+Local matching is a case-insensitive substring test on issue/MR titles and labels
+and on project/group names and paths; a query of the exact form `#123` additionally
+matches issues and MRs by their per-project number — and keeps live results exact
+too (live hits that match neither the text nor the number are dropped).
+Descriptions are not cached, so offline matching does not cover them.
 
 `kinds` restricts the reply to a subset of `issues`, `merge_requests`, `projects`,
 `groups` (omitted or empty = all four; an unknown kind is an eager `GitlabError`).
@@ -170,16 +185,26 @@ searched.
 and MRs come newest-updated first, projects and groups sorted by path. An empty or
 whitespace-only `query` is an eager `GitlabError`.
 
-What the corpus contains depends on the `[search]` daemon config: issues and MRs
-from everything the token can see (`population = "all"`) or only from member
-projects (`"member"`); the default `"auto"` resolves to `"member"` on gitlab.com
-(which rejects the global fetch) and `"all"` elsewhere, falling back to `"member"`
-until the next full resync if the instance rejects the global fetch too. Projects
-and groups are always membership-scoped.
+**Streaming** (`"more": true` on the call): the daemon replies twice — first the
+instant local corpus results with `"continues": true`, then, after the live lookup,
+the merged results as the terminal reply. The frame count is deterministic: an
+error is always a single terminal frame, a success always exactly two (while
+dormant the second frame just repeats the cache read), so clients may count frames
+instead of parsing `continues`. `tt search` uses this; `varlinkctl call --more`
+shows both frames.
+
+What the corpus contains depends on `[search] population`: `"tracked"` (what the
+default `"auto"` resolves to) grows it lazily from assigned issues/MRs, recent
+time-tracking history, and live-search hits, and the background sync refreshes only
+those *tracked* projects — a full resync also evicts projects without evidence
+within `search.tracked_retention_hours` (default 90 days) and prunes their entries.
+`"all"` (everything the token can see) and `"member"` (every membership project)
+remain as eager modes. Projects and groups are always membership-scoped.
 Issue `graph_status` is filled best-effort from already-cached board labels and is
 empty for projects the board cache has never seen. When the cache has never been
-synced: replies with empty arrays if a session exists (first sync pending),
-`NotAuthenticated` otherwise.
+synced: a connected call under the tracked population still runs the live lookup
+and replies with whatever it finds; otherwise — empty arrays if a session exists
+(first sync pending), `NotAuthenticated` when dormant.
 
 ### `GetHistory(days: ?int) -> (events: []HistoryEvent)`
 
@@ -261,7 +286,7 @@ each scope string selects a slice:
 | scope    | clears                                              | re-fetches            |
 |----------|-----------------------------------------------------|-----------------------|
 | `issues` | assigned-issues and board caches                    | (next quick refresh)  |
-| `search` | search corpus (issues, MRs, projects, groups — incl. the assigned-MR view) and its sync stamps | full search resync |
+| `search` | search corpus (issues, MRs, projects, groups — incl. the assigned-MR view), the tracked-project set, and the sync stamps | full search resync |
 | `quick`  | history inside the quick window (last `refresh.quick.window_hours`) | that window |
 | `slow`   | history between the quick and slow windows          | the slow window       |
 | `stale`  | history older than the slow window                  | the full retention window, then prunes |

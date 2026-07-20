@@ -103,6 +103,11 @@ pub struct Handlers {
     /// waking the background reconnect supervisor so it re-engages at once instead
     /// of only at startup.
     pub reconnect_signal: Arc<Notify>,
+    /// Completion times of recent successful live search lookups, keyed by
+    /// normalized query + kinds — the `search.live_debounce_secs` state. In
+    /// memory on purpose: a restart forgetting the debounce only costs one
+    /// extra live lookup. A `std::sync::Mutex` (never held across an await).
+    pub live_search_recent: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 impl Handlers {

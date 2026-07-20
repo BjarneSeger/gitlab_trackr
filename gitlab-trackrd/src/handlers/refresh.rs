@@ -153,11 +153,13 @@ impl Handlers {
         self.prune_history();
     }
 
-    /// Warm the caches from scratch: refresh issues/boards, then backfill the
-    /// full history window. Order matters — history enrichment reads project IDs
-    /// from the issue cache, so issues must land first; when the stamp-gated
-    /// refresh skips, enrichment reads the *persisted* issue cache, so the
-    /// guarantee holds across restarts (a first boot has zero stamps and runs
+    /// Warm the caches from scratch: refresh issues/boards, then the search
+    /// corpus, then backfill the full history window. Order matters — the
+    /// tracked search sync reads the issue cache for evidence, and history
+    /// enrichment reads project IDs from the issue cache and MR titles from
+    /// the search corpus, so both must land first; when a stamp-gated step
+    /// skips, its consumers read the *persisted* caches, so the guarantee
+    /// holds across restarts (a first boot has zero stamps and runs
     /// everything). All steps are no-ops while dormant and gate on their
     /// persisted stamps, so a warm-up shortly after the last run — a restart,
     /// a reconnect flap — does not re-poll GitLab. Shared by the startup
@@ -165,8 +167,8 @@ impl Handlers {
     /// (which zeroes the stamps first).
     pub async fn warm_up(&self) {
         self.refresh_cache().await;
-        self.backfill_history().await;
         self.sync_search_cache().await;
+        self.backfill_history().await;
     }
 
     /// The shared due-check prologue: read the persisted stamps and evaluate

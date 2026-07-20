@@ -99,10 +99,10 @@ pub const SEARCH_SCHEMA_VERSION: u32 = 1;
 pub struct SyncStamps {
     pub last_partial_sync_secs: u64,
     pub last_full_sync_secs: u64,
-    /// Set when `population = "auto"` fell back to member-project fetches
-    /// because the instance rejected the global `scope=all` fetch; honored by
-    /// incremental syncs and retried (cleared on success) at the next full
-    /// sync. `serde(default)` keeps stamps written before this field readable.
+    /// Vestigial: the pre-tracked `auto` population set this when the
+    /// instance rejected the global `scope=all` fetch. `auto` no longer
+    /// attempts global fetches, so the flag is always written `false`; it
+    /// stays on the struct so persisted stamps from either era parse.
     #[serde(default)]
     pub degraded_to_member: bool,
     /// The entry-schema version the corpus was written under; see
@@ -123,7 +123,19 @@ const SEARCH_MRS_KEYSPACE: &str = "search_mrs_v1";
 const SEARCH_PROJECTS_KEYSPACE: &str = "search_projects_v1";
 const SEARCH_GROUPS_KEYSPACE: &str = "search_groups_v1";
 const SEARCH_META_KEYSPACE: &str = "search_meta_v1";
+const SEARCH_TRACKED_KEYSPACE: &str = "search_tracked_v1";
 const STAMPS_KEY: &str = "stamps";
+
+/// Per-project bookkeeping for the tracked population mode: a project is
+/// "tracked" while there is recent local evidence of relevance (an assigned
+/// issue/MR, a history entry, or a live-search hit). Keyed by project id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedProject {
+    /// UNIX seconds of the most recent evidence; drives inactivity eviction.
+    /// Deliberately local recency — GitLab's `updated_at` says nothing about
+    /// whether *this user* still cares about the project.
+    pub last_evidence_secs: u64,
+}
 
 /// Entry types keyed by their global GitLab id.
 trait HasId {
@@ -147,6 +159,7 @@ pub struct SearchCache {
     projects: KvStore<u64, SearchProject>,
     groups: KvStore<u64, SearchGroup>,
     meta: KvStore<&'static str, SyncStamps>,
+    tracked: KvStore<u64, TrackedProject>,
     /// Serializes mutations: warm-up, the periodic loop, and `ClearCache` can
     /// all race. Sync losers [`SearchCache::try_begin_sync`] and skip — a
     /// second concurrent sync would only duplicate work — while `ClearCache`'s
@@ -170,6 +183,7 @@ impl SearchCache {
             projects: KvStore::open(db, SEARCH_PROJECTS_KEYSPACE)?,
             groups: KvStore::open(db, SEARCH_GROUPS_KEYSPACE)?,
             meta: KvStore::open(db, SEARCH_META_KEYSPACE)?,
+            tracked: KvStore::open(db, SEARCH_TRACKED_KEYSPACE)?,
             sync_gate: Mutex::new(()),
         })
     }
@@ -225,6 +239,18 @@ impl SearchCache {
     pub fn all_groups(&self) -> Result<Vec<SearchGroup>> {
         self.groups.scan(|_, v| Ok(v))
     }
+
+    /// Every tracked project with its bookkeeping, unordered.
+    pub fn tracked_projects(&self) -> Result<Vec<(i64, TrackedProject)>> {
+        self.tracked.scan(|k, v| Ok((k as i64, v)))
+    }
+
+    /// Point read of one issue by global id — the live search uses it to
+    /// patch fields `/search` omits (epic, time stats) from an existing
+    /// richer row before upserting.
+    pub fn issue_by_id(&self, id: i64) -> Result<Option<SearchIssue>> {
+        self.issues.get(id as u64)
+    }
 }
 
 impl SyncGuard<'_> {
@@ -264,6 +290,69 @@ impl SyncGuard<'_> {
         retain(&self.cache.groups, keep)
     }
 
+    /// Record evidence of relevance for `project_ids` at `now`. Existing
+    /// entries keep their most recent evidence (max-merge), so replaying an
+    /// old evidence source can never age a project.
+    pub fn note_tracked(&self, project_ids: impl IntoIterator<Item = i64>, now: u64) -> Result<()> {
+        for id in project_ids {
+            let key = id as u64;
+            let last = self
+                .cache
+                .tracked
+                .get(key)?
+                .map(|t| t.last_evidence_secs)
+                .unwrap_or(0);
+            if now > last {
+                self.cache.tracked.put(
+                    key,
+                    &TrackedProject {
+                        last_evidence_secs: now,
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop tracked entries whose last evidence predates `cutoff_secs` and
+    /// return their project ids — the inactivity half of retention. The
+    /// caller prunes the corpus via [`SyncGuard::prune_untracked`].
+    pub fn evict_tracked(&self, cutoff_secs: u64) -> Result<Vec<i64>> {
+        let stale: Vec<u64> = self
+            .cache
+            .tracked
+            .scan(|k, t: TrackedProject| Ok((t.last_evidence_secs < cutoff_secs).then_some(k)))?
+            .into_iter()
+            .flatten()
+            .collect();
+        let mut evicted = Vec::with_capacity(stale.len());
+        for key in stale {
+            self.cache.tracked.remove(key)?;
+            evicted.push(key as i64);
+        }
+        Ok(evicted)
+    }
+
+    /// Remove issues of `project_id` whose id is not in `keep` — the
+    /// per-project deletion half of a tracked full sync. Entries of other
+    /// projects are untouched.
+    pub fn retain_issues_in_project(&self, project_id: i64, keep: &HashSet<u64>) -> Result<usize> {
+        retain_in_project(&self.cache.issues, project_id, keep, |i| i.project_id)
+    }
+
+    /// MR counterpart of [`SyncGuard::retain_issues_in_project`].
+    pub fn retain_mrs_in_project(&self, project_id: i64, keep: &HashSet<u64>) -> Result<usize> {
+        retain_in_project(&self.cache.mrs, project_id, keep, |m| m.project_id)
+    }
+
+    /// Drop every issue and MR whose project is not in `tracked` — the
+    /// corpus half of the eviction sweep. Returns `(issues, mrs)` removed.
+    pub fn prune_untracked(&self, tracked: &HashSet<i64>) -> Result<(usize, usize)> {
+        let issues = prune_by_project(&self.cache.issues, tracked, |i| i.project_id)?;
+        let mrs = prune_by_project(&self.cache.mrs, tracked, |m| m.project_id)?;
+        Ok((issues, mrs))
+    }
+
     /// Apply `f` to the cached MR at `(project_id, iid)`, if any. Returns
     /// whether a row was updated. Used by the write handlers to reflect a
     /// close/unassign immediately instead of waiting for the next sync.
@@ -288,13 +377,14 @@ impl SyncGuard<'_> {
         Ok(true)
     }
 
-    /// Drop every entry of every kind *and* the sync stamps, so the next sync
-    /// runs full.
+    /// Drop every entry of every kind, the tracked set, *and* the sync
+    /// stamps, so the next sync runs full.
     pub fn clear(&self) -> Result<()> {
         self.cache.issues.clear()?;
         self.cache.mrs.clear()?;
         self.cache.projects.clear()?;
         self.cache.groups.clear()?;
+        self.cache.tracked.clear()?;
         self.cache.meta.clear()
     }
 }
@@ -318,6 +408,46 @@ fn retain<T: Serialize + DeserializeOwned>(
 ) -> Result<usize> {
     let stale: Vec<u64> = store
         .scan(|k, _| Ok((!keep.contains(&k)).then_some(k)))?
+        .into_iter()
+        .flatten()
+        .collect();
+    let count = stale.len();
+    for key in stale {
+        store.remove(key)?;
+    }
+    Ok(count)
+}
+
+/// Remove entries of `project_id` whose key is not in `keep` — the scoped
+/// variant of [`retain`] used by tracked full syncs, which only ever fetch
+/// one project at a time and so can only vouch for that project.
+fn retain_in_project<T: Serialize + DeserializeOwned>(
+    store: &KvStore<u64, T>,
+    project_id: i64,
+    keep: &HashSet<u64>,
+    project_of: impl Fn(&T) -> i64,
+) -> Result<usize> {
+    let stale: Vec<u64> = store
+        .scan(|k, v| Ok((project_of(&v) == project_id && !keep.contains(&k)).then_some(k)))?
+        .into_iter()
+        .flatten()
+        .collect();
+    let count = stale.len();
+    for key in stale {
+        store.remove(key)?;
+    }
+    Ok(count)
+}
+
+/// Remove entries whose project is not in `tracked`. Returns the removed
+/// count.
+fn prune_by_project<T: Serialize + DeserializeOwned>(
+    store: &KvStore<u64, T>,
+    tracked: &HashSet<i64>,
+    project_of: impl Fn(&T) -> i64,
+) -> Result<usize> {
+    let stale: Vec<u64> = store
+        .scan(|k, v| Ok((!tracked.contains(&project_of(&v))).then_some(k)))?
         .into_iter()
         .flatten()
         .collect();
@@ -567,6 +697,7 @@ mod tests {
         g.upsert_mrs(&[mr(1, "m")]).unwrap();
         g.upsert_projects(&[project(1, "team/p")]).unwrap();
         g.upsert_groups(&[group(1, "team")]).unwrap();
+        g.note_tracked([1], 100).unwrap();
         g.set_stamps(&SyncStamps {
             last_partial_sync_secs: 1,
             last_full_sync_secs: 1,
@@ -580,8 +711,90 @@ mod tests {
         assert!(c.all_mrs().unwrap().is_empty());
         assert!(c.all_projects().unwrap().is_empty());
         assert!(c.all_groups().unwrap().is_empty());
+        assert!(c.tracked_projects().unwrap().is_empty());
         assert_eq!(c.stamps().unwrap().last_partial_sync_secs, 0);
         assert_eq!(c.stamps().unwrap().last_full_sync_secs, 0);
+    }
+
+    #[test]
+    fn note_tracked_max_merges_evidence() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        g.note_tracked([1, 2], 100).unwrap();
+        g.note_tracked([1], 50).unwrap(); // older evidence must not age it
+        g.note_tracked([2], 200).unwrap();
+
+        let mut tracked = c.tracked_projects().unwrap();
+        tracked.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            tracked
+                .iter()
+                .map(|(id, t)| (*id, t.last_evidence_secs))
+                .collect::<Vec<_>>(),
+            vec![(1, 100), (2, 200)]
+        );
+    }
+
+    #[test]
+    fn evict_tracked_drops_only_stale_entries() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        g.note_tracked([1], 100).unwrap();
+        g.note_tracked([2], 500).unwrap();
+
+        let evicted = g.evict_tracked(300).unwrap();
+        assert_eq!(evicted, vec![1]);
+
+        let tracked = c.tracked_projects().unwrap();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].0, 2);
+    }
+
+    #[test]
+    fn retain_in_project_touches_only_that_project() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        let mut foreign = issue(3, "other project");
+        foreign.project_id = 2;
+        g.upsert_issues(&[issue(1, "keep"), issue(2, "drop"), foreign])
+            .unwrap();
+        let mut foreign_mr = mr(30, "other project");
+        foreign_mr.project_id = 2;
+        g.upsert_mrs(&[mr(10, "drop"), foreign_mr]).unwrap();
+
+        assert_eq!(
+            g.retain_issues_in_project(1, &HashSet::from([1])).unwrap(),
+            1,
+            "only issue 2 (project 1, not kept) goes"
+        );
+        assert_eq!(
+            g.retain_mrs_in_project(1, &HashSet::new()).unwrap(),
+            1,
+            "only MR 10 (project 1) goes"
+        );
+
+        let mut ids: Vec<i64> = c.all_issues().unwrap().iter().map(|i| i.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 3], "the other project's issue is untouched");
+        let ids: Vec<i64> = c.all_mrs().unwrap().iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![30], "the other project's MR is untouched");
+    }
+
+    #[test]
+    fn prune_untracked_drops_foreign_projects() {
+        let (c, _td) = cache();
+        let g = c.try_begin_sync().unwrap();
+        let mut foreign = issue(2, "untracked");
+        foreign.project_id = 9;
+        g.upsert_issues(&[issue(1, "tracked"), foreign]).unwrap();
+        let mut foreign_mr = mr(20, "untracked");
+        foreign_mr.project_id = 9;
+        g.upsert_mrs(&[mr(10, "tracked"), foreign_mr]).unwrap();
+
+        let (issues, mrs) = g.prune_untracked(&HashSet::from([1])).unwrap();
+        assert_eq!((issues, mrs), (1, 1));
+        assert_eq!(c.all_issues().unwrap()[0].id, 1);
+        assert_eq!(c.all_mrs().unwrap()[0].id, 10);
     }
 
     #[test]
@@ -595,6 +808,7 @@ mod tests {
             let c = SearchCache::open(&db).unwrap();
             let g = c.try_begin_sync().unwrap();
             g.upsert_issues(&[issue(1, "persisted")]).unwrap();
+            g.note_tracked([5], 7).unwrap();
             g.set_stamps(&SyncStamps {
                 last_partial_sync_secs: 7,
                 last_full_sync_secs: 7,
@@ -606,6 +820,15 @@ mod tests {
         let c = SearchCache::open(&db).unwrap();
         assert_eq!(c.all_issues().unwrap()[0].title, "persisted");
         assert_eq!(c.stamps().unwrap().last_full_sync_secs, 7);
+        assert_eq!(
+            c.tracked_projects().unwrap(),
+            vec![(
+                5,
+                TrackedProject {
+                    last_evidence_secs: 7
+                }
+            )]
+        );
     }
 
     #[test]

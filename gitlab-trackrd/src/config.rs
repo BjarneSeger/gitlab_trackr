@@ -289,15 +289,15 @@ impl ReconnectConfig {
 /// restarting the daemon inside the partial interval does not re-poll GitLab.
 #[derive(Debug, ConfiqueConfig)]
 pub struct SearchConfig {
-    /// What the search cache holds for issues and merge requests: `"all"`
-    /// syncs everything your token can see (GitLab `scope=all`; on very large
-    /// instances the initial sync can be huge — prefer `"member"` there),
-    /// `"member"` only what is in projects you are a member of. The default
-    /// `"auto"` picks for you: `"member"` on gitlab.com (which rejects the
-    /// global fetch outright), `"all"` on self-hosted instances — falling back
-    /// to `"member"` until the next full resync if the instance rejects the
-    /// global fetch too. Projects and groups themselves are always
-    /// membership-scoped.
+    /// What the search cache holds for issues and merge requests:
+    /// `"tracked"` (what the default `"auto"` resolves to) populates lazily —
+    /// searches ask GitLab directly and cache what they find, and the
+    /// background sync refreshes only projects with recent evidence of
+    /// relevance (assigned items, time-tracking history, live-search hits).
+    /// `"all"` eagerly syncs everything your token can see (GitLab
+    /// `scope=all`; infeasible on large instances), `"member"` eagerly syncs
+    /// every project you are a member of (two fetches per project). Projects
+    /// and groups themselves are always membership-scoped.
     #[config(default = "auto")]
     pub population: SearchPopulation,
 
@@ -310,6 +310,29 @@ pub struct SearchConfig {
     /// items. (7 days by default.)
     #[config(default = 604800)]
     pub full_interval_secs: u64,
+
+    /// Total time budget in milliseconds for the live GitLab lookup a search
+    /// may run while connected; on timeout the reply falls back to cached
+    /// results only. (3 seconds by default.)
+    #[config(default = 3000)]
+    pub live_deadline_ms: u64,
+
+    /// Per-kind cap on results a search's live GitLab lookup fetches.
+    /// (100 by default.)
+    #[config(default = 100)]
+    pub live_limit: u64,
+
+    /// Seconds during which repeating an identical search skips the live
+    /// GitLab lookup and serves the cache; 0 disables the debounce. (30 by
+    /// default.)
+    #[config(default = 30)]
+    pub live_debounce_secs: u64,
+
+    /// Hours a project stays tracked — its issues and MRs kept searchable
+    /// offline and refreshed by the background sync — after the last evidence
+    /// of relevance. (90 days by default.)
+    #[config(default = 2160)]
+    pub tracked_retention_hours: u64,
 }
 
 /// Which issues/MRs the search cache is populated with — see
@@ -317,14 +340,17 @@ pub struct SearchConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SearchPopulation {
-    /// Resolve per host: `Member` on gitlab.com, otherwise `All` with an
-    /// automatic fallback to `Member` when the instance rejects the global
-    /// fetch (see `handlers/search_sync.rs`).
+    /// What the daemon thinks is best; currently resolves to `Tracked` on
+    /// every host.
     Auto,
     /// Everything the token can see (`scope=all` on the global endpoints).
     All,
     /// Only projects the user is a member of (one fetch per project).
     Member,
+    /// Lazy population: live search lookups feed the corpus, and the
+    /// background sync refreshes only projects with recent evidence of
+    /// relevance (see `handlers/search_sync.rs`).
+    Tracked,
 }
 
 impl SearchConfig {
@@ -336,6 +362,21 @@ impl SearchConfig {
     /// Gap between full resyncs.
     pub fn full_interval(&self) -> Duration {
         Duration::from_secs(self.full_interval_secs)
+    }
+
+    /// Time budget for a search's live GitLab lookup.
+    pub fn live_deadline(&self) -> Duration {
+        Duration::from_millis(self.live_deadline_ms)
+    }
+
+    /// Window during which an identical search skips the live lookup.
+    pub fn live_debounce(&self) -> Duration {
+        Duration::from_secs(self.live_debounce_secs)
+    }
+
+    /// Tracked-project inactivity eviction window.
+    pub fn tracked_retention(&self) -> Duration {
+        Duration::from_hours(self.tracked_retention_hours)
     }
 }
 
@@ -421,6 +462,31 @@ fn normalize_search(search: &mut SearchConfig) {
         );
         search.full_interval_secs = search.partial_interval_secs;
     }
+    if search.live_deadline_ms < 50 {
+        warn!(
+            configured = search.live_deadline_ms,
+            "search.live_deadline_ms below 50 leaves no time for any live lookup; flooring to 50"
+        );
+        search.live_deadline_ms = 50;
+    }
+    if search.live_limit == 0 {
+        warn!("search.live_limit of 0 would fetch nothing; flooring to 1");
+        search.live_limit = 1;
+    }
+    if search.live_limit > 500 {
+        warn!(
+            configured = search.live_limit,
+            "search.live_limit above 500 strains the instance on every search; capping to 500"
+        );
+        search.live_limit = 500;
+    }
+    if search.tracked_retention_hours < 24 {
+        warn!(
+            configured = search.tracked_retention_hours,
+            "search.tracked_retention_hours below 24 would evict projects near-immediately; flooring to 24"
+        );
+        search.tracked_retention_hours = 24;
+    }
 }
 
 /// Load once and wrap for sharing across the daemon's tasks. Used at startup; a
@@ -494,6 +560,16 @@ mod tests {
         assert_eq!(c.search.population, SearchPopulation::Auto);
         assert_eq!(c.search.partial_interval(), Duration::from_secs(1800));
         assert_eq!(c.search.full_interval(), Duration::from_secs(604800));
+        assert_eq!(c.search.live_deadline(), Duration::from_millis(3000));
+        assert_eq!(c.search.live_limit, 100);
+        assert_eq!(c.search.live_debounce(), Duration::from_secs(30));
+        assert_eq!(c.search.tracked_retention(), Duration::from_hours(2160));
+    }
+
+    #[test]
+    fn search_population_parses_tracked() {
+        let s: SearchPopulation = serde_json::from_str(r#""tracked""#).unwrap();
+        assert_eq!(s, SearchPopulation::Tracked);
     }
 
     proptest! {
@@ -530,6 +606,32 @@ mod tests {
                 prop_assert_eq!(
                     (s.partial_interval_secs, s.full_interval_secs),
                     (partial_in, full_in),
+                    "in-range values are left untouched"
+                );
+            }
+        }
+
+        #[test]
+        fn normalize_search_clamps_the_live_and_tracked_knobs(
+            deadline_in in any::<u64>(),
+            limit_in in any::<u64>(),
+            debounce_in in any::<u64>(),
+            retention_in in any::<u64>(),
+        ) {
+            let mut s = defaults().search;
+            s.live_deadline_ms = deadline_in;
+            s.live_limit = limit_in;
+            s.live_debounce_secs = debounce_in;
+            s.tracked_retention_hours = retention_in;
+            normalize_search(&mut s);
+            prop_assert!(s.live_deadline_ms >= 50);
+            prop_assert!((1..=500).contains(&s.live_limit));
+            prop_assert_eq!(s.live_debounce_secs, debounce_in, "0 is a valid off switch");
+            prop_assert!(s.tracked_retention_hours >= 24);
+            if deadline_in >= 50 && (1..=500).contains(&limit_in) && retention_in >= 24 {
+                prop_assert_eq!(
+                    (s.live_deadline_ms, s.live_limit, s.tracked_retention_hours),
+                    (deadline_in, limit_in, retention_in),
                     "in-range values are left untouched"
                 );
             }

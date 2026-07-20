@@ -846,10 +846,43 @@ mod tests {
         ) -> TrackrResult<Vec<crate::search::SearchMr>> {
             unimplemented!()
         }
+        async fn fetch_assigned_merge_requests(
+            &self,
+        ) -> TrackrResult<Vec<crate::search::SearchMr>> {
+            unimplemented!()
+        }
         async fn fetch_member_projects(&self) -> TrackrResult<Vec<crate::search::SearchProject>> {
             unimplemented!()
         }
         async fn fetch_member_groups(&self) -> TrackrResult<Vec<crate::search::SearchGroup>> {
+            unimplemented!()
+        }
+        async fn search_issues_live(
+            &self,
+            _q: &str,
+            _l: usize,
+        ) -> TrackrResult<Vec<crate::search::SearchIssue>> {
+            unimplemented!()
+        }
+        async fn search_mrs_live(
+            &self,
+            _q: &str,
+            _l: usize,
+        ) -> TrackrResult<Vec<crate::search::SearchMr>> {
+            unimplemented!()
+        }
+        async fn search_projects_live(
+            &self,
+            _q: &str,
+            _l: usize,
+        ) -> TrackrResult<Vec<crate::search::SearchProject>> {
+            unimplemented!()
+        }
+        async fn search_groups_live(
+            &self,
+            _q: &str,
+            _l: usize,
+        ) -> TrackrResult<Vec<crate::search::SearchGroup>> {
             unimplemented!()
         }
     }

@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use tokio::io::AsyncWrite;
 use tracing::{debug, warn};
 use varlink::Reply;
 use varlink::sansio::ServerEvent;
@@ -49,11 +50,15 @@ impl ServiceHandler {
     }
 }
 
+/// The `Search` method name — the one method with a streaming (`more`) path.
+const SEARCH_METHOD: &str = "org.thehoster.gitlab.trackrd.Search";
+
 #[async_trait::async_trait]
-impl varlink::AsyncConnectionHandler for ServiceHandler {
+impl crate::server::ConnectionHandler for ServiceHandler {
     async fn handle(
         &self,
         server: &mut varlink::sansio::Server,
+        out: &mut (dyn AsyncWrite + Send + Unpin),
         _upgraded: Option<String>,
     ) -> varlink::Result<Option<String>> {
         while let Some(event) = server.poll_event() {
@@ -63,6 +68,15 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
                     let method = request.method.as_ref();
                     let reply = if let Some(reply) = handle_varlink_meta(method, &request) {
                         Some(reply)
+                    } else if method == SEARCH_METHOD && request.more == Some(true) {
+                        handle_search_streamed(
+                            request.parameters.clone(),
+                            &self.handlers,
+                            server,
+                            out,
+                        )
+                        .await?;
+                        None
                     } else if method.starts_with("org.thehoster.gitlab.trackrd.") {
                         handle_trackrd(method, request.parameters, &self.handlers).await?
                     } else {
@@ -81,6 +95,74 @@ impl varlink::AsyncConnectionHandler for ServiceHandler {
         }
         Ok(None)
     }
+}
+
+/// `Search` with `more: true` — the streaming path: an instant reply from the
+/// local corpus, flushed to the socket with `continues: true`, then the full
+/// transparent search (live micro-sync + merge) as the terminal reply.
+///
+/// The frame count is deliberately deterministic: an error is one terminal
+/// frame (varlink errors always end an exchange), a success is exactly two —
+/// even while dormant, where phase 2 degrades to a cache re-read. varlink
+/// 13's async client does not expose the `continues` flag, so `tt` counts
+/// frames instead of reading it; this contract is documented in
+/// `docs/varlink_interface.md`.
+async fn handle_search_streamed(
+    params: Option<serde_json::Value>,
+    handlers: &Handlers,
+    server: &mut varlink::sansio::Server,
+    out: &mut (dyn AsyncWrite + Send + Unpin),
+) -> varlink::Result<()> {
+    let Some(args_val) = params else {
+        return server.send_reply(Reply::error(
+            "org.varlink.service.InvalidParameter",
+            Some(serde_json::json!({"parameter": "parameters"})),
+        ));
+    };
+    let args: Search_Args = serde_json::from_value(args_val).map_err(|e| {
+        varlink::Error(
+            varlink::ErrorKind::InvalidParameter(e.to_string()),
+            None,
+            None,
+        )
+    })?;
+
+    // Phase 1: the pure cache read, served immediately.
+    let mut call = AsyncCall::default();
+    handlers
+        .search_cached(
+            &mut call as &mut dyn Call_Search,
+            args.query.clone(),
+            args.kinds.clone(),
+            args.limit,
+        )
+        .await?;
+    let Some(mut first) = call.take_reply() else {
+        return Ok(());
+    };
+    if first.error.is_some() {
+        return server.send_reply(first);
+    }
+    first.continues = Some(true);
+    server.send_reply(first)?;
+    // The flush is the point: the cached frame must hit the socket before
+    // the live fetch spends its deadline.
+    crate::server::flush_transmits(server, out).await?;
+
+    // Phase 2: the transparent search; its reply ends the exchange.
+    let mut call = AsyncCall::default();
+    handlers
+        .search(
+            &mut call as &mut dyn Call_Search,
+            args.query,
+            args.kinds,
+            args.limit,
+        )
+        .await?;
+    if let Some(reply) = call.take_reply() {
+        server.send_reply(reply)?;
+    }
+    Ok(())
 }
 
 /// Replies for the framework-level `org.varlink.service.*` methods, or `None`
@@ -401,6 +483,173 @@ async fn handle_trackrd(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::Duration;
+
+    use crate::server::ConnectionHandler as _;
+
+    /// One NUL-terminated varlink request frame.
+    fn frame(method: &str, params: serde_json::Value, more: bool) -> Vec<u8> {
+        let mut req = serde_json::json!({
+            "method": method,
+            "parameters": params,
+        });
+        if more {
+            req["more"] = serde_json::Value::Bool(true);
+        }
+        let mut bytes = serde_json::to_vec(&req).unwrap();
+        bytes.push(0);
+        bytes
+    }
+
+    fn search_frame(query: &str, more: bool) -> Vec<u8> {
+        frame(
+            "org.thehoster.gitlab.trackrd.Search",
+            serde_json::json!({"query": query, "kinds": ["issues"]}),
+            more,
+        )
+    }
+
+    /// Feed one request frame through the dispatcher and split the wire
+    /// output back into parsed reply frames.
+    async fn drive_frames(handler: &ServiceHandler, input: &[u8]) -> Vec<serde_json::Value> {
+        let mut server = varlink::sansio::Server::new();
+        server.handle_input(input).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        handler.handle(&mut server, &mut out, None).await.unwrap();
+        crate::server::flush_transmits(&mut server, &mut out)
+            .await
+            .unwrap();
+        out.split(|b| *b == 0)
+            .filter(|f| !f.is_empty())
+            .map(|f| serde_json::from_slice(f).unwrap())
+            .collect()
+    }
+
+    fn issue_ids(reply: &serde_json::Value) -> Vec<i64> {
+        reply["parameters"]["issues"]
+            .as_array()
+            .expect("issues array")
+            .iter()
+            .map(|i| i["id"].as_i64().unwrap())
+            .collect()
+    }
+
+    fn continues(reply: &serde_json::Value) -> bool {
+        reply.get("continues").and_then(|v| v.as_bool()) == Some(true)
+    }
+
+    #[tokio::test]
+    async fn search_with_more_streams_cached_then_live_merged() {
+        let (h, _dir) = crate::handlers::tests::connected_with_live_hit(None);
+        let handler = ServiceHandler::new(Arc::new(h));
+
+        let frames = drive_frames(&handler, &search_frame("oauth", true)).await;
+
+        assert_eq!(frames.len(), 2, "streamed search replies twice: {frames:?}");
+        assert!(continues(&frames[0]), "the cached frame carries continues");
+        assert_eq!(
+            issue_ids(&frames[0]),
+            vec![1],
+            "phase 1 is the local corpus only"
+        );
+        assert!(!continues(&frames[1]), "the merged frame ends the exchange");
+        assert!(
+            issue_ids(&frames[1]).contains(&70),
+            "phase 2 folds in the live hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_with_more_while_dormant_still_sends_two_frames() {
+        let (h, _dir) = crate::handlers::tests::dormant_with_seeded_corpus();
+        let handler = ServiceHandler::new(Arc::new(h));
+
+        let frames = drive_frames(&handler, &search_frame("oauth", true)).await;
+
+        // A success is ALWAYS two frames — the client counts frames because
+        // varlink 13's async client hides the continues flag. Dormant phase 2
+        // is just the cache re-read.
+        assert_eq!(frames.len(), 2, "deterministic frame count: {frames:?}");
+        assert!(continues(&frames[0]));
+        assert_eq!(issue_ids(&frames[0]), vec![1]);
+        assert!(!continues(&frames[1]));
+        assert_eq!(issue_ids(&frames[1]), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn search_with_more_rejects_bad_args_with_one_error_frame() {
+        let (h, _dir) = crate::handlers::tests::connected_with_live_hit(None);
+        let handler = ServiceHandler::new(Arc::new(h));
+
+        let frames = drive_frames(&handler, &search_frame("", true)).await;
+
+        assert_eq!(frames.len(), 1, "errors always end the exchange");
+        assert!(!continues(&frames[0]));
+        assert_eq!(
+            frames[0]["error"].as_str(),
+            Some("org.thehoster.gitlab.trackrd.GitlabError")
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_more_replies_once_with_the_live_merge() {
+        let (h, _dir) = crate::handlers::tests::connected_with_live_hit(None);
+        let handler = ServiceHandler::new(Arc::new(h));
+
+        let frames = drive_frames(&handler, &search_frame("oauth", false)).await;
+
+        assert_eq!(frames.len(), 1, "no more flag → the single bounded reply");
+        assert!(!continues(&frames[0]));
+        assert!(
+            issue_ids(&frames[0]).contains(&70),
+            "the single reply already carries the live merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_with_more_flushes_the_cached_frame_before_the_live_fetch() {
+        use tokio::io::AsyncReadExt;
+
+        let (h, _dir) =
+            crate::handlers::tests::connected_with_live_hit(Some(Duration::from_millis(400)));
+        let handler = ServiceHandler::new(Arc::new(h));
+        let (mut client, mut daemon_side) = tokio::io::duplex(64 * 1024);
+
+        let drive = async {
+            let mut server = varlink::sansio::Server::new();
+            server.handle_input(&search_frame("oauth", true)).unwrap();
+            handler
+                .handle(&mut server, &mut daemon_side, None)
+                .await
+                .unwrap();
+            crate::server::flush_transmits(&mut server, &mut daemon_side)
+                .await
+                .unwrap();
+        };
+        let read_first_frame = async {
+            let started = std::time::Instant::now();
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                client.read_exact(&mut byte).await.unwrap();
+                if byte[0] == 0 {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+            let reply: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+            (reply, started.elapsed())
+        };
+
+        let ((), (first, elapsed)) = tokio::join!(drive, read_first_frame);
+        assert!(continues(&first));
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "the cached frame must hit the wire while the live fetch is still \
+             sleeping (took {elapsed:?})"
+        );
+    }
 
     /// Pins the hand-written dispatch above: a method that exists in the
     /// generated `VarlinkInterface` trait but has no arm in `handle_trackrd`

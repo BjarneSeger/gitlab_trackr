@@ -4,10 +4,20 @@
 //! schedule via the cache-global [`SyncStamps`]: an incremental sync
 //! (`updated_after` deltas, upsert-only) runs at most once per
 //! `search.partial_interval_secs`, and a full resync — which also reconciles
-//! deletions by dropping entries GitLab no longer returns — once per
-//! `search.full_interval_secs`. Both stamps persist, so a daemon restart
-//! inside the partial window costs GitLab nothing, and the very first sync
-//! (zeroed stamps) is automatically a full one.
+//! deletions — once per `search.full_interval_secs`. Both stamps persist, so
+//! a daemon restart inside the partial window costs GitLab nothing, and the
+//! very first sync (zeroed stamps) is automatically a full one.
+//!
+//! Issue/MR population is governed by `search.population`. The default
+//! (`auto`, resolving to `tracked`) never enumerates the instance or the
+//! membership: it refreshes only *tracked* projects — those with recent
+//! local evidence of relevance (assigned issues/MRs, time-tracking history,
+//! live-search hits; see [`crate::search::TrackedProject`]) — and a full
+//! sync additionally evicts projects whose evidence went stale, pruning
+//! their corpus entries. The eager modes (`all`, `member`) fetch instance-
+//! or membership-wide and reconcile deletions with global keep-sets.
+//! Assigned MRs are always fetched directly (`scope=assigned_to_me`), so the
+//! assigned-MR view never depends on population coverage.
 //!
 //! [`Handlers::sync_search_cache`] is entirely self-gating, so the warm-up,
 //! the periodic loop, and `ClearCache` can all call it unconditionally. The
@@ -23,7 +33,7 @@ use tracing::{debug, info, warn};
 use crate::config::SearchPopulation;
 use crate::error::Error;
 use crate::gitlab::GitlabApi;
-use crate::search::{SEARCH_SCHEMA_VERSION, SyncGuard, SyncStamps};
+use crate::search::{SEARCH_SCHEMA_VERSION, SearchMr, SearchProject, SyncGuard, SyncStamps};
 
 use super::{Handlers, now_secs};
 
@@ -34,10 +44,14 @@ use super::{Handlers, now_secs};
 const UPDATED_AFTER_OVERLAP: Duration = Duration::from_secs(300);
 
 /// Issue count after a full `all`-population sync above which we warn that
-/// `population = "member"` is probably the better fit. Near gitlab.com's
+/// a leaner population is probably the better fit. Near gitlab.com's
 /// offset-pagination cap; a corpus this size works but strains the instance
 /// and the initial sync.
 const LARGE_CORPUS_WARN: usize = 50_000;
+
+/// Tracked-project count above which we warn: per-project refreshes at this
+/// scale approach the eager `member` cost the tracked mode exists to avoid.
+const LARGE_TRACKED_WARN: usize = 500;
 
 /// What `SearchPopulation` resolved to for one sync run — `Auto` is gone by
 /// the time fetches happen.
@@ -45,6 +59,7 @@ const LARGE_CORPUS_WARN: usize = 50_000;
 enum Population {
     All,
     Member,
+    Tracked,
 }
 
 /// How one [`Handlers::sync_all_kinds`] run ended.
@@ -54,15 +69,9 @@ enum Outcome {
     Failed,
     /// The *global* (`scope=all`) issues/MR fetch was rejected outright
     /// (permanent error, e.g. gitlab.com's 500 on unfiltered `scope=all`).
-    /// Under `population = "auto"` the caller retries the sync with
-    /// [`Population::Member`].
+    /// Only reachable under an explicit `population = "all"`; the caller
+    /// logs advice to switch populations.
     GlobalRejected,
-}
-
-/// gitlab.com rejects the unfiltered global `scope=all` fetch outright, so
-/// `population = "auto"` never attempts it there.
-fn is_gitlab_com(host: &str) -> bool {
-    host.eq_ignore_ascii_case("gitlab.com")
 }
 
 impl Handlers {
@@ -128,29 +137,10 @@ impl Handlers {
         let user_id = session.user_id;
         let gitlab = session.gitlab;
 
-        // Resolve `auto` against the host and the sticky degrade flag. The
-        // flag is honored between full syncs only — a due full sync retries
-        // the global fetch, so a recovered instance heals automatically.
-        let auto = population == SearchPopulation::Auto;
-        let mut degraded = false;
-        let mut effective = match population {
+        let effective = match population {
             SearchPopulation::All => Population::All,
             SearchPopulation::Member => Population::Member,
-            SearchPopulation::Auto => {
-                if is_gitlab_com(&session.host) {
-                    debug!("population=auto on gitlab.com; using member fetches");
-                    Population::Member
-                } else if !full_due && stamps.degraded_to_member {
-                    debug!(
-                        "population=auto is degraded to member fetches; \
-                         the global fetch is retried at the next full sync"
-                    );
-                    degraded = true;
-                    Population::Member
-                } else {
-                    Population::All
-                }
-            }
+            SearchPopulation::Auto | SearchPopulation::Tracked => Population::Tracked,
         };
 
         // Captured before any fetch so the next incremental cursor overlaps
@@ -164,27 +154,14 @@ impl Handlers {
                 .unwrap_or_else(chrono::Utc::now)
         });
 
-        let mut outcome = self
+        let outcome = self
             .sync_all_kinds(&guard, &gitlab, effective, updated_after)
             .await;
         if outcome == Outcome::GlobalRejected {
-            if auto {
-                warn!(
-                    "instance rejected the global scope=all fetch; degrading to \
-                     member-project fetches until the next full sync \
-                     (set [search] population explicitly to silence this)"
-                );
-                degraded = true;
-                effective = Population::Member;
-                outcome = self
-                    .sync_all_kinds(&guard, &gitlab, effective, updated_after)
-                    .await;
-            } else {
-                warn!(
-                    "instance rejected the global scope=all fetch; \
-                     consider [search] population = \"member\""
-                );
-            }
+            warn!(
+                "instance rejected the global scope=all fetch; \
+                 consider [search] population = \"tracked\" or \"member\""
+            );
         }
         if outcome != Outcome::Ok {
             return;
@@ -197,7 +174,7 @@ impl Handlers {
             } else {
                 stamps.last_full_sync_secs
             },
-            degraded_to_member: degraded,
+            degraded_to_member: false,
             schema_version: SEARCH_SCHEMA_VERSION,
             synced_user_id: user_id,
         };
@@ -208,14 +185,15 @@ impl Handlers {
 
     /// Fetch and store every kind. `updated_after = None` is the full resync:
     /// issues and MRs are fetched in full and entries GitLab no longer returns
-    /// are dropped. `Some(cursor)` is the incremental sync: issues and MRs are
+    /// are dropped (globally for the eager populations, per tracked project
+    /// otherwise). `Some(cursor)` is the incremental sync: issues and MRs are
     /// delta-fetched and upserted only. Projects and groups are always the
     /// full membership lists — they are small and have no reliable delta
-    /// filter — so they stay exact on every sync.
+    /// filter — so they stay exact on every sync, as do the directly-fetched
+    /// assigned MRs.
     ///
     /// A permanent rejection of a *global* (`Population::All`) issue/MR fetch
-    /// returns [`Outcome::GlobalRejected`] so the auto-population caller can
-    /// retry with member fetches; any other fetch failure is
+    /// returns [`Outcome::GlobalRejected`]; any other fetch failure is
     /// [`Outcome::Failed`]. Already-landed upserts are idempotent and
     /// harmless, and each kind's deletion diff runs only after its own
     /// successful fetch.
@@ -226,8 +204,6 @@ impl Handlers {
         population: Population,
         updated_after: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Outcome {
-        let full = updated_after.is_none();
-
         let projects = match gitlab.fetch_member_projects().await {
             Ok(p) => p,
             Err(e) => return self.fail_search_fetch(gitlab, "projects", &e).await,
@@ -244,8 +220,183 @@ impl Handlers {
         let keep: HashSet<u64> = groups.iter().map(|g| g.id as u64).collect();
         log_retain("groups", guard.retain_groups(&keep));
 
-        let issues = match population {
-            Population::All => match gitlab.fetch_issues_for_search(None, updated_after).await {
+        // Assigned MRs are fetched directly (`scope=assigned_to_me`) so the
+        // assigned-MR view never depends on how broadly the population below
+        // covers the instance. Runs for every population mode — one cheap
+        // call — and its ids join the full-sync keep-sets so a population
+        // fetch that misses them can't prune them right back out.
+        let assigned_mrs = match gitlab.fetch_assigned_merge_requests().await {
+            Ok(m) => m,
+            Err(e) => {
+                return self
+                    .fail_search_fetch(gitlab, "assigned merge requests", &e)
+                    .await;
+            }
+        };
+        log_store("assigned merge requests", guard.upsert_mrs(&assigned_mrs));
+
+        match population {
+            Population::Tracked => {
+                self.sync_tracked(guard, gitlab, updated_after, &assigned_mrs)
+                    .await
+            }
+            Population::All => {
+                self.sync_eager(guard, gitlab, true, updated_after, &assigned_mrs, &projects)
+                    .await
+            }
+            Population::Member => {
+                self.sync_eager(
+                    guard,
+                    gitlab,
+                    false,
+                    updated_after,
+                    &assigned_mrs,
+                    &projects,
+                )
+                .await
+            }
+        }
+    }
+
+    /// The tracked population: refresh only projects with recent local
+    /// evidence of relevance. Never enumerates the membership, so the cost
+    /// scales with what the user actually touches, not with the instance.
+    async fn sync_tracked(
+        &self,
+        guard: &SyncGuard<'_>,
+        gitlab: &Arc<dyn GitlabApi>,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+        assigned_mrs: &[SearchMr],
+    ) -> Outcome {
+        let full = updated_after.is_none();
+        let retention = { self.config.read().unwrap().search.tracked_retention() };
+        let now = now_secs();
+        let cutoff = now.saturating_sub(retention.as_secs());
+
+        // Evidence pass: every project seen in the assigned-issue cache, the
+        // direct assigned-MR fetch, or the recent history window re-earns its
+        // tracked slot now. Live-search hits add theirs at search time. Local
+        // read failures only cost evidence freshness, never the sync.
+        let mut evidence: HashSet<i64> = assigned_mrs.iter().map(|m| m.project_id).collect();
+        match self.cache.get() {
+            Ok(issues) => evidence.extend(issues.into_iter().flatten().map(|i| i.project_id)),
+            Err(e) => {
+                warn!(error = %e, "tracked sync: issue cache read failed; evidence incomplete");
+            }
+        }
+        match self.history.all_since(cutoff) {
+            Ok(events) => evidence.extend(events.iter().map(|t| t.project_id)),
+            Err(e) => warn!(error = %e, "tracked sync: history read failed; evidence incomplete"),
+        }
+        if let Err(e) = guard.note_tracked(evidence, now) {
+            warn!(error = %e, "tracked sync: evidence write failed");
+        }
+
+        // Retention sweep, full tier only: drop projects whose evidence went
+        // stale, then their (now unrefreshed-forever) corpus leftovers. Also
+        // the migration path that shrinks a corpus inherited from an eager
+        // population down to the tracked set.
+        if full {
+            match guard.evict_tracked(cutoff) {
+                Ok(evicted) if evicted.is_empty() => {}
+                Ok(evicted) => info!(
+                    count = evicted.len(),
+                    "evicted tracked projects without recent evidence"
+                ),
+                Err(e) => warn!(error = %e, "tracked sync: eviction failed"),
+            }
+        }
+
+        let mut tracked: Vec<i64> = match self.search.tracked_projects() {
+            Ok(t) => t.into_iter().map(|(id, _)| id).collect(),
+            Err(e) => {
+                warn!(error = %e, "tracked sync: tracked set read failed");
+                return Outcome::Failed;
+            }
+        };
+        tracked.sort_unstable();
+
+        if full {
+            let keep: HashSet<i64> = tracked.iter().copied().collect();
+            match guard.prune_untracked(&keep) {
+                Ok((0, 0)) => {}
+                Ok((issues, mrs)) => {
+                    info!(issues, mrs, "pruned corpus entries of untracked projects");
+                }
+                Err(e) => warn!(error = %e, "tracked sync: corpus prune failed"),
+            }
+        }
+
+        if tracked.len() > LARGE_TRACKED_WARN {
+            warn!(
+                count = tracked.len(),
+                "tracked project set is very large; per-project refreshes will strain GitLab"
+            );
+        }
+
+        let mut issue_count = 0usize;
+        let mut mr_count = 0usize;
+        for &pid in &tracked {
+            let issues = match gitlab
+                .fetch_issues_for_search(Some(pid), updated_after)
+                .await
+            {
+                Ok(i) => i,
+                Err(e) => return self.fail_search_fetch(gitlab, "issues", &e).await,
+            };
+            issue_count += issues.len();
+            log_store("issues", guard.upsert_issues(&issues));
+            if full {
+                let keep: HashSet<u64> = issues.iter().map(|i| i.id as u64).collect();
+                log_retain("issues", guard.retain_issues_in_project(pid, &keep));
+            }
+
+            let mrs = match gitlab
+                .fetch_merge_requests_for_search(Some(pid), updated_after)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => return self.fail_search_fetch(gitlab, "merge requests", &e).await,
+            };
+            mr_count += mrs.len();
+            log_store("merge requests", guard.upsert_mrs(&mrs));
+            if full {
+                let keep: HashSet<u64> = mrs
+                    .iter()
+                    .chain(assigned_mrs.iter().filter(|m| m.project_id == pid))
+                    .map(|m| m.id as u64)
+                    .collect();
+                log_retain("merge requests", guard.retain_mrs_in_project(pid, &keep));
+            }
+        }
+
+        info!(
+            full,
+            tracked = tracked.len(),
+            issues = issue_count,
+            merge_requests = mr_count,
+            "tracked search sync complete"
+        );
+        Outcome::Ok
+    }
+
+    /// The eager populations: `global` fetches the instance-wide `scope=all`
+    /// endpoints once, otherwise one fetch per membership project. Deletion
+    /// reconciliation uses global keep-sets, which is only sound because the
+    /// fetch covered the whole population.
+    async fn sync_eager(
+        &self,
+        guard: &SyncGuard<'_>,
+        gitlab: &Arc<dyn GitlabApi>,
+        global: bool,
+        updated_after: Option<chrono::DateTime<chrono::Utc>>,
+        assigned_mrs: &[SearchMr],
+        projects: &[SearchProject],
+    ) -> Outcome {
+        let full = updated_after.is_none();
+
+        let issues = if global {
+            match gitlab.fetch_issues_for_search(None, updated_after).await {
                 Ok(i) => i,
                 Err(e) => {
                     let rejected = matches!(e, Error::Gitlab(_));
@@ -256,20 +407,19 @@ impl Handlers {
                         Outcome::Failed
                     };
                 }
-            },
-            Population::Member => {
-                let mut acc = Vec::new();
-                for p in &projects {
-                    match gitlab
-                        .fetch_issues_for_search(Some(p.id), updated_after)
-                        .await
-                    {
-                        Ok(i) => acc.extend(i),
-                        Err(e) => return self.fail_search_fetch(gitlab, "issues", &e).await,
-                    }
-                }
-                acc
             }
+        } else {
+            let mut acc = Vec::new();
+            for p in projects {
+                match gitlab
+                    .fetch_issues_for_search(Some(p.id), updated_after)
+                    .await
+                {
+                    Ok(i) => acc.extend(i),
+                    Err(e) => return self.fail_search_fetch(gitlab, "issues", &e).await,
+                }
+            }
+            acc
         };
         log_store("issues", guard.upsert_issues(&issues));
         if full {
@@ -277,43 +427,44 @@ impl Handlers {
             log_retain("issues", guard.retain_issues(&keep));
         }
 
-        let mrs = match population {
-            Population::All => {
+        let mrs = if global {
+            match gitlab
+                .fetch_merge_requests_for_search(None, updated_after)
+                .await
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    let rejected = matches!(e, Error::Gitlab(_));
+                    self.fail_search_fetch(gitlab, "merge requests", &e).await;
+                    return if rejected {
+                        Outcome::GlobalRejected
+                    } else {
+                        Outcome::Failed
+                    };
+                }
+            }
+        } else {
+            let mut acc = Vec::new();
+            for p in projects {
                 match gitlab
-                    .fetch_merge_requests_for_search(None, updated_after)
+                    .fetch_merge_requests_for_search(Some(p.id), updated_after)
                     .await
                 {
-                    Ok(m) => m,
+                    Ok(m) => acc.extend(m),
                     Err(e) => {
-                        let rejected = matches!(e, Error::Gitlab(_));
-                        self.fail_search_fetch(gitlab, "merge requests", &e).await;
-                        return if rejected {
-                            Outcome::GlobalRejected
-                        } else {
-                            Outcome::Failed
-                        };
+                        return self.fail_search_fetch(gitlab, "merge requests", &e).await;
                     }
                 }
             }
-            Population::Member => {
-                let mut acc = Vec::new();
-                for p in &projects {
-                    match gitlab
-                        .fetch_merge_requests_for_search(Some(p.id), updated_after)
-                        .await
-                    {
-                        Ok(m) => acc.extend(m),
-                        Err(e) => {
-                            return self.fail_search_fetch(gitlab, "merge requests", &e).await;
-                        }
-                    }
-                }
-                acc
-            }
+            acc
         };
         log_store("merge requests", guard.upsert_mrs(&mrs));
         if full {
-            let keep: HashSet<u64> = mrs.iter().map(|m| m.id as u64).collect();
+            let keep: HashSet<u64> = mrs
+                .iter()
+                .chain(assigned_mrs.iter())
+                .map(|m| m.id as u64)
+                .collect();
             log_retain("merge requests", guard.retain_mrs(&keep));
         }
 
@@ -322,13 +473,12 @@ impl Handlers {
             issues = issues.len(),
             merge_requests = mrs.len(),
             projects = projects.len(),
-            groups = groups.len(),
             "search sync complete"
         );
-        if full && population == Population::All && issues.len() > LARGE_CORPUS_WARN {
+        if full && global && issues.len() > LARGE_CORPUS_WARN {
             warn!(
                 count = issues.len(),
-                "search corpus is very large; consider [search] population = \"member\""
+                "search corpus is very large; consider [search] population = \"tracked\""
             );
         }
         Outcome::Ok

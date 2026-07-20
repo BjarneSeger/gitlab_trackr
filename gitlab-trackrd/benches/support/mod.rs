@@ -78,6 +78,7 @@ pub fn dormant_env() -> BenchEnv {
             queue,
             config,
             reconnect_signal: Arc::new(Notify::new()),
+            live_search_recent: std::sync::Mutex::new(std::collections::HashMap::new()),
         },
         rt,
         _dir: dir,

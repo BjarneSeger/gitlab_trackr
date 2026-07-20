@@ -149,6 +149,13 @@ pub trait GitlabApi: Send + Sync {
         updated_after: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<SearchMr>>;
 
+    /// Merge requests assigned to the authenticated user
+    /// (`scope=assigned_to_me`), always the full list. Fetched directly so the
+    /// assigned-MR view never depends on how broadly the search corpus is
+    /// populated. No state filter — a close must overwrite the cached row, and
+    /// the assigned set is small enough that the full fetch stays cheap.
+    async fn fetch_assigned_merge_requests(&self) -> Result<Vec<SearchMr>>;
+
     /// All projects the user is a member of (`membership=true`), always the
     /// full list — the membership set is small and has no reliable delta
     /// filter (renames don't bump `last_activity_at`).
@@ -157,6 +164,26 @@ pub trait GitlabApi: Send + Sync {
     /// All groups the user is a member of (`min_access_level=guest`; a bare
     /// `GET /groups` would also include public non-member groups).
     async fn fetch_member_groups(&self) -> Result<Vec<SearchGroup>>;
+
+    /// Live lookups for the transparent search path, each capped at `limit`
+    /// results. Issues and MRs go through the dedicated `/search` API — it
+    /// works on gitlab.com (where unfiltered `scope=all` list fetches are
+    /// rejected) and matches descriptions as well as titles. Projects and
+    /// groups reuse the membership-scoped list endpoints with a server-side
+    /// `search` filter, so those keyspaces stay membership-only and the
+    /// background retain reconciliation stays exact. All four are
+    /// single-attempt on purpose: callers run under a deadline, and a
+    /// transient-retry backoff would only burn that budget.
+    async fn search_issues_live(&self, query: &str, limit: usize) -> Result<Vec<SearchIssue>>;
+
+    /// See [`GitlabApi::search_issues_live`].
+    async fn search_mrs_live(&self, query: &str, limit: usize) -> Result<Vec<SearchMr>>;
+
+    /// See [`GitlabApi::search_issues_live`].
+    async fn search_projects_live(&self, query: &str, limit: usize) -> Result<Vec<SearchProject>>;
+
+    /// See [`GitlabApi::search_issues_live`].
+    async fn search_groups_live(&self, query: &str, limit: usize) -> Result<Vec<SearchGroup>>;
 }
 
 impl GitlabClient {
@@ -572,6 +599,33 @@ impl GitlabApi for GitlabClient {
     }
 
     #[instrument(skip(self))]
+    async fn fetch_assigned_merge_requests(&self) -> Result<Vec<SearchMr>> {
+        use gitlab::api::merge_requests::{MergeRequestScope, MergeRequests};
+        use gitlab::api::{Pagination, paged};
+
+        let mut builder = MergeRequests::builder();
+        builder.scope(MergeRequestScope::AssignedToMe);
+        let query = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+        let raw = run_paged_query(
+            &self.inner,
+            "fetch assigned merge requests",
+            paged(query, Pagination::All),
+        )
+        .await?;
+
+        let mrs: Vec<SearchMr> = raw
+            .iter()
+            .map(search_mr_from_json)
+            .filter(|m| m.id > 0)
+            .collect();
+        info!(
+            count = mrs.len(),
+            "fetched assigned merge requests from GitLab"
+        );
+        Ok(mrs)
+    }
+
+    #[instrument(skip(self))]
     async fn fetch_member_projects(&self) -> Result<Vec<SearchProject>> {
         use gitlab::api::projects::Projects;
         use gitlab::api::{Pagination, paged};
@@ -622,6 +676,71 @@ impl GitlabApi for GitlabClient {
         info!(count = groups.len(), "fetched member groups from GitLab");
         Ok(groups)
     }
+
+    #[instrument(skip(self))]
+    async fn search_issues_live(&self, query: &str, limit: usize) -> Result<Vec<SearchIssue>> {
+        use gitlab::api::{Pagination, paged};
+
+        let q = GlobalSearch {
+            scope: "issues",
+            query,
+        };
+        let raw = run_paged_query_once(&self.inner, paged(q, Pagination::Limit(limit))).await?;
+        Ok(raw
+            .iter()
+            .map(search_issue_from_json)
+            .filter(|i| i.id > 0)
+            .collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn search_mrs_live(&self, query: &str, limit: usize) -> Result<Vec<SearchMr>> {
+        use gitlab::api::{Pagination, paged};
+
+        let q = GlobalSearch {
+            scope: "merge_requests",
+            query,
+        };
+        let raw = run_paged_query_once(&self.inner, paged(q, Pagination::Limit(limit))).await?;
+        Ok(raw
+            .iter()
+            .map(search_mr_from_json)
+            .filter(|m| m.id > 0)
+            .collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn search_projects_live(&self, query: &str, limit: usize) -> Result<Vec<SearchProject>> {
+        use gitlab::api::projects::Projects;
+        use gitlab::api::{Pagination, paged};
+
+        let mut builder = Projects::builder();
+        builder.membership(true).simple(true).search(query);
+        let q = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+        let raw = run_paged_query_once(&self.inner, paged(q, Pagination::Limit(limit))).await?;
+        Ok(raw
+            .iter()
+            .map(search_project_from_json)
+            .filter(|p| p.id > 0)
+            .collect())
+    }
+
+    #[instrument(skip(self))]
+    async fn search_groups_live(&self, query: &str, limit: usize) -> Result<Vec<SearchGroup>> {
+        use gitlab::api::common::AccessLevel;
+        use gitlab::api::groups::Groups;
+        use gitlab::api::{Pagination, paged};
+
+        let mut builder = Groups::builder();
+        builder.min_access_level(AccessLevel::Guest).search(query);
+        let q = builder.build().map_err(|e| Error::Gitlab(e.to_string()))?;
+        let raw = run_paged_query_once(&self.inner, paged(q, Pagination::Limit(limit))).await?;
+        Ok(raw
+            .iter()
+            .map(search_group_from_json)
+            .filter(|g| g.id > 0)
+            .collect())
+    }
 }
 
 /// Run `query` against `client`, retrying transient errors with exponential
@@ -634,6 +753,19 @@ where
     let issues: Vec<IssueWithLabels> = raw.iter().map(issue_with_labels).collect();
     info!(count = issues.len(), "fetched issues from GitLab");
     Ok(issues)
+}
+
+/// Run a paged list `query` against `client` into raw JSON exactly once — no
+/// transient retry. For the live search path, which runs under a
+/// caller-enforced deadline where a backoff retry would only burn the budget.
+async fn run_paged_query_once<Q>(
+    client: &gitlab::AsyncGitlab,
+    query: Q,
+) -> Result<Vec<serde_json::Value>>
+where
+    Q: gitlab::api::AsyncQuery<Vec<serde_json::Value>, gitlab::AsyncGitlab> + Sync,
+{
+    query.query_async(client).await.map_err(classify)
 }
 
 /// Run a paged list `query` against `client` into raw JSON, retrying transient
@@ -887,6 +1019,39 @@ impl gitlab::api::Endpoint for TimelogCreate<'_> {
         Ok(Some(("application/json", serde_json::to_vec(&body)?)))
     }
 }
+
+/// `GET /search?scope=<scope>&search=<query>` — the dedicated search API.
+/// The gitlab crate has no binding for it, but it is the right endpoint for
+/// the transparent live search: it works on gitlab.com (where the unfiltered
+/// `scope=all` list endpoints are rejected), matches title *and* description
+/// server-side, and returns the same entity JSON shapes as the list
+/// endpoints, so the existing `search_*_from_json` converters apply.
+struct GlobalSearch<'a> {
+    /// `"issues"` or `"merge_requests"`.
+    scope: &'static str,
+    query: &'a str,
+}
+
+impl gitlab::api::Endpoint for GlobalSearch<'_> {
+    fn method(&self) -> http::Method {
+        http::Method::GET
+    }
+
+    fn endpoint(&self) -> Cow<'static, str> {
+        "search".into()
+    }
+
+    fn parameters(&self) -> gitlab::api::QueryParams<'_> {
+        let mut params = gitlab::api::QueryParams::default();
+        params.push("scope", self.scope);
+        params.push("search", self.query);
+        params
+    }
+}
+
+/// Plain offset pagination — `/search` supports `page`/`per_page` like the
+/// list endpoints.
+impl gitlab::api::Pageable for GlobalSearch<'_> {}
 
 /// `GET /user` — returns the authenticated user's profile. Only `id` is used.
 struct CurrentUserEndpoint;
@@ -1159,6 +1324,32 @@ impl gitlab::api::Endpoint for ListBoardLists {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn global_search_endpoint_renders_scope_and_query() {
+        use gitlab::api::Endpoint as _;
+
+        let e = GlobalSearch {
+            scope: "merge_requests",
+            query: "needle text",
+        };
+        assert_eq!(e.method(), http::Method::GET);
+        assert_eq!(e.endpoint(), "search");
+
+        let mut url = url::Url::parse("https://gl.example/api/v4/search").unwrap();
+        e.parameters().add_to_url(&mut url);
+        let pairs: Vec<(String, String)> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("scope".to_string(), "merge_requests".to_string()),
+                ("search".to_string(), "needle text".to_string()),
+            ]
+        );
+    }
 
     /// Anchors the exact output grammar; the shape over all inputs is covered
     /// by `format_duration_renders_whole_minutes_of_any_input`.
